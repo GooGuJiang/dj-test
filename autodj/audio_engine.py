@@ -722,8 +722,12 @@ class AutoDJEngine:
         使用一条连续 source->target 时间映射恢复原 BPM。
 
         旧实现逐小节单独 time-stretch 后用 12ms crossfade 拼接，电子鼓和低频会
-        在每个小节边界产生相位/瞬态变化。新实现一次渲染整首歌曲：恢复前保持
-        同步速度，恢复区用五次缓动逐小节改变局部速度，恢复后保持原速。
+        在每个小节边界产生相位/瞬态变化。新实现一次渲染整首歌曲：mix end 后
+        先完整保持一小节同步速度，再用高密度五次缓动连续恢复，最后保持原速。
+
+        这里的 ``restore_start`` 是 mix end，而不是速度恢复真正开始的位置。
+        这样新歌接管后不会立刻“抬速/升调”，也不会把 tempo 自动化放在刚完成
+        低频交接的瞬态上。
         """
         bars_requested = int(self.config.tempo_restore_bars)
         if math.isclose(synced.stretch_rate, 1.0, abs_tol=1e-3):
@@ -749,15 +753,34 @@ class AutoDJEngine:
 
         source_length = int(synced.source_audio.shape[0])
         initial_rate = float(synced.stretch_rate)
-        source_start = int(round(restore_start * initial_rate))
-        source_start = int(np.clip(source_start, 0, max(0, source_length - 1)))
+        source_mix_end = int(round(restore_start * initial_rate))
+        source_mix_end = int(np.clip(source_mix_end, 0, max(0, source_length - 1)))
 
         boundaries = self._source_bar_boundaries(synced)
-        boundaries = np.unique(boundaries[(boundaries > source_start) & (boundaries <= source_length)])
-        if boundaries.size == 0:
+        boundaries = np.unique(boundaries[(boundaries >= 0) & (boundaries <= source_length)])
+        if boundaries.size < 2:
             return synced
 
-        endpoints = boundaries[:bars_requested]
+        # mix end 后至少保持一个完整小节的同步 BPM。若 mix end 落在小节中间，
+        # 先走完当前小节，再额外保留约一小节，避免恢复自动化紧贴接歌尾端。
+        bar_diffs = np.diff(boundaries)
+        positive_diffs = bar_diffs[bar_diffs > 0]
+        if positive_diffs.size:
+            source_bar = int(round(float(np.median(positive_diffs))))
+        else:
+            source_bar = int(round(
+                max(2, synced.analysis.beats_per_bar)
+                * 60.0
+                / max(synced.original_bpm, 1.0)
+                * synced.sample_rate
+            ))
+        minimum_hold_end = source_mix_end + max(source_bar, synced.sample_rate // 2)
+        hold_candidates = boundaries[boundaries >= minimum_hold_end]
+        if hold_candidates.size == 0:
+            return synced
+        source_restore_start = int(hold_candidates[0])
+
+        endpoints = boundaries[boundaries > source_restore_start][:bars_requested]
         if endpoints.size == 0:
             return synced
         bars = int(endpoints.size)
@@ -765,20 +788,48 @@ class AutoDJEngine:
         # 保证恢复开始前的时间坐标与原同步版本完全一致，因而已有 IN/MIX
         # 位置不需要重新计算。
         keyframes: list[tuple[int, int]] = [(0, 0)]
-        if source_start > 0:
-            keyframes.append((source_start, int(restore_start)))
+        if source_mix_end > 0:
+            keyframes.append((source_mix_end, int(restore_start)))
 
-        source_cursor = source_start
-        target_cursor = float(restore_start)
+        # 保持段仍使用原同步 rate，因此 source->target 斜率与 mix 前完全相同。
+        hold_target = float(restore_start) + (
+            source_restore_start - source_mix_end
+        ) / max(initial_rate, 1e-6)
+        keyframes.append((source_restore_start, int(round(hold_target))))
+
+        source_cursor = source_restore_start
+        target_cursor = float(hold_target)
         log_initial_rate = math.log(max(initial_rate, 1e-6))
 
-        for index, source_end in enumerate(endpoints):
-            source_end = int(source_end)
+        restore_end_source = int(endpoints[-1])
+        restore_span = max(1, restore_end_source - source_restore_start)
+        subdivisions_per_bar = 16
+        dense_endpoints: list[int] = []
+        bar_start = source_restore_start
+        for bar_end in endpoints:
+            bar_end = int(bar_end)
+            if bar_end <= bar_start:
+                continue
+            for subdivision in range(1, subdivisions_per_bar + 1):
+                point = int(round(
+                    bar_start
+                    + (bar_end - bar_start) * subdivision / subdivisions_per_bar
+                ))
+                if point > source_cursor and (
+                    not dense_endpoints or point > dense_endpoints[-1]
+                ):
+                    dense_endpoints.append(point)
+            bar_start = bar_end
+
+        for source_end in dense_endpoints:
             if source_end <= source_cursor:
                 continue
-            midpoint = (index + 0.5) / max(bars, 1)
-            eased = float(_smootherstep(midpoint))
-            # BPM/速度用几何插值，比线性 rate 插值的听感更均匀。
+            p0 = (source_cursor - source_restore_start) / restore_span
+            p1 = (source_end - source_restore_start) / restore_span
+            pm = 0.5 * (p0 + p1)
+            eased = float(_smootherstep(pm))
+            # BPM/速度用几何插值，比线性 rate 插值的听感更均匀。每小节 16 个
+            # 连续映射段将局部速度台阶压到听觉阈值以下。
             local_rate = math.exp(log_initial_rate * (1.0 - eased))
             target_cursor += (source_end - source_cursor) / max(local_rate, 1e-6)
             keyframes.append((source_end, int(round(target_cursor))))
@@ -827,12 +878,11 @@ class AutoDJEngine:
             round(float(np.interp(source_cue, source_map, target_map)))
         )
 
-        restore_end_source = int(endpoints[-1])
         restore_end = int(
             round(float(np.interp(restore_end_source, source_map, target_map)))
         )
         restore_start_mapped = int(
-            round(float(np.interp(source_start, source_map, target_map)))
+            round(float(np.interp(source_restore_start, source_map, target_map)))
         )
 
         result = self._finish_prepared_track(
@@ -1532,10 +1582,16 @@ class AutoDJEngine:
 
         main = ramp(switch - 0.18, switch + 0.22)
         bass = ramp(switch - 0.06, switch + 0.06)
+        # 匹配阶段可能为下一首计算局部响度补偿。补偿只用于混音前段；
+        # 到 MIX END 必须平滑回到 unity，否则提升下一首为 current 时会
+        # 瞬时跳变，听起来像短暂掉音或“断一下”。
+        gain_release = np.float32(gain) + (
+            np.float32(1.0 - gain) * ramp(0.0, 1.0)
+        )
         fade_out = np.cos(main * np.pi / 2.0).astype(np.float32)
-        fade_in = (np.sin(main * np.pi / 2.0) * np.float32(gain)).astype(np.float32)
+        fade_in = (np.sin(main * np.pi / 2.0) * gain_release).astype(np.float32)
         bass_out = (1.0 - bass).astype(np.float32)
-        bass_in = (bass * np.float32(gain)).astype(np.float32)
+        bass_in = (bass * gain_release).astype(np.float32)
         return tuple(
             np.ascontiguousarray(value, dtype=np.float32)
             for value in (fade_out, fade_in, bass_out, bass_in, fade_out, fade_in)
@@ -1602,7 +1658,10 @@ class AutoDJEngine:
             transition_mode=mode,
             policy_mode=policy,
             switch_position=base_plan.switch_position,
-            next_resume_sample=base_plan.next_resume_sample,
+            # Simple/Gapless 路径没有 phrase warp，实时回调按 B 原始时间轴
+            # 连续读取。恢复点必须紧接最后一个已播放 sample；沿用高级渲染器
+            # 的 warp resume 点会在 MIX END 跳过或重复一段音频。
+            next_resume_sample=int(next_start + length),
             micro_offset_samples=base_plan.micro_offset_samples,
             current_cue_sample=base_plan.current_cue_sample,
             next_cue_sample=base_plan.next_cue_sample,
@@ -1690,8 +1749,15 @@ class AutoDJEngine:
         if len(rendered) > target_length:
             rendered = rendered[:target_length]
         elif len(rendered) < target_length:
+            # 某些 time-stretch 后端会因取整少返回几个 sample。不能补零，
+            # 否则预渲染片段尾部会先掉到静音，再在 MIX END 跳回下一首。
+            # 复制最后一个连续 sample 只用于极小的长度误差，随后还会经过
+            # `_stitch_rendered_transition_to_next` 的 24 ms 精确接缝。
+            mode = "edge" if len(rendered) else "constant"
             rendered = np.pad(
-                rendered, ((0, target_length - len(rendered)), (0, 0))
+                rendered,
+                ((0, target_length - len(rendered)), (0, 0)),
+                mode=mode,
             )
         return np.ascontiguousarray(rendered, dtype=np.float32), backend
 
@@ -1862,6 +1928,63 @@ class AutoDJEngine:
         plan.transition_mode = f"Human Candidate · {human.archetype}"
         return plan
 
+    def _stitch_rendered_transition_to_next(
+        self,
+        plan: TransitionPlan,
+        next_track: PreparedTrack,
+    ) -> TransitionPlan:
+        """De-click the pre-rendered MIX END against B's live playback buffer.
+
+        Phrase warp and deck phase-lock deliberately alter B inside the short
+        transition.  Even with the correct resume sample, the final rendered
+        waveform can differ slightly from ``next_track.audio`` at promotion.
+        Crossfading only the final ~24 ms to the exact contiguous B tail makes
+        the last transition sample and the first post-mix sample one continuous
+        waveform.  This is a de-click seam, not an extra musical overlap.
+        """
+        if plan.rendered_audio is None or len(plan.rendered_audio) < 16:
+            return plan
+        if next_track.total_samples < 3:
+            return plan
+
+        resume = (
+            int(plan.next_resume_sample)
+            if plan.next_resume_sample >= 0
+            else int(plan.next_start + len(plan.rendered_audio))
+        )
+        resume = int(np.clip(resume, 1, next_track.total_samples - 1))
+        plan.next_resume_sample = resume
+
+        requested = max(64, int(round(0.024 * self.config.sample_rate)))
+        seam = min(requested, len(plan.rendered_audio) // 5, resume)
+        if seam < 16:
+            return plan
+
+        target = np.ascontiguousarray(
+            next_track.audio[resume - seam : resume], dtype=np.float32
+        )
+        if len(target) != seam:
+            return plan
+
+        rendered = np.ascontiguousarray(plan.rendered_audio, dtype=np.float32).copy()
+        next_first = next_track.audio[resume]
+        jump_before = float(np.max(np.abs(rendered[-1] - next_first)))
+
+        phase = np.linspace(
+            0.0, np.pi / 2.0, seam, endpoint=True, dtype=np.float32
+        )
+        rendered[-seam:] = (
+            rendered[-seam:] * np.cos(phase)[:, None]
+            + target * np.sin(phase)[:, None]
+        )
+        jump_after = float(np.max(np.abs(rendered[-1] - next_first)))
+
+        plan.rendered_audio = np.ascontiguousarray(rendered, dtype=np.float32)
+        plan.metrics["mixend_seam_ms"] = 1000.0 * seam / self.config.sample_rate
+        plan.metrics["mixend_jump_before"] = jump_before
+        plan.metrics["mixend_jump_after"] = jump_after
+        return plan
+
     def _render_advanced_transition(
         self,
         plan: TransitionPlan,
@@ -1910,11 +2033,12 @@ class AutoDJEngine:
                 plan.metrics["graph_flow"] = result.flow_value
                 plan.metrics["phrase_warp_ratio"] = len(b_raw) / max(phrase_length, 1)
                 plan.metrics["phrase_warp_backend"] = 1.0 if "rubber" in phrase_backend.lower() else 0.0
-                return plan
+                return self._stitch_rendered_transition_to_next(plan, next_track)
             except Exception as exc:
                 self.emit(f"谱缝合回退到 MuQ/HPSS：{exc}")
 
-        return self._render_phrase_locked_hpss(plan, current, next_track)
+        plan = self._render_phrase_locked_hpss(plan, current, next_track)
+        return self._stitch_rendered_transition_to_next(plan, next_track)
 
     def _calculate_plan(
         self,

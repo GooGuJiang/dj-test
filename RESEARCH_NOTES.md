@@ -1,4 +1,4 @@
-# Engineering notes — 1.2.13
+# Engineering notes — 1.2.14
 
 ## Research conclusion
 
@@ -41,6 +41,15 @@ Transition history, variation bonuses and impact-mode preferences were removed. 
 
 ## Verification
 
-- 74 pytest cases pass.
+- 80 pytest cases pass.
 - The standalone natural-transition smoke test checks finite audio, peak ceiling, bass ownership, quiet pre-cue drums, cue-time ownership, sub-beat release and continuous curves.
 - Existing preload, seek, phase-lock, tempo recovery, time-stretch and CUE-DETR-only tests remain active.
+
+
+## MIX END tempo and buffer continuity
+
+The incoming deck remains at the synchronized BPM for at least one complete bar after MIX END. Tempo restoration then uses 16 source-to-target map subdivisions per bar with a smootherstep/geometric rate trajectory. This keeps the derivative near zero at both endpoints and avoids a bar-level staircase.
+
+A second failure mode was independent of tempo: fallback transitions consumed B linearly but resumed from the advanced phrase-warp endpoint, and advanced rendered buffers were promoted without a final waveform seam. The fallback now resumes at `next_start + length`; local gain reaches unity at the boundary; advanced renders crossfade their final ~24 ms to the exact B samples immediately preceding `next_resume_sample`. Time-stretch length shortfalls no longer receive zero padding.
+
+These changes follow the general behavior exposed by DJ/audio tools: tempo changes should retain key when key lock is enabled, and adjacent audio clips use short crossfades to avoid edge discontinuities.

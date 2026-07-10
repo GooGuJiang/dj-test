@@ -1,4 +1,4 @@
-"""Offline smoke test for the cue-centered v1.2.13 transition renderer."""
+"""Offline smoke test for the cue-centered v1.2.14 transition renderer."""
 
 from __future__ import annotations
 

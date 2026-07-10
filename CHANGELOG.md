@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.14
+
+- MIX END 后至少保持一个完整小节的同步 BPM，不再立即恢复原速。
+- BPM 恢复 time-map 从每小节 1 段提高到每小节 16 段，使用 smootherstep + 几何速度插值。
+- 修复 Simple Crossfade / Gapless 在 MIX END 跳到 phrase-warp resume 点导致的跳样、重复或短暂中断。
+- 下一首局部响度补偿在 MIX END 前平滑回到 unity，避免 promote 时增益突跳。
+- 高级预渲染尾端增加约 24 ms equal-power 去点击接缝，精确连接下一首实时缓冲区。
+- time-stretch 长度不足不再补零，避免预渲染尾端出现静音槽。
+- 新增实时 callback 跨 MIX END、速度保持、密集 time-map 和接缝连续性测试；共 80 项测试通过。
+
 ## 1.2.13
 
 - 将 CUE-DETR OUT/IN cue 从“长过渡起点”改为精确主交接点。

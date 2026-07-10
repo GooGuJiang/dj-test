@@ -1,6 +1,6 @@
-# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.13
+# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.14
 
-这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.13 把 CUE-DETR 标记从“长过渡起点”改为真正的换曲交接点：切点前只做一拍低电平预入，切点当拍完成鼓组与低频主导权交接，切点后约一拍内平滑释放旧歌。
+这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.14 延续 CUE-DETR cue 居中的短交接，并重点修复 MIX END 之后突然变速/升调以及转场尾端短暂中断：新歌接管后先保持同步 BPM，随后连续恢复原速；预渲染尾端与实时播放缓冲区使用微型去点击接缝。
 
 ## 模型分工
 
@@ -10,7 +10,7 @@
 - **MuQ**：播放顺序、风格连续性和 cue 对兼容度。
 - **本地 DSP**：BPM 同步、逐拍相位锁定、低频所有权、HPSS 和最终转场渲染。
 
-## 1.2.13 的核心变化
+## 1.2.14 的核心变化
 
 ### 1. 取消“尾部接头部”硬约束
 
@@ -21,7 +21,7 @@ A OUT：后 42% / 最后 48 小节
 B IN ：前 35% / 前 32 小节
 ```
 
-1.2.13 已完全移除这些位置门槛和 `tail_to_head` 加分。现在所有有效 CUE-DETR cue 都可以参加配对，候选只根据以下因素排序：
+1.2.14 继续完全移除这些位置门槛和 `tail_to_head` 加分。现在所有有效 CUE-DETR cue 都可以参加配对，候选只根据以下因素排序：
 
 - downbeat 与乐句边界；
 - CUE-DETR IN/OUT 置信度；
@@ -66,7 +66,27 @@ cue 后 <1 拍：A 的鼓组与主体平滑归零，B 完全接管
 
 低频使用互补增益 `bass_A + bass_B = 1`。主包络使用连续 equal-power 曲线，因此切换明确但不会像突然停止播放。Echo 只处理旧歌的和声层，不把 kick 和 sub 送进 delay。
 
-### 4. 去除“为了变化而变化”
+
+### 4. MIX END 后不立即变速
+
+下一首在接歌窗口内保持同步 BPM。MIX END 后先至少保持一个完整小节，再按每小节 16 个连续 time-map 分段，用五次缓动逐渐恢复原 BPM。音高保持由 Rubber Band R3 或连续可变相位声码器负责。
+
+```text
+MIX END → 保持同步 BPM ≥ 1 小节 → 连续恢复 → 原 BPM
+```
+
+速度恢复不会再贴着低频交接点开始，也不会按“一小节一个速度台阶”跳变。
+
+### 5. MIX END 连续接缝
+
+- Simple Crossfade / Gapless 从最后实际播放的 B sample 紧接继续，不再沿用 phrase-warp 的恢复点。
+- 下一首局部响度补偿在 MIX END 前平滑回到 unity，避免 promote 时音量突跳。
+- 高级预渲染尾端用约 24 ms equal-power seam 接到下一首实时缓冲区。
+- time-stretch 后端长度少量不足时使用连续边缘 sample，不再补零制造静音缝。
+
+这段 seam 只用于去点击，不延长两首歌的音乐重叠。
+
+### 6. 去除“为了变化而变化”
 
 删除真人变化度、最近手法惩罚和随机化式候选奖励。相同音频、相同分析和相同设置会得到完全相同的转场结果，便于试听、复现和调试。
 
@@ -76,7 +96,7 @@ cue 后 <1 拍：A 的鼓组与主体平滑归零，B 完全接管
 
 ```powershell
 conda activate beatthis-auto-dj
-cd beatthis_muq_cuedetr_auto_dj_gui_v1213
+cd beatthis_muq_cuedetr_auto_dj_gui_v1214
 python verify_cuedetr.py
 python app.py
 ```
@@ -125,13 +145,15 @@ pytest -q
 
 ```bash
 python check_natural_transition.py
+python check_mixend_continuity.py
 ```
 
 当前结果：
 
 ```text
-74 passed
+80 passed
 PASS: cue-centered transition invariants satisfied
+PASS: MIX END continuity invariants satisfied
 ```
 
 专项覆盖：
@@ -145,6 +167,9 @@ PASS: cue-centered transition invariants satisfied
 - 干净的歌曲配对不会滥用 Echo；
 - 高人声/低调性兼容时才加入 Echo 候选；
 - 已删除的冲击式手法会明确拒绝；
+- MIX END 后至少一小节速度保持、每小节 16 段连续 BPM 恢复；
+- Simple/Gapless 播放位置连续、下一首增益在 MIX END 达到 unity；
+- 高级渲染 24 ms 接缝、time-stretch 不补零、实时 callback 跨 MIX END 无零样本；
 - 完整预加载、Seek、BPM 恢复、相位锁定和 CUE-DETR-only 回归测试继续通过。
 
 ## 研究与实现依据
