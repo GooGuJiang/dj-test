@@ -6,9 +6,11 @@ from typing import Iterable
 
 import librosa
 import numpy as np
+from scipy import signal
 
 from .edm_structure import camelot_compatibility
 from .models import BarFeatures, PreparedTrack, TransitionPlan
+from .muq_analyzer import cosine_similarity
 
 
 @dataclass(frozen=True)
@@ -118,7 +120,7 @@ def extract_bar_features(
             mono,
             orig_sr=sample_rate,
             target_sr=feature_sample_rate,
-            res_type="kaiser_fast",
+            res_type="soxr_hq",
         )
     else:
         y = mono
@@ -226,9 +228,139 @@ def _harmonic_compatibility(a: np.ndarray, b: np.ndarray) -> float:
     return max(direct, fifth_up, fifth_down)
 
 
+def _muq_sequence_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Small monotonic alignment score for local MuQ semantic trajectories."""
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    if (
+        a.ndim != 2
+        or b.ndim != 2
+        or not len(a)
+        or not len(b)
+        or a.shape[1] != b.shape[1]
+    ):
+        return 0.5
+    cost = np.full((len(a) + 1, len(b) + 1), np.inf, dtype=np.float64)
+    cost[0, 0] = 0.0
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            local = 1.0 - cosine_similarity(a[i - 1], b[j - 1])
+            cost[i, j] = local + min(
+                cost[i - 1, j], cost[i, j - 1], cost[i - 1, j - 1]
+            )
+    normalized = cost[-1, -1] / max(len(a), len(b))
+    return float(np.clip(np.exp(-2.4 * normalized), 0.0, 1.0))
+
+
+def _muq_candidate_metrics(
+    current: PreparedTrack,
+    next_track: PreparedTrack,
+    current_index: int,
+    next_index: int,
+    bars: int,
+) -> tuple[float, float, float]:
+    pa = current.muq_profile
+    pb = next_track.muq_profile
+    if not pa.available or not pb.available:
+        return 0.5, 0.5, 0.5
+    a_position = (current_index + 0.5 * bars) / max(current.bar_features.count, 1)
+    b_position = (next_index + 0.5 * bars) / max(next_track.bar_features.count, 1)
+    style = cosine_similarity(pa.global_embedding, pb.global_embedding)
+    segment = cosine_similarity(pa.embedding_at(a_position), pb.embedding_at(b_position))
+    trajectory = _muq_sequence_similarity(
+        pa.sequence_around(a_position, radius=1),
+        pb.sequence_around(b_position, radius=1),
+    )
+    return style, segment, trajectory
+
+
+def estimate_micro_alignment(
+    current: PreparedTrack,
+    next_track: PreparedTrack,
+    current_start: int,
+    next_start: int,
+    max_offset_ms: float = 80.0,
+) -> tuple[int, float]:
+    """Fine-align downbeat transients to reduce kick flam after model beat tracking."""
+    sr = current.sample_rate
+    window = int(round(min(0.42, 60.0 / max(current.playback_bpm, 1.0)) * sr))
+    if window < 128:
+        return 0, 0.0
+    a = current.audio[current_start : current_start + window]
+    b = next_track.audio[next_start : next_start + window]
+    length = min(len(a), len(b))
+    if length < 128:
+        return 0, 0.0
+    a_mono = np.mean(a[:length], axis=1, dtype=np.float64)
+    b_mono = np.mean(b[:length], axis=1, dtype=np.float64)
+    try:
+        sos = signal.butter(3, min(220.0 / (sr / 2.0), 0.95), btype="lowpass", output="sos")
+        a_mono = signal.sosfiltfilt(sos, a_mono)
+        b_mono = signal.sosfiltfilt(sos, b_mono)
+    except ValueError:
+        pass
+    a_onset = np.abs(np.diff(a_mono, prepend=a_mono[0]))
+    b_onset = np.abs(np.diff(b_mono, prepend=b_mono[0]))
+    smooth = max(1, int(round(0.004 * sr)))
+    kernel = np.ones(smooth, dtype=np.float64) / smooth
+    a_onset = np.convolve(a_onset, kernel, mode="same")
+    b_onset = np.convolve(b_onset, kernel, mode="same")
+    search = min(length, int(round(0.18 * sr)))
+    a_peak = int(np.argmax(a_onset[:search]))
+    b_peak = int(np.argmax(b_onset[:search]))
+    maximum = int(round(max_offset_ms * sr / 1000.0))
+    offset = int(np.clip(b_peak - a_peak, -maximum, maximum))
+    strength_a = float(a_onset[a_peak] / (np.mean(a_onset[:search]) + 1e-9))
+    strength_b = float(b_onset[b_peak] / (np.mean(b_onset[:search]) + 1e-9))
+    confidence = float(np.clip(min(strength_a, strength_b) / 8.0, 0.0, 1.0))
+    if confidence < 0.18:
+        return 0, confidence
+    return offset, confidence
+
+
 def _smoothstep(values: np.ndarray) -> np.ndarray:
     values = np.clip(values, 0.0, 1.0)
     return values * values * (3.0 - 2.0 * values)
+
+
+def _allin1_role_compatibility(
+    current_role: str,
+    next_role: str,
+    current_function: str,
+    next_function: str,
+) -> float:
+    a = current_role.upper()
+    b = next_role.upper()
+    fa = current_function.upper()
+    fb = next_function.upper()
+    preferred = {
+        ("OUTRO", "INTRO"): 1.00,
+        ("BREAKDOWN", "DROP"): 0.98,
+        ("BUILDUP", "DROP"): 0.96,
+        ("VERSE", "INTRO"): 0.88,
+        ("VOCAL", "INTRO"): 0.86,
+        ("CHORUS", "BREAKDOWN"): 0.84,
+        ("DROP", "BREAKDOWN"): 0.82,
+        ("SOLO", "INTRO"): 0.82,
+        ("PHRASE", "INTRO"): 0.80,
+        ("OUTRO", "DROP"): 0.78,
+        ("BREAKDOWN", "INTRO"): 0.78,
+    }
+    if (a, b) in preferred:
+        return preferred[(a, b)]
+    # Harmonix functional labels provide a useful fallback even when the local
+    # EDM role conversion is uncertain.
+    if fa in {"OUTRO", "END"} and fb in {"INTRO", "START", "INST"}:
+        return 0.96
+    if fa in {"BREAK", "BRIDGE"} and fb in {"CHORUS", "INST"}:
+        return 0.86
+    if fa in {"VERSE", "CHORUS", "SOLO"} and fb in {"INTRO", "BREAK", "INST"}:
+        return 0.78
+    if a in {"VOCAL", "VERSE", "CHORUS"} and b in {"VOCAL", "VERSE", "CHORUS"}:
+        return 0.34
+    if a == b and a in {"DROP", "CHORUS"}:
+        return 0.52
+    return 0.62
 
 
 def _score_candidate(
@@ -351,24 +483,68 @@ def _score_candidate(
             * max(next_track.structure.edm_confidence, 0.0)
         )
     )
+    muq_style, muq_segment, muq_trajectory = _muq_candidate_metrics(
+        current, next_track, current_index, next_index, bars
+    )
+    current_role = (
+        current.structure.labels[current_index]
+        if current_index < len(current.structure.labels)
+        else "SECTION"
+    )
+    next_role = (
+        next_track.structure.labels[next_index]
+        if next_index < len(next_track.structure.labels)
+        else "SECTION"
+    )
+    current_function = (
+        current.structure.functional_labels[current_index]
+        if current_index < len(current.structure.functional_labels)
+        else "UNKNOWN"
+    )
+    next_function = (
+        next_track.structure.functional_labels[next_index]
+        if next_index < len(next_track.structure.functional_labels)
+        else "UNKNOWN"
+    )
+    role_compatibility = _allin1_role_compatibility(
+        current_role, next_role, current_function, next_function
+    )
+    boundary_a = (
+        float(current.structure.allin1_boundary_score[current_index])
+        if current.structure.allin1_boundary_score.size > current_index
+        else 0.50
+    )
+    boundary_b = (
+        float(next_track.structure.allin1_boundary_score[next_index])
+        if next_track.structure.allin1_boundary_score.size > next_index
+        else 0.50
+    )
+    allin1_boundary = float(np.sqrt(max(boundary_a, 0.0) * max(boundary_b, 0.0)))
 
-    # Research profile: cue/phrase alignment has more weight for EDM than
+    # MuQ is used as a bounded semantic/style term, not as the sole compatibility
+    # judge: recent mashup work shows general-purpose embeddings are insufficient
+    # and that A->B compatibility is directional.
     # arbitrary position priors. Parametric EQ/fader terms follow the
     # differentiable-DSP transition literature.
     score = (
-        0.18 * continuity
-        + 0.13 * harmonic
-        + 0.08 * key_score
-        + 0.07 * rhythm
-        + 0.04 * brightness
-        + 0.10 * bass_clean
-        + 0.10 * vocal_clean
-        + 0.06 * structure
-        + 0.04 * dynamics
-        + 0.03 * length_fit
-        + 0.11 * cue_alignment
+        0.14 * continuity
+        + 0.10 * harmonic
+        + 0.06 * key_score
+        + 0.06 * rhythm
+        + 0.02 * brightness
+        + 0.09 * bass_clean
+        + 0.09 * vocal_clean
+        + 0.03 * structure
+        + 0.03 * dynamics
+        + 0.02 * length_fit
+        + 0.08 * cue_alignment
         + 0.04 * phrase_alignment
-        + 0.02 * edm_confidence
+        + 0.01 * edm_confidence
+        + 0.05 * muq_style
+        + 0.06 * muq_segment
+        + 0.02 * muq_trajectory
+        + 0.05 * allin1_boundary
+        + 0.05 * role_compatibility
     )
     metrics = {
         "continuity": continuity,
@@ -384,6 +560,17 @@ def _score_candidate(
         "cue_alignment": cue_alignment,
         "phrase_alignment": phrase_alignment,
         "edm_confidence": edm_confidence,
+        "muq_style": muq_style,
+        "muq_segment": muq_segment,
+        "muq_trajectory": muq_trajectory,
+        "allin1_boundary": allin1_boundary,
+        "allin1_role_compatibility": role_compatibility,
+        "current_functional_role": float(
+            {"INTRO": 0, "VERSE": 1, "CHORUS": 2, "BREAK": 3, "BRIDGE": 4, "INST": 5, "SOLO": 6, "OUTRO": 7, "START": 8, "END": 9}.get(current_function, -1)
+        ),
+        "next_functional_role": float(
+            {"INTRO": 0, "VERSE": 1, "CHORUS": 2, "BREAK": 3, "BRIDGE": 4, "INST": 5, "SOLO": 6, "OUTRO": 7, "START": 8, "END": 9}.get(next_function, -1)
+        ),
         "local_gain": float(local_gain),
     }
     return float(np.clip(score, 0.0, 1.0)), metrics
@@ -581,11 +768,20 @@ def find_best_transition(
     next_start = int(b.start_samples[next_index])
     current_end = int(a.end_samples[current_index + bars - 1])
     next_end = int(b.end_samples[next_index + bars - 1])
+    micro_offset, micro_confidence = estimate_micro_alignment(
+        current, next_track, current_start, next_start
+    )
+    adjusted_next_start = int(
+        np.clip(next_start + micro_offset, 0, max(0, next_end - 1))
+    )
+    metrics["micro_align_ms"] = 1000.0 * micro_offset / current.sample_rate
+    metrics["micro_align_confidence"] = micro_confidence
+    next_start = adjusted_next_start
+    # The outgoing phrase defines wall-clock transition duration. The incoming
+    # phrase is rendered to this exact duration later, then resumes at next_end.
     length = min(
         current_end - current_start,
-        next_end - next_start,
         current.total_samples - current_start,
-        next_track.total_samples - next_start,
     )
     length = max(1, int(length))
     fade_out, fade_in, bass_out, bass_in, high_out, high_in = _make_curves(
@@ -619,4 +815,6 @@ def find_best_transition(
             and next_track.structure.labels[next_index] == "DROP"
             else 0.55
         ),
+        next_resume_sample=int(next_end),
+        micro_offset_samples=int(micro_offset),
     )

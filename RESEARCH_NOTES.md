@@ -1,23 +1,63 @@
-# Research Notes
+# Research Notes 0.6.1
 
-## Beat/downbeat front end
+## 采用的公开研究方向
 
-0.5 版本使用 Beat This! 1.1.0 作为离线主分析器：
+### MuQ (2025)
 
-1. File2Beats 输出 beat 和 downbeat。
-2. infer_beat_numbers 生成拍号编号。
-3. 对稳定电子音乐网格做保守的重复峰合并与漏拍补全。
-4. Beat This! 不使用 DBN，因此不会对速度变化歌曲强制固定 tempo/meter。
-5. 所有 OUT/IN 和 phrase 搜索均基于 Beat This! downbeat。
+MuQ 使用 Mel Residual Vector Quantization 进行自监督音乐表示学习。项目使用官方 `MuQ-large-msd-iter` 的最后四层隐藏状态平均，再做时间池化，用于全局风格和局部段落表示。
 
-## Continuous tempo recovery
+### AutoMashup (2025)
 
-使用 source sample 到 target sample 的单调 key-frame map：
+AutoMashup 的结果强调：兼容度具有方向性，而且 CLAP/MERT 等通用 embedding 不能单独代替感知兼容模型。因此本项目：
 
-- 恢复前斜率为 `1 / initial_rate`
-- 恢复区局部 rate 使用五次 smootherstep 和几何插值
-- 恢复后斜率为 1
-- Rubber Band R3 使用 time-map 一次性渲染
-- 回退算法在单个 STFT 中按 target->source 时间坐标采样
+- 区分 `A outro → B intro`
+- MuQ 只占组合评分的一部分
+- 保留 beat、phrase、key、energy、bass 和 vocal 冲突项
 
-这避免了逐小节独立 phase vocoder 的重启和短 crossfade 接缝。
+### DJ-AI / graph playlist ordering (2025)
+
+播放列表被建模成有方向的图。边权为 MuQ 段落兼容度、tempo 和声学连续性，采用 beam search 求路径，并保留用户选择的起始歌曲。
+
+### SELEBI (2026) 与 transient-aware TSM
+
+SELEBI 指出传统 phase vocoder 对打击乐会产生 smearing。项目当前优先使用 Rubber Band R3，并在过渡层将低频、percussive 和 harmonic 分开处理。这里不是 SELEBI 的精确复现，因为截至开发时未找到成熟的官方实现。
+
+## 为什么 Adaptive 改用 HPSS
+
+Graph-cut 能为不同频率寻找不同切换时刻，但在密集电子鼓、强 sidechain 和宽频瞬态中，频率相关 seam 也可能让 transient 所有权不稳定。新默认策略采用更稳定的三角色所有权：
+
+- low：一次 bass swap
+- percussive：鼓组较早交接
+- harmonic：根据人声风险延迟交接
+
+Graph-cut 仍作为显式实验模式。
+
+## 0.6.1 新增实现
+
+### MuQ 多层与多窗口聚合
+
+官方 MuQ 支持输出全部隐藏层。本项目对最后四层求平均，再对时间维做池化；全曲使用多个窗口，分别保留 intro、outro 与局部时间轨迹。该实现受 2026 年 MuQ-token 多层特征聚合研究启发，但没有复制其面向推荐系统的离散 token 训练流程。
+
+### 有方向的语义排序
+
+AutoMashup 指出 mashup 兼容度取决于 stem/角色方向，且通用 embedding 不能单独代替感知兼容模型。因此 MuQ 只作为组合评分的一部分；排序边权同时包含 `outro→intro`、局部 DTW、BPM 与声学连续性。
+
+### Hybrid HPSS + WSOLA
+
+SELEBI 研究聚焦传统 phase vocoder 的 percussion smearing。本项目尚未实现其非平稳 Gabor 变换，而是提供可运行的工程回退：谐波使用相位声码器、打击乐使用立体声 WSOLA。Rubber Band R3 仍是优先后端。
+
+## 0.9.0 All-In-One functional structure model
+
+The application now invokes the official `allin1.analyze()` API with the
+`harmonix-all` ensemble. Beat This! remains the single metrical clock. All-In-One
+segments are sampled at the original-audio downbeats and mapped to the prepared
+playback timeline, including tempo-sync and tempo-recovery warps.
+
+Original Harmonix labels are retained (`intro`, `verse`, `chorus`, `break`,
+`bridge`, `inst`, `solo`, `outro`). A separate DJ-role fusion maps those labels
+with local energy/percussion evidence, e.g. a high-energy chorus can become
+`DROP`, while bridge/break can become `BUILDUP` or `BREAKDOWN`.
+
+The project does not claim that All-In-One is a Raveform model. Raveform remains
+a taxonomy/dataset reference; All-In-One is the actual structure inference
+backend in 0.9.0.

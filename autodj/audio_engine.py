@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import queue
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
@@ -15,7 +16,15 @@ except ImportError:  # 允许在无声卡/测试环境中导入匹配与 DSP 模
 from scipy import signal
 
 from .edm_structure import analyze_edm_structure
-from .models import PreparedTrack, TrackAnalysis, TransitionPlan
+from .allinone_analyzer import AllInOneAnalyzer
+from .allinone_structure import fuse_allinone_structure
+from .human_transition import (
+    HumanTransitionConfig,
+    SUPPORTED_ARCHETYPES,
+    render_human_transition,
+)
+from .models import AllInOneProfile, MuQProfile, PreparedTrack, TrackAnalysis, TransitionPlan
+from .muq_analyzer import MuQAnalyzer
 from .spectral_seam import spectral_seam_crossfade
 from .time_stretch import (
     stretch_stereo as quality_time_stretch,
@@ -53,6 +62,27 @@ class EngineConfig:
     automix_policy: str = "AutoMix-like"
     time_stretch_backend: str = "auto"
     min_complex_score: float = 0.60
+    # MuQ semantic/style embeddings are optional but enabled by default.
+    muq_enabled: bool = True
+    muq_device: str = "cpu"
+    muq_model_name: str = "OpenMuQ/MuQ-large-msd-iter"
+    # All-In-One provides functional structure boundaries/labels. Beat This!
+    # remains the timing authority so both outputs share one stable beat grid.
+    allin1_enabled: bool = True
+    allin1_device: str = "cpu"
+    allin1_model_name: str = "harmonix-all"
+    # GUI performs batch analysis before playback. Keeping runtime inference off
+    # prevents Demucs/All-In-One from unexpectedly blocking next-track preload.
+    allin1_runtime_inference: bool = False
+    # Generate several context-aware DJ techniques and select the best with
+    # reference-aware transition quality metrics.
+    human_style_mode: str = "Adaptive Human"
+    human_variation: float = 0.58
+    human_max_candidates: int = 5
+    # Sliding preload window: current + hot next + warm future tracks.
+    preload_window_tracks: int = 3
+    preload_memory_mb: int = 1024
+    preload_deadline_seconds: float = 60.0
     latency: str = "high"
 
 
@@ -233,6 +263,39 @@ class AutoDJEngine:
         self._next_loading = False
         self._loader_generation = 0
         self._last_callback_status = ""
+        self._muq_analyzer: MuQAnalyzer | None = None
+        self._allin1_analyzer: AllInOneAnalyzer | None = None
+        # Recent chosen techniques are used to avoid machine-like repetition.
+        self._transition_history: list[str] = []
+
+        # 播放前后台预加载的第一对歌曲。预加载只保存“当前 + 下一首”，
+        # 因此不会随着队列长度线性占用内存。
+        self._prime_generation = 0
+        self._prime_loading = False
+        self._prime_key: tuple[Any, ...] | None = None
+        self._prime_current: PreparedTrack | None = None
+        self._prime_next_synced_base: PreparedTrack | None = None
+        self._prime_next: PreparedTrack | None = None
+        self._prime_plan: TransitionPlan | None = None
+
+        # 外部 MuQ 排序器已经分析过的 profile 可直接注入，避免音频引擎
+        # 在准备下一首时再次运行大模型。
+        self._preloaded_muq_profiles: dict[str, MuQProfile] = {}
+        self._preloaded_allin1_profiles: dict[str, AllInOneProfile] = {}
+
+        # Sliding-window preloader. The immediate next track is rendered hot in
+        # self._next; later tracks are kept as synchronized warm PreparedTrack
+        # objects so model inference, decoding and time-stretching do not start at
+        # the last moment. OrderedDict gives deterministic memory-bounded LRU.
+        self._warm_cache: OrderedDict[tuple[Any, ...], PreparedTrack] = OrderedDict()
+        self._warm_cache_bytes = 0
+        self._warm_loading_paths: set[str] = set()
+        self._preload_urgent = False
+        self._urgent_notice_index = -1
+
+        # seek 后的短淡入，避免从非零采样位置突然起音产生 click。
+        self._seek_fade_remaining = 0
+        self._seek_fade_total = max(64, int(0.030 * self.config.sample_rate))
 
     def emit(self, message: str) -> None:
         self._events.put(message)
@@ -258,6 +321,43 @@ class AutoDJEngine:
                 result.append((index, f"{item['name']} ({hostapi})"))
         return result
 
+    def _get_muq_profile(self, analysis: TrackAnalysis) -> MuQProfile:
+        if not self.config.muq_enabled:
+            return MuQProfile()
+        cached = self._preloaded_muq_profiles.get(analysis.path)
+        if cached is not None and cached.available:
+            return cached
+        try:
+            if self._muq_analyzer is None:
+                self._muq_analyzer = MuQAnalyzer(
+                    model_name=self.config.muq_model_name,
+                    device=self.config.muq_device,
+                )
+            return self._muq_analyzer.analyze(analysis.path, status=self.emit)
+        except Exception as exc:
+            self.emit(f"MuQ 回退到传统特征：{analysis.title} · {exc}")
+            return MuQProfile(backend="fallback")
+
+    def _get_allin1_profile(self, analysis: TrackAnalysis) -> AllInOneProfile:
+        if not self.config.allin1_enabled:
+            return AllInOneProfile()
+        cached = self._preloaded_allin1_profiles.get(analysis.path)
+        if cached is not None and cached.available:
+            return cached
+        if not self.config.allin1_runtime_inference:
+            self.emit(f"All-In-One 尚未预分析：{analysis.title}，使用本地结构估计")
+            return AllInOneProfile(backend="not-preloaded")
+        try:
+            if self._allin1_analyzer is None:
+                self._allin1_analyzer = AllInOneAnalyzer(
+                    model=self.config.allin1_model_name,
+                    device=self.config.allin1_device,
+                )
+            return self._allin1_analyzer.analyze(analysis.path, status=self.emit)
+        except Exception as exc:
+            self.emit(f"All-In-One 回退到本地结构估计：{analysis.title} · {exc}")
+            return AllInOneProfile(backend="fallback")
+
     def _finish_prepared_track(
         self,
         *,
@@ -277,6 +377,8 @@ class AutoDJEngine:
         tempo_restore_start: int = -1,
         tempo_restore_end: int = -1,
         tempo_restore_bars: int = 0,
+        muq_profile: MuQProfile | None = None,
+        allin1_profile: AllInOneProfile | None = None,
         stretch_backend: str = "librosa",
     ) -> PreparedTrack:
         low, mid, high = _split_three_bands(
@@ -299,6 +401,15 @@ class AutoDJEngine:
             features=features,
             beats_per_bar=max(2, analysis.beats_per_bar),
         )
+        allin1_profile = allin1_profile or AllInOneProfile()
+        if allin1_profile.available:
+            structure = fuse_allinone_structure(
+                base=structure,
+                profile=allin1_profile,
+                features=features,
+                source_downbeat_samples=source_downbeat_samples,
+                sample_rate=self.config.sample_rate,
+            )
         envelope = waveform_envelope(audio, bins=self.matcher_config.waveform_bins)
         return PreparedTrack(
             analysis=analysis,
@@ -324,6 +435,8 @@ class AutoDJEngine:
             tempo_restore_end=int(tempo_restore_end),
             tempo_restore_bars=int(tempo_restore_bars),
             structure=structure,
+            muq_profile=muq_profile or MuQProfile(),
+            allin1_profile=allin1_profile,
             stretch_backend=stretch_backend,
         )
 
@@ -419,6 +532,8 @@ class AutoDJEngine:
             if candidates.size:
                 cue_sample = int(candidates[0])
 
+        muq_profile = self._get_muq_profile(analysis)
+        allin1_profile = self._get_allin1_profile(analysis)
         return self._finish_prepared_track(
             analysis=analysis,
             audio=audio,
@@ -433,6 +548,8 @@ class AutoDJEngine:
             source_beat_numbers=source_beat_numbers,
             source_downbeat_samples=source_downbeats,
             cue_sample=cue_sample,
+            muq_profile=muq_profile,
+            allin1_profile=allin1_profile,
             stretch_backend=stretch_backend,
         )
 
@@ -594,6 +711,8 @@ class AutoDJEngine:
             tempo_restore_start=restore_start_mapped,
             tempo_restore_end=restore_end,
             tempo_restore_bars=bars,
+            muq_profile=synced.muq_profile,
+            allin1_profile=synced.allin1_profile,
             stretch_backend=backend,
         )
         self.emit(
@@ -651,6 +770,274 @@ class AutoDJEngine:
         tail_shape = np.sin(np.pi * np.clip((phase - 0.45) / 0.55, 0.0, 1.0))
         return np.ascontiguousarray(echo * tail_shape[:, None], dtype=np.float32)
 
+    def _preload_config_signature(self) -> tuple[Any, ...]:
+        return (
+            self.config.sample_rate,
+            self.config.crossfade_bars,
+            round(self.config.max_stretch_percent, 3),
+            self.config.tempo_restore_bars,
+            self.config.mix_style,
+            round(self.config.effect_strength, 3),
+            self.config.transition_engine,
+            self.config.automix_policy,
+            self.config.time_stretch_backend,
+            self.config.muq_enabled,
+            self.config.muq_device,
+            self.config.allin1_enabled,
+            self.config.allin1_device,
+            self.config.allin1_model_name,
+            self.config.preload_window_tracks,
+            self.config.preload_memory_mb,
+        )
+
+    def _pair_key(
+        self, playlist: Sequence[TrackAnalysis], start_index: int
+    ) -> tuple[Any, ...]:
+        current_path = playlist[start_index].path
+        next_path = (
+            playlist[start_index + 1].path
+            if start_index + 1 < len(playlist)
+            else ""
+        )
+        return (
+            current_path,
+            next_path,
+            self._preload_config_signature(),
+        )
+
+    @staticmethod
+    def _prepared_track_bytes(track: PreparedTrack) -> int:
+        """Approximate unique NumPy memory retained by a PreparedTrack."""
+        total = 0
+        seen: set[int] = set()
+        for value in vars(track).values():
+            if isinstance(value, np.ndarray):
+                pointer = int(value.__array_interface__["data"][0]) if value.size else id(value)
+                if pointer not in seen:
+                    seen.add(pointer)
+                    total += int(value.nbytes)
+        return total
+
+    def _warm_key(
+        self,
+        outgoing: TrackAnalysis,
+        incoming: TrackAnalysis,
+        target_bpm: float,
+    ) -> tuple[Any, ...]:
+        return (
+            outgoing.path,
+            incoming.path,
+            round(float(target_bpm), 3),
+            self._preload_config_signature(),
+        )
+
+    def _take_warm_track(
+        self,
+        outgoing: TrackAnalysis,
+        incoming: TrackAnalysis,
+        target_bpm: float,
+    ) -> PreparedTrack | None:
+        key = self._warm_key(outgoing, incoming, target_bpm)
+        with self._lock:
+            track = self._warm_cache.pop(key, None)
+            if track is not None:
+                self._warm_cache_bytes = max(
+                    0, self._warm_cache_bytes - self._prepared_track_bytes(track)
+                )
+        if track is not None:
+            self.emit(f"滑动窗口命中：{incoming.title} 已完成解码与变速预热")
+        return track
+
+    def _store_warm_track(
+        self,
+        outgoing: TrackAnalysis,
+        incoming: TrackAnalysis,
+        target_bpm: float,
+        track: PreparedTrack,
+    ) -> None:
+        key = self._warm_key(outgoing, incoming, target_bpm)
+        size = self._prepared_track_bytes(track)
+        budget = max(256, int(self.config.preload_memory_mb)) * 1024 * 1024
+        with self._lock:
+            old = self._warm_cache.pop(key, None)
+            if old is not None:
+                self._warm_cache_bytes = max(
+                    0, self._warm_cache_bytes - self._prepared_track_bytes(old)
+                )
+            # Keep at least one warm item when possible. Evict oldest pairs first.
+            while self._warm_cache and self._warm_cache_bytes + size > budget:
+                _, evicted = self._warm_cache.popitem(last=False)
+                self._warm_cache_bytes = max(
+                    0, self._warm_cache_bytes - self._prepared_track_bytes(evicted)
+                )
+            if size <= budget:
+                self._warm_cache[key] = track
+                self._warm_cache_bytes += size
+
+    def _window_token_valid(self, kind: str, generation: int) -> bool:
+        with self._lock:
+            if kind == "prime":
+                return generation == self._prime_generation and not self._playing
+            return generation == self._loader_generation and self._playing
+
+    def _warm_following_tracks(
+        self,
+        snapshot: Sequence[TrackAnalysis],
+        first_target_index: int,
+        source_bpm: float,
+        generation: int,
+        token_kind: str,
+    ) -> None:
+        """Prepare the warm portion of the sliding window in priority order."""
+        # Window count includes current and immediate hot next; the remaining
+        # slots are warm synchronized bases.
+        warm_count = max(0, int(self.config.preload_window_tracks) - 2)
+        stop = min(len(snapshot), first_target_index + warm_count)
+        previous_bpm = float(source_bpm)
+        for target_index in range(first_target_index, stop):
+            if not self._window_token_valid(token_kind, generation):
+                return
+            outgoing = snapshot[target_index - 1]
+            incoming = snapshot[target_index]
+            key = self._warm_key(outgoing, incoming, previous_bpm)
+            with self._lock:
+                cached = self._warm_cache.get(key)
+                if cached is not None:
+                    self._warm_cache.move_to_end(key)
+                    previous_bpm = cached.original_bpm
+                    continue
+                self._warm_loading_paths.add(incoming.path)
+            try:
+                self.emit(
+                    f"滑动窗口预热 {target_index + 1}/{len(snapshot)}：{incoming.title}"
+                )
+                warmed = self.prepare_track(incoming, target_bpm=previous_bpm)
+                if not self._window_token_valid(token_kind, generation):
+                    return
+                self._store_warm_track(outgoing, incoming, previous_bpm, warmed)
+                previous_bpm = warmed.original_bpm
+            except Exception as exc:
+                self.emit(f"暖轨预加载失败：{incoming.title} · {exc}")
+                return
+            finally:
+                with self._lock:
+                    self._warm_loading_paths.discard(incoming.path)
+
+    def set_preloaded_muq_profiles(
+        self, profiles: dict[str, MuQProfile]
+    ) -> None:
+        """注入 GUI 已完成的 MuQ 结果，避免引擎重复推理。"""
+        with self._lock:
+            self._preloaded_muq_profiles = dict(profiles)
+
+    def set_preloaded_allin1_profiles(
+        self, profiles: dict[str, AllInOneProfile]
+    ) -> None:
+        """注入 GUI 已完成的 All-In-One 结构结果，避免播放时重复推理。"""
+        with self._lock:
+            self._preloaded_allin1_profiles = dict(profiles)
+
+    def clear_preload(self) -> None:
+        with self._lock:
+            self._prime_generation += 1
+            self._prime_loading = False
+            self._prime_key = None
+            self._prime_current = None
+            self._prime_next_synced_base = None
+            self._prime_next = None
+            self._prime_plan = None
+            self._warm_cache.clear()
+            self._warm_cache_bytes = 0
+            self._warm_loading_paths.clear()
+            self._preload_urgent = False
+
+    def preload_pair(
+        self,
+        playlist: Sequence[TrackAnalysis],
+        start_index: int = 0,
+    ) -> bool:
+        """后台完整准备第一首和下一首。
+
+        包括 MuQ 缓存读取、音频加载、结构特征、BPM 同步、切点搜索、
+        BPM 恢复桥和过渡渲染。用户点击播放时可直接复用结果。
+        """
+        if not playlist or not 0 <= start_index < len(playlist):
+            return False
+        key = self._pair_key(playlist, start_index)
+        with self._lock:
+            if self._playing:
+                return False
+            if self._prime_key == key and (
+                self._prime_loading or self._prime_current is not None
+            ):
+                return True
+            self._prime_generation += 1
+            generation = self._prime_generation
+            self._prime_loading = True
+            self._prime_key = key
+            self._prime_current = None
+            self._prime_next_synced_base = None
+            self._prime_next = None
+            self._prime_plan = None
+            snapshot = list(playlist)
+
+        def worker() -> None:
+            try:
+                self.emit(f"后台预加载：{snapshot[start_index].title}")
+                current = self.prepare_track(snapshot[start_index])
+                synced_base: PreparedTrack | None = None
+                prepared: PreparedTrack | None = None
+                plan: TransitionPlan | None = None
+                if start_index + 1 < len(snapshot):
+                    incoming = snapshot[start_index + 1]
+                    self.emit(f"后台预分析下一首：{incoming.title}")
+                    synced_base = self.prepare_track(
+                        incoming, target_bpm=current.original_bpm
+                    )
+                    plan = self._calculate_plan(
+                        current,
+                        synced_base,
+                        earliest_start=int(0.25 * self.config.sample_rate),
+                    )
+                    prepared = self._apply_tempo_restore(
+                        synced_base, plan.next_end
+                    )
+                    plan = self._render_advanced_transition(
+                        plan, current, prepared
+                    )
+                with self._lock:
+                    if (
+                        generation == self._prime_generation
+                        and self._prime_key == key
+                        and not self._playing
+                    ):
+                        self._prime_current = current
+                        self._prime_next_synced_base = synced_base
+                        self._prime_next = prepared
+                        self._prime_plan = plan
+                        self.emit("热下一轨预加载完成：点击播放可直接开始")
+                if prepared is not None and start_index + 2 < len(snapshot):
+                    self._warm_following_tracks(
+                        snapshot=snapshot,
+                        first_target_index=start_index + 2,
+                        source_bpm=prepared.original_bpm,
+                        generation=generation,
+                        token_kind="prime",
+                    )
+            except Exception as exc:
+                self.emit(f"后台预加载失败，将在播放时重试：{exc}")
+            finally:
+                with self._lock:
+                    if generation == self._prime_generation:
+                        self._prime_loading = False
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="AutoDJ-PairPreloader",
+        ).start()
+        return True
+
     def start_playlist(
         self,
         playlist: Sequence[TrackAnalysis],
@@ -668,17 +1055,42 @@ class AutoDJEngine:
                 "python-sounddevice/portaudio 后再启动实时播放。"
             )
 
-        self.close()
-        self.emit(f"正在提取当前歌曲的智能匹配特征：{playlist[start_index].title}")
-        current = self.prepare_track(playlist[start_index])
+        self.stop(clear_preload=False)
+        key = self._pair_key(playlist, start_index)
+        with self._lock:
+            use_prime = self._prime_key == key and self._prime_current is not None
+            if use_prime:
+                current = self._prime_current
+                primed_synced = self._prime_next_synced_base
+                primed_next = self._prime_next
+                primed_plan = self._prime_plan
+            else:
+                current = None
+                primed_synced = None
+                primed_next = None
+                primed_plan = None
+            # 取消仍在进行的旧预加载，但保留刚刚复制出的对象。
+            self._prime_generation += 1
+            self._prime_loading = False
+            self._prime_key = None
+            self._prime_current = None
+            self._prime_next_synced_base = None
+            self._prime_next = None
+            self._prime_plan = None
+
+        if current is None:
+            self.emit(f"正在提取当前歌曲的智能匹配特征：{playlist[start_index].title}")
+            current = self.prepare_track(playlist[start_index])
+        else:
+            self.emit("使用后台预加载结果启动播放")
 
         with self._lock:
             self._playlist = list(playlist)
             self._index = start_index
             self._current = current
-            self._next = None
-            self._next_synced_base = None
-            self._plan = None
+            self._next = primed_next
+            self._next_synced_base = primed_synced
+            self._plan = primed_plan
             self._current_pos = 0
             self._next_pos = 0
             self._transition_pos = 0
@@ -833,60 +1245,177 @@ class AutoDJEngine:
             current, next_track, earliest_start, plan, "Gapless Trim"
         )
 
+    def _fit_phrase_length(
+        self, audio: np.ndarray, target_length: int
+    ) -> tuple[np.ndarray, str]:
+        """Pitch-preserving local phrase warp to the outgoing wall-clock length."""
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+        target_length = max(1, int(target_length))
+        if len(audio) == target_length:
+            return audio, "none"
+        rate = len(audio) / float(target_length)
+        rendered, backend = quality_time_stretch(
+            audio,
+            sample_rate=self.config.sample_rate,
+            rate=rate,
+            backend=self.config.time_stretch_backend,
+        )
+        if len(rendered) > target_length:
+            rendered = rendered[:target_length]
+        elif len(rendered) < target_length:
+            rendered = np.pad(
+                rendered, ((0, target_length - len(rendered)), (0, 0))
+            )
+        return np.ascontiguousarray(rendered, dtype=np.float32), backend
+
+    @staticmethod
+    def _hpss_stereo(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Soft harmonic/percussive roles; sum remains close to the input."""
+        try:
+            harmonic, percussive = librosa.effects.hpss(
+                np.ascontiguousarray(audio.T),
+                margin=(1.0, 1.35),
+            )
+            return (
+                np.ascontiguousarray(harmonic.T, dtype=np.float32),
+                np.ascontiguousarray(percussive.T, dtype=np.float32),
+            )
+        except Exception:
+            return (
+                np.ascontiguousarray(audio, dtype=np.float32),
+                np.zeros_like(audio, dtype=np.float32),
+            )
+
+    def _render_phrase_locked_hpss(
+        self,
+        plan: TransitionPlan,
+        current: PreparedTrack,
+        next_track: PreparedTrack,
+    ) -> TransitionPlan:
+        """Generate several human-style phrase-locked transitions and rank them."""
+        a = current.audio[plan.current_start : plan.current_start + plan.length]
+        b_end = (
+            plan.next_resume_sample
+            if plan.next_resume_sample >= 0
+            else plan.next_start + plan.length
+        )
+        b_raw = next_track.audio[plan.next_start : b_end]
+        if len(a) < plan.length:
+            a = np.pad(a, ((0, plan.length - len(a)), (0, 0)))
+        a = np.ascontiguousarray(a[: plan.length], dtype=np.float32)
+        b, phrase_backend = self._fit_phrase_length(b_raw, plan.length)
+
+        a_low, _, _ = _split_three_bands(
+            a, self.config.sample_rate, self.config.bass_split_hz, self.config.high_split_hz
+        )
+        b_low, _, _ = _split_three_bands(
+            b, self.config.sample_rate, self.config.bass_split_hz, self.config.high_split_hz
+        )
+        a_body = np.ascontiguousarray(a - a_low, dtype=np.float32)
+        b_body = np.ascontiguousarray(b - b_low, dtype=np.float32)
+        a_harm, a_perc = self._hpss_stereo(a_body)
+        b_harm, b_perc = self._hpss_stereo(b_body)
+
+        current_label = (
+            current.structure.labels[plan.current_bar_index]
+            if plan.current_bar_index < len(current.structure.labels)
+            else "SECTION"
+        )
+        next_label = (
+            next_track.structure.labels[plan.next_bar_index]
+            if plan.next_bar_index < len(next_track.structure.labels)
+            else "SECTION"
+        )
+        human = render_human_transition(
+            a_low=a_low,
+            b_low=b_low,
+            a_harm=a_harm,
+            b_harm=b_harm,
+            a_perc=a_perc,
+            b_perc=b_perc,
+            sample_rate=self.config.sample_rate,
+            bpm=current.playback_bpm,
+            beats_per_bar=max(2, current.analysis.beats_per_bar),
+            bars=max(1, plan.bars),
+            local_gain=float(plan.metrics.get("local_gain", 1.0)),
+            effect_strength=plan.effect_strength,
+            plan_metrics=plan.metrics,
+            current_label=current_label,
+            next_label=next_label,
+            history=tuple(self._transition_history),
+            config=HumanTransitionConfig(
+                mode=self.config.human_style_mode,
+                variation=self.config.human_variation,
+                max_candidates=self.config.human_max_candidates,
+            ),
+        )
+
+        plan.rendered_audio = np.ascontiguousarray(human.audio, dtype=np.float32)
+        plan.human_archetype = human.archetype
+        plan.human_quality_score = human.score
+        plan.human_quality_metrics = dict(human.quality)
+        plan.metrics.update(human.quality)
+        plan.metrics["phrase_warp_ratio"] = len(b_raw) / max(plan.length, 1)
+        plan.metrics["phrase_warp_backend"] = (
+            1.0 if "rubber" in phrase_backend.lower() else 0.0
+        )
+        plan.metrics["human_current_role"] = float(
+            {"INTRO": 0, "BUILDUP": 1, "SECTION": 2, "PHRASE": 3, "VOCAL": 4, "BREAK": 5, "BREAKDOWN": 5, "COOLDOWN": 6, "DROP": 7, "OUTRO": 8}.get(current_label, 1)
+        )
+        plan.metrics["human_next_role"] = float(
+            {"INTRO": 0, "BUILDUP": 1, "SECTION": 2, "PHRASE": 3, "VOCAL": 4, "BREAK": 5, "BREAKDOWN": 5, "COOLDOWN": 6, "DROP": 7, "OUTRO": 8}.get(next_label, 1)
+        )
+        plan.transition_mode = f"Human Candidate · {human.archetype}"
+        return plan
+
     def _render_advanced_transition(
         self,
         plan: TransitionPlan,
         current: PreparedTrack,
         next_track: PreparedTrack,
     ) -> TransitionPlan:
-        """Pre-render echo or graph-cut spectral seam outside the audio callback."""
+        """Pre-render role-aware or graph-cut transition outside audio callback."""
         is_complex = plan.transition_mode == "Paper EQ/Fader"
         plan.echo_audio = (
             self._render_echo(plan, current)
             if is_complex
             else np.zeros((plan.length, 2), dtype=np.float32)
         )
+        if not is_complex:
+            return plan
+
         engine = self.config.transition_engine.strip().lower()
-        edm_pair = float(np.sqrt(
-            max(current.structure.edm_confidence, 0.0)
-            * max(next_track.structure.edm_confidence, 0.0)
-        ))
-        use_spectral = is_complex and (engine == "spectral seam" or (
-            engine == "adaptive"
-            and plan.policy_mode == "Complex DJ transition"
-            and edm_pair >= 0.48
-            and plan.score >= 0.54
-        ))
-        # Full-STFT rendering of very long 32-bar transitions is memory-heavy;
-        # parametric three-band DSP remains the safer renderer there.
-        maximum_seconds = 24.0
-        if use_spectral and plan.length / self.config.sample_rate <= maximum_seconds:
-            a = current.audio[plan.current_start : plan.current_end]
-            b = next_track.audio[plan.next_start : plan.next_end]
+        # Adaptive now defaults to phrase-locked role-aware rendering. Graph-cut is
+        # retained as an explicit experimental choice because it can blur dense EDM
+        # transients when the seam changes too frequently across frequency bins.
+        use_spectral = engine == "spectral seam"
+        if use_spectral and plan.length / self.config.sample_rate <= 24.0:
+            a = current.audio[plan.current_start : plan.current_start + plan.length]
+            b_end = plan.next_resume_sample if plan.next_resume_sample >= 0 else plan.next_start + plan.length
+            b_raw = next_track.audio[plan.next_start : b_end]
+            b, phrase_backend = self._fit_phrase_length(b_raw, plan.length)
             try:
                 result = spectral_seam_crossfade(
-                    outgoing=a,
+                    outgoing=a[: plan.length],
                     incoming=b,
                     sample_rate=self.config.sample_rate,
                 )
-                rendered = result.audio[: plan.length]
-                if len(rendered) < plan.length:
-                    rendered = np.pad(rendered, ((0, plan.length - len(rendered)), (0, 0)))
-                rendered = rendered + plan.echo_audio[: len(rendered)]
+                rendered = result.audio[: plan.length] + plan.echo_audio[: plan.length]
                 peak = float(np.max(np.abs(rendered)) + 1e-9)
                 if peak > 0.98:
                     rendered *= np.float32(0.98 / peak)
                 plan.rendered_audio = np.ascontiguousarray(rendered, dtype=np.float32)
-                plan.transition_mode = "Spectral Graph-Cut"
+                plan.transition_mode = "Phrase-Locked Spectral Graph-Cut"
                 plan.metrics["seam_mean_seconds"] = result.seam_seconds_mean
                 plan.metrics["seam_std_seconds"] = result.seam_seconds_std
                 plan.metrics["graph_flow"] = result.flow_value
+                plan.metrics["phrase_warp_ratio"] = len(b_raw) / max(plan.length, 1)
+                plan.metrics["phrase_warp_backend"] = 1.0 if "rubber" in phrase_backend.lower() else 0.0
+                return plan
             except Exception as exc:
-                self.emit(f"谱缝合回退到三段 EQ：{exc}")
-                plan.transition_mode = "Paper EQ/Fader"
-        elif plan.transition_mode not in {"Simple Crossfade", "Gapless Trim"}:
-            plan.transition_mode = "Paper EQ/Fader"
-        return plan
+                self.emit(f"谱缝合回退到 MuQ/HPSS：{exc}")
+
+        return self._render_phrase_locked_hpss(plan, current, next_track)
 
     def _calculate_plan(
         self,
@@ -905,7 +1434,9 @@ class AutoDJEngine:
             fx_config=self._fx_config(),
         )
         plan = self._apply_automix_policy(current, next_track, earliest_start, plan)
-        plan = self._render_advanced_transition(plan, current, next_track)
+        # Rendering is intentionally deferred until after the incoming track has
+        # received its continuous BPM-recovery bridge. This avoids doing HPSS and
+        # phrase warping twice in the background loader.
         plan.metrics["tempo_sync_bpm"] = next_track.playback_bpm
         plan.metrics["tempo_original_bpm"] = next_track.original_bpm
         plan.metrics["current_edm_confidence"] = current.structure.edm_confidence
@@ -920,8 +1451,16 @@ class AutoDJEngine:
         target_bpm: float,
     ) -> None:
         try:
-            self.emit(f"正在分析下一首匹配片段：{analysis.title}")
-            synced_base = self.prepare_track(analysis, target_bpm=target_bpm)
+            with self._lock:
+                snapshot = list(self._playlist)
+                outgoing_analysis = snapshot[source_index]
+            synced_base = self._take_warm_track(
+                outgoing_analysis, analysis, target_bpm
+            )
+            if synced_base is None:
+                self.emit(f"正在分析下一首匹配片段：{analysis.title}")
+                synced_base = self.prepare_track(analysis, target_bpm=target_bpm)
+
             with self._lock:
                 still_valid = (
                     generation == self._loader_generation
@@ -930,7 +1469,12 @@ class AutoDJEngine:
                     and self._playing
                 )
                 current = self._current
-                earliest = self._current_pos + int(0.25 * self.config.sample_rate)
+                latest = self._current_pos
+                earliest = latest + int(0.25 * self.config.sample_rate)
+                remaining_seconds = (
+                    (current.total_samples - latest) / self.config.sample_rate
+                    if current is not None else 0.0
+                )
 
             plan: TransitionPlan | None = None
             prepared = synced_base
@@ -938,15 +1482,37 @@ class AutoDJEngine:
                 plan = self._calculate_plan(current, synced_base, earliest)
                 with self._lock:
                     latest = self._current_pos
+                    remaining_seconds = (
+                        current.total_samples - latest
+                    ) / self.config.sample_rate
                 if latest >= plan.current_start:
                     plan = self._calculate_plan(
                         current,
                         synced_base,
-                        latest + int(0.15 * self.config.sample_rate),
+                        latest + int(0.10 * self.config.sample_rate),
                     )
+
+                # Deadline guard: if heavy processing finished close to the end,
+                # use a shorter beat-aligned transition rather than missing the
+                # planned OUT point and falling off the end of the current track.
+                if remaining_seconds <= max(8.0, self.config.preload_deadline_seconds * 0.35):
+                    if plan.current_end > current.total_samples or (
+                        plan.current_start - latest
+                    ) / self.config.sample_rate < 1.5:
+                        plan = self._simple_transition_plan(
+                            current,
+                            synced_base,
+                            latest + int(0.08 * self.config.sample_rate),
+                            plan,
+                            "Simple Crossfade",
+                        )
+                        plan.metrics["preload_deadline_fallback"] = 1.0
+                        self.emit("预加载接近截止点：已切换为短节拍淡化，避免错过切歌")
+
                 prepared = self._apply_tempo_restore(synced_base, plan.next_end)
                 plan = self._render_advanced_transition(plan, current, prepared)
 
+            installed = False
             with self._lock:
                 if (
                     generation == self._loader_generation
@@ -956,6 +1522,9 @@ class AutoDJEngine:
                     self._next_synced_base = synced_base
                     self._next = prepared
                     self._plan = plan
+                    self._preload_urgent = False
+                    self._next_loading = False
+                    installed = True
                     if plan is not None:
                         self.emit(
                             "专业切歌已规划："
@@ -964,24 +1533,52 @@ class AutoDJEngine:
                             f"{(str(plan.bars) + ' 小节') if plan.bars else '无缝裁切'} | {plan.transition_mode} | "
                             f"匹配 {plan.score * 100:.0f}分"
                         )
+
+            # The immediate next track is hot. Use the remaining background time
+            # to prepare synchronized bases farther ahead in the queue.
+            if installed and prepared is not None and source_index + 2 < len(snapshot):
+                self._warm_following_tracks(
+                    snapshot=snapshot,
+                    first_target_index=source_index + 2,
+                    source_bpm=prepared.original_bpm,
+                    generation=generation,
+                    token_kind="loader",
+                )
         except Exception as exc:
             self.emit(f"准备下一首失败：{exc}")
         finally:
             with self._lock:
-                self._next_loading = False
+                if (
+                    generation == self._loader_generation
+                    and source_index == self._index
+                ):
+                    self._next_loading = False
 
     def service(self) -> None:
         with self._lock:
+            if not self._playing or self._current is None:
+                return
+            remaining_seconds = (
+                self._current.total_samples - self._current_pos
+            ) / self.config.sample_rate
+            if self._next is None and self._index + 1 < len(self._playlist):
+                urgent = remaining_seconds <= self.config.preload_deadline_seconds
+                self._preload_urgent = urgent
+                if urgent and self._urgent_notice_index != self._index:
+                    self._urgent_notice_index = self._index
+                    self.emit(
+                        f"预加载进入优先模式：距离当前轨结束约 {remaining_seconds:.0f} 秒"
+                    )
+            else:
+                self._preload_urgent = False
+
             if (
-                not self._playing
-                or self._current is None
-                or self._next is not None
+                self._next is not None
                 or self._next_loading
                 or self._index + 1 >= len(self._playlist)
             ):
                 return
             analysis = self._playlist[self._index + 1]
-            # 下一次切歌通常发生在当前歌曲已恢复原 BPM 之后。
             target_bpm = self._current.original_bpm
             generation = self._loader_generation
             source_index = self._index
@@ -991,11 +1588,10 @@ class AutoDJEngine:
             target=self._load_next_worker,
             args=(generation, source_index, analysis, target_bpm),
             daemon=True,
-            name="AutoDJ-NextLoader",
+            name="AutoDJ-SlidingWindowLoader",
         )
         self._next_loader = worker
         worker.start()
-
     def _replan(self, force_start: int | None = None) -> TransitionPlan | None:
         with self._lock:
             current = self._current
@@ -1060,8 +1656,14 @@ class AutoDJEngine:
         if self._next is None:
             self._playing = False
             return
+        if self._plan is not None and self._plan.human_archetype:
+            self._transition_history.append(self._plan.human_archetype)
+            del self._transition_history[:-8]
+        resume = self._next_pos
+        if self._plan is not None and self._plan.next_resume_sample >= 0:
+            resume = self._plan.next_resume_sample
         self._current = self._next
-        self._current_pos = self._next_pos
+        self._current_pos = int(np.clip(resume, 0, max(0, self._current.total_samples - 1)))
         self._index += 1
         self._next = None
         self._next_synced_base = None
@@ -1175,6 +1777,18 @@ class AutoDJEngine:
 
             if self._master_volume != 1.0:
                 outdata *= np.float32(self._master_volume)
+            if self._seek_fade_remaining > 0:
+                count = min(frames, self._seek_fade_remaining)
+                completed = self._seek_fade_total - self._seek_fade_remaining
+                ramp = np.linspace(
+                    completed / max(self._seek_fade_total, 1),
+                    (completed + count) / max(self._seek_fade_total, 1),
+                    count,
+                    endpoint=False,
+                    dtype=np.float32,
+                )
+                outdata[:count] *= ramp[:, None]
+                self._seek_fade_remaining -= count
             self._soft_limit(outdata)
 
     def pause(self) -> None:
@@ -1187,7 +1801,114 @@ class AutoDJEngine:
                 self._paused = False
                 self._playing = True
 
-    def stop(self) -> None:
+    def seek(self, seconds: float, snap_to_beat: bool = True) -> float:
+        """跳转当前歌曲位置，并在后台重新规划后续切歌。
+
+        默认吸附到最近 beat，既便于 DJ 场景定位，也减少从瞬态中间起播的
+        违和感。跳转后加入 30ms 淡入以抑制 click。
+        """
+        with self._lock:
+            current = self._current
+            if current is None:
+                raise RuntimeError("当前没有可跳转的歌曲。")
+            target = int(round(float(seconds) * self.config.sample_rate))
+            target = int(np.clip(target, 0, max(0, current.total_samples - 1)))
+            if snap_to_beat and current.beat_samples.size:
+                index = int(np.argmin(np.abs(current.beat_samples - target)))
+                target = int(current.beat_samples[index])
+
+            self._current_pos = target
+            self._transitioning = False
+            self._transition_pos = 0
+            self._next_pos = 0
+            self._seek_fade_remaining = self._seek_fade_total
+
+            should_replan = self._next_synced_base is not None
+            if should_replan:
+                # 旧 plan 的 OUT 位置可能已经在跳转点之前；先撤销已渲染版本，
+                # 后台以新播放位置为 earliest_start 重新搜索。
+                self._next = None
+                self._plan = None
+                self._next_loading = True
+                replan_generation = self._loader_generation
+                replan_index = self._index
+            else:
+                replan_generation = -1
+                replan_index = -1
+            actual = target / float(self.config.sample_rate)
+
+        self.emit(f"已跳转到 {actual:.1f}s（吸附最近节拍）")
+        if should_replan:
+            def worker() -> None:
+                try:
+                    self._replan()
+                    self.emit("跳转后的切歌位置已重新规划")
+                except Exception as exc:
+                    self.emit(f"跳转后重新规划失败：{exc}")
+                finally:
+                    with self._lock:
+                        if (
+                            replan_generation == self._loader_generation
+                            and replan_index == self._index
+                        ):
+                            self._next_loading = False
+
+            threading.Thread(
+                target=worker,
+                daemon=True,
+                name="AutoDJ-SeekReplan",
+            ).start()
+        else:
+            self.service()
+        return actual
+
+    def update_playlist_order(self, playlist: Sequence[TrackAnalysis]) -> None:
+        """在播放中更新队列，保留当前歌曲并重载改变后的下一首。"""
+        snapshot = list(playlist)
+        if not snapshot:
+            return
+        reload_needed = False
+        with self._lock:
+            if self._current is None or not self._playing:
+                self._playlist = snapshot
+                return
+            current_path = self._current.analysis.path
+            positions = [
+                index
+                for index, item in enumerate(snapshot)
+                if item.path == current_path
+            ]
+            if not positions:
+                raise ValueError("新播放列表中缺少当前正在播放的歌曲。")
+            new_index = positions[0]
+            desired_next = (
+                snapshot[new_index + 1].path
+                if new_index + 1 < len(snapshot)
+                else ""
+            )
+            loaded_next = self._next.analysis.path if self._next is not None else ""
+
+            self._playlist = snapshot
+            self._index = new_index
+            self._loader_generation += 1
+            self._next_loading = False
+            self._warm_loading_paths.clear()
+            self._preload_urgent = False
+
+            # 已经进入过渡后不能替换 B；GUI 排序器会锁住该歌曲。
+            if not self._transitioning and desired_next != loaded_next:
+                self._next = None
+                self._next_synced_base = None
+                self._plan = None
+                self._next_pos = 0
+                self._transition_pos = 0
+                reload_needed = bool(desired_next)
+
+        if reload_needed:
+            self.emit("MuQ 已更新尚未播放顺序，正在预加载新的下一首")
+            self.service()
+
+    def stop(self, clear_preload: bool = True) -> None:
         with self._lock:
             self._playing = False
             self._paused = False
@@ -1210,6 +1931,12 @@ class AutoDJEngine:
             self._next_pos = 0
             self._transition_pos = 0
             self._transitioning = False
+            self._seek_fade_remaining = 0
+            self._next_loading = False
+            self._preload_urgent = False
+            self._warm_loading_paths.clear()
+        if clear_preload:
+            self.clear_preload()
 
     def close(self) -> None:
         self.stop()
@@ -1244,6 +1971,21 @@ class AutoDJEngine:
         self.config.effect_strength = float(np.clip(strength, 0.0, 1.0))
         self.rebuild_transition()
 
+    def set_human_style_mode(self, value: str) -> None:
+        allowed = {"Adaptive Human", *SUPPORTED_ARCHETYPES}
+        if value not in allowed:
+            raise ValueError(f"未知真人 DJ 策略：{value}")
+        self.config.human_style_mode = value
+        self.rebuild_transition()
+
+    def set_human_variation(self, value: float) -> None:
+        self.config.human_variation = float(np.clip(value, 0.0, 1.0))
+        self.rebuild_transition()
+
+    def set_human_candidate_count(self, value: int) -> None:
+        self.config.human_max_candidates = int(np.clip(value, 1, len(SUPPORTED_ARCHETYPES)))
+        self.rebuild_transition()
+
     def set_transition_engine(self, value: str) -> None:
         if value not in {"Adaptive", "Spectral Seam", "EQ/Fader"}:
             raise ValueError(f"未知过渡引擎：{value}")
@@ -1257,12 +1999,77 @@ class AutoDJEngine:
         self.rebuild_transition()
 
     def set_time_stretch_backend(self, value: str) -> None:
-        if value not in {"auto", "Rubber Band R3", "librosa"}:
+        if value not in {"auto", "Rubber Band R3", "Hybrid HPSS", "librosa"}:
             raise ValueError(f"未知时间拉伸后端：{value}")
         self.config.time_stretch_backend = value
 
+    def set_muq_enabled(self, enabled: bool) -> None:
+        self.config.muq_enabled = bool(enabled)
+        self.rebuild_transition()
+
+    def set_muq_device(self, device: str) -> None:
+        if device not in {"cpu", "cuda", "mps"}:
+            raise ValueError(f"未知 MuQ 设备：{device}")
+        self.config.muq_device = device
+        self._muq_analyzer = None
+
+    def set_allin1_enabled(self, enabled: bool) -> None:
+        self.config.allin1_enabled = bool(enabled)
+        self.rebuild_transition()
+
+    def set_allin1_device(self, device: str) -> None:
+        if device not in {"cpu", "cuda", "mps"}:
+            raise ValueError(f"未知 All-In-One 设备：{device}")
+        self.config.allin1_device = device
+        self._allin1_analyzer = None
+
+    def set_allin1_model(self, model: str) -> None:
+        if not model.startswith("harmonix-"):
+            raise ValueError(f"未知 All-In-One 模型：{model}")
+        self.config.allin1_model_name = model
+        self._allin1_analyzer = None
+        self.rebuild_transition()
+
+    def set_preload_window_tracks(self, value: int) -> None:
+        self.config.preload_window_tracks = int(np.clip(value, 2, 6))
+
+    def set_preload_memory_mb(self, value: int) -> None:
+        self.config.preload_memory_mb = int(np.clip(value, 256, 8192))
+
+    def set_preload_deadline_seconds(self, value: float) -> None:
+        self.config.preload_deadline_seconds = float(np.clip(value, 15.0, 180.0))
+
     def set_cue_on_first_downbeat(self, enabled: bool) -> None:
         self.config.cue_on_first_downbeat = bool(enabled)
+
+    @staticmethod
+    def _timeline_sections(track: PreparedTrack | None) -> tuple[tuple[float, float, str], ...]:
+        if track is None or not track.allin1_profile.available:
+            return ()
+        source_grid = np.asarray(track.source_downbeat_samples, dtype=np.float64)
+        target_grid = np.asarray(track.downbeat_samples, dtype=np.float64)
+        count = min(source_grid.size, target_grid.size)
+        if count >= 2:
+            source_grid = source_grid[:count]
+            target_grid = target_grid[:count]
+            source_grid = np.concatenate(([0.0], source_grid, [float(len(track.source_audio))]))
+            target_grid = np.concatenate(([0.0], target_grid, [float(track.total_samples)]))
+            source_grid, unique = np.unique(source_grid, return_index=True)
+            target_grid = target_grid[unique]
+
+            def mapped(seconds: float) -> float:
+                sample = float(seconds) * track.sample_rate
+                value = float(np.interp(sample, source_grid, target_grid))
+                return value / track.sample_rate
+        else:
+            def mapped(seconds: float) -> float:
+                return float(seconds) / max(track.stretch_rate, 1e-6)
+
+        return tuple(
+            (mapped(segment.start), mapped(segment.end), segment.label.upper())
+            for segment in track.allin1_profile.segments
+            if segment.end > segment.start
+        )
 
     def get_status(self) -> dict[str, Any]:
         with self._lock:
@@ -1275,7 +2082,9 @@ class AutoDJEngine:
                     "playing": False,
                     "paused": False,
                     "current": "",
+                    "current_path": "",
                     "next": "",
+                    "next_path": "",
                     "position": 0.0,
                     "duration": 0.0,
                     "next_duration": 0.0,
@@ -1288,6 +2097,17 @@ class AutoDJEngine:
                     "transition_progress": 0.0,
                     "index": -1,
                     "next_loading": self._next_loading,
+                    "next_ready": False,
+                    "preload_loading": self._prime_loading,
+                    "preload_ready": self._prime_current is not None,
+                    "preload_current_path": self._prime_key[0] if self._prime_key else "",
+                    "preload_next_path": self._prime_key[1] if self._prime_key else "",
+                    "preload_window_tracks": self.config.preload_window_tracks,
+                    "warm_ready_paths": tuple(key[1] for key in self._warm_cache.keys()),
+                    "warm_loading_paths": tuple(sorted(self._warm_loading_paths)),
+                    "warm_cache_mb": self._warm_cache_bytes / (1024.0 * 1024.0),
+                    "preload_urgent": self._preload_urgent,
+                    "seconds_to_transition": None,
                     "cpu_load": 0.0,
                     "callback_status": self._last_callback_status,
                     "current_waveform": None,
@@ -1307,6 +2127,11 @@ class AutoDJEngine:
                     "match_metrics": {},
                     "mix_style": self.config.mix_style,
                     "effect_strength": self.config.effect_strength,
+                    "human_style_mode": self.config.human_style_mode,
+                    "human_variation": self.config.human_variation,
+                    "human_archetype": "",
+                    "human_quality_score": 0.0,
+                    "human_quality_metrics": {},
                     "transition_mode": "",
                     "policy_mode": self.config.automix_policy,
                     "stretch_backend": "",
@@ -1316,6 +2141,13 @@ class AutoDJEngine:
                     "next_edm_confidence": 0.0,
                     "current_cues": (),
                     "next_cues": (),
+                    "current_sections": (),
+                    "next_sections": (),
+                    "current_structure_source": "",
+                    "next_structure_source": "",
+                    "current_function_label": "",
+                    "next_function_label": "",
+                    "allin1_enabled": self.config.allin1_enabled,
                     "switch_time_a": None,
                     "switch_time_b": None,
                     "plan_signature": None,
@@ -1369,13 +2201,17 @@ class AutoDJEngine:
                 self.config.tempo_restore_bars,
                 plan.transition_mode,
                 plan.policy_mode,
+                plan.human_archetype,
+                round(plan.human_quality_score, 3),
             ) if plan else None
 
             return {
                 "playing": self._playing,
                 "paused": self._paused,
                 "current": current.title,
+                "current_path": current.analysis.path,
                 "next": next_track.title if next_track else "",
+                "next_path": next_track.analysis.path if next_track else "",
                 "position": position,
                 "duration": duration,
                 "next_duration": next_track.duration if next_track else 0.0,
@@ -1390,6 +2226,20 @@ class AutoDJEngine:
                 "transition_progress": float(np.clip(transition_progress, 0.0, 1.0)),
                 "index": self._index,
                 "next_loading": self._next_loading,
+                "next_ready": next_track is not None and plan is not None,
+                "preload_loading": self._prime_loading,
+                "preload_ready": self._prime_current is not None,
+                "preload_current_path": self._prime_key[0] if self._prime_key else "",
+                "preload_next_path": self._prime_key[1] if self._prime_key else "",
+                "preload_window_tracks": self.config.preload_window_tracks,
+                "warm_ready_paths": tuple(key[1] for key in self._warm_cache.keys()),
+                "warm_loading_paths": tuple(sorted(self._warm_loading_paths)),
+                "warm_cache_mb": self._warm_cache_bytes / (1024.0 * 1024.0),
+                "preload_urgent": self._preload_urgent,
+                "seconds_to_transition": (
+                    max(0.0, (plan.current_start - current_pos) / self.config.sample_rate)
+                    if plan is not None else max(0.0, duration - position)
+                ),
                 "cpu_load": cpu_load,
                 "callback_status": self._last_callback_status,
                 "current_waveform": current.waveform_envelope,
@@ -1427,6 +2277,11 @@ class AutoDJEngine:
                 "effect_strength": (
                     plan.effect_strength if plan else self.config.effect_strength
                 ),
+                "human_style_mode": self.config.human_style_mode,
+                "human_variation": self.config.human_variation,
+                "human_archetype": plan.human_archetype if plan else "",
+                "human_quality_score": plan.human_quality_score if plan else 0.0,
+                "human_quality_metrics": dict(plan.human_quality_metrics) if plan else {},
                 "transition_mode": plan.transition_mode if plan else "",
                 "policy_mode": plan.policy_mode if plan else self.config.automix_policy,
                 "stretch_backend": next_track.stretch_backend if next_track else current.stretch_backend,
@@ -1444,6 +2299,21 @@ class AutoDJEngine:
                     for index in next_track.structure.cue_indices[:48]
                     if next_track and index < next_track.bar_features.count
                 ) if next_track else (),
+                "current_sections": self._timeline_sections(current),
+                "next_sections": self._timeline_sections(next_track),
+                "current_structure_source": current.structure.structure_source,
+                "next_structure_source": next_track.structure.structure_source if next_track else "",
+                "current_function_label": (
+                    current.structure.functional_labels[plan.current_bar_index]
+                    if plan and plan.current_bar_index < len(current.structure.functional_labels)
+                    else ""
+                ),
+                "next_function_label": (
+                    next_track.structure.functional_labels[plan.next_bar_index]
+                    if plan and next_track and plan.next_bar_index < len(next_track.structure.functional_labels)
+                    else ""
+                ),
+                "allin1_enabled": self.config.allin1_enabled,
                 "switch_time_a": plan.switch_sample_a / self.config.sample_rate if plan else None,
                 "switch_time_b": plan.switch_sample_b / self.config.sample_rate if plan else None,
                 "plan_signature": signature,

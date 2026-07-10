@@ -1,63 +1,71 @@
-# Python cache and bytecode
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Virtual environments
+# Virtual environments / dependency folders
 .venv/
 venv/
 env/
 ENV/
+.conda/
 
-# Packaging and build artifacts
+# Build / packaging artifacts
 build/
 dist/
 *.egg-info/
-.eggs/
 *.egg
 
-# Test, coverage, and type-check caches
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.mypy_cache/
-.ruff_cache/
-.tox/
-
-# Jupyter / IPython
-.ipynb_checkpoints/
-
-# IDE and editor files
+# IDE / editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS files
+# OS generated files
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Logs and temporary files
+# Logs / temporary files
 *.log
 *.tmp
 *.temp
+tmp/
+temp/
 
-# Environment and secrets
+# Local environment / secrets
 .env
 .env.*
 !.env.example
 
-# Generated audio / analysis outputs
+# ML / model / cache outputs
+.cache/
+models/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Generated demo and audio outputs
+demo_output/
 outputs/
 output/
-exports/
-cache/
+*.wav
 *.mp3
 *.flac
+*.ogg
+*.m4a
 *.aiff
 *.aif
-*.m4a
 
-# Keep demo WAV files tracked unless explicitly removed
-!demo_tracks/*.wav
+# Keep source fixtures in demo_tracks and tests if intentionally tracked
+!demo_tracks/
+!demo_tracks/**
+!tests/**

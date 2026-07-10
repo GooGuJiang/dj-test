@@ -72,3 +72,22 @@ def test_time_stretch_fallback_preserves_stereo() -> None:
     assert len(result) < len(audio)
     assert "librosa" in backend.lower()
     assert np.isfinite(result).all()
+
+
+def test_hybrid_hpss_stretch_preserves_transients_and_stereo() -> None:
+    sr = 8000
+    n = sr * 2
+    audio = np.zeros((n, 2), dtype=np.float32)
+    for start in range(0, n, sr // 2):
+        length = min(96, n - start)
+        envelope = np.exp(-np.arange(length, dtype=np.float32) / 18.0)
+        audio[start : start + length, 0] += envelope
+        audio[start : start + length, 1] += 0.9 * envelope
+    t = np.arange(n, dtype=np.float32) / sr
+    audio += 0.04 * np.column_stack((np.sin(2 * np.pi * 110 * t),) * 2).astype(np.float32)
+    result, backend = stretch_stereo(audio, sr, rate=1.04, backend="Hybrid HPSS")
+    assert result.ndim == 2 and result.shape[1] == 2
+    assert abs(len(result) - round(len(audio) / 1.04)) <= 2
+    assert "hybrid" in backend.lower()
+    assert np.isfinite(result).all()
+    assert float(np.max(np.abs(result))) > 0.2

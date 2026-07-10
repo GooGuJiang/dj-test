@@ -1,17 +1,35 @@
 from __future__ import annotations
 
-from autodj.time_stretch import rubberband_executable
+import json
+import os
+import sys
+
+from autodj.time_stretch import rubberband_probe
 
 
 def main() -> None:
-    executable = rubberband_executable()
-    if executable:
-        print("Rubber Band R3/CLI 已找到：", executable)
-        print("GUI 中将时间拉伸质量设置为 auto 或 Rubber Band R3 即可使用。")
+    result = rubberband_probe()
+    print("Python:", sys.executable)
+    print("CONDA_PREFIX:", os.environ.get("CONDA_PREFIX", "<未设置>"))
+    print("显式 Rubber Band 环境变量:")
+    for name, value in result.get("environment", {}).items():
+        print(f"  {name}={value or '<未设置>'}")
+    print()
+    if result.get("ok"):
+        print("Rubber Band R3/CLI 已找到并可启动：")
+        print(" ", result.get("executable"))
+        print("探测信息：", result.get("message"))
+        print("GUI 中选择 auto 或 Rubber Band R3 即可使用。")
+    elif result.get("executable"):
+        print("找到了文件，但进程无法正常启动：")
+        print(" ", result.get("executable"))
+        print("原因：", result.get("message"))
     else:
-        print("没有找到 rubberband-r3 或 rubberband 可执行文件。")
-        print("程序仍可运行：定速使用 librosa，BPM 回归使用单次 STFT 连续可变 phase-vocoder。")
-        print("需要更高质量时，请安装 Rubber Band 命令行程序并加入 PATH。")
+        print("没有找到 Rubber Band CLI。")
+        print("Windows 请注意：PATH 中应加入 rubberband.exe 所在目录，而不是 exe 文件本身。")
+        print("也可以设置：")
+        print(r'  set AUTODJ_RUBBERBAND=C:\\tools\\rubberband\\rubberband.exe')
+        print("或者在 GUI 中手动选择 rubberband.exe。")
 
 
 if __name__ == "__main__":

@@ -13,3 +13,16 @@ torchaudio>=2.3
 einops>=0.8
 rotary-embedding-torch>=0.6
 soxr>=0.3
+
+# MuQ 风格/语义表示（权重 CC-BY-NC 4.0）
+muq
+huggingface-hub>=0.24
+safetensors>=0.4
+
+# All-In-One functional structure analysis. Install the package itself with
+# python install_allinone.py so pip does not replace PyTorch/NATTEN unexpectedly.
+Cython<3
+demucs>=4.0
+hydra-core>=1.3
+omegaconf>=2.3
+tqdm>=4.66

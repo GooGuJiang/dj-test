@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -14,9 +14,18 @@ def _time_text(seconds: float | None) -> str:
 
 
 class DJTimeline(tk.Canvas):
-    """双轨波形时间轴，显示 OUT/IN、混音区和 BPM 恢复区。"""
+    """双轨波形时间轴。
 
-    def __init__(self, master: tk.Misc, **kwargs: Any) -> None:
+    上方 A 轨支持鼠标点击和拖动预览；松开鼠标后调用 ``on_seek``。
+    只在松开时真正 seek，避免拖动时反复重建切歌规划和产生音频抖动。
+    """
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_seek: Callable[[float], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
         height = int(kwargs.pop("height", 142))
         super().__init__(
             master,
@@ -25,7 +34,67 @@ class DJTimeline(tk.Canvas):
             highlightthickness=0,
             **kwargs,
         )
+        self._on_seek = on_seek
+        self._last_status: dict[str, Any] = {}
+        self._dragging = False
+        self._preview_seconds: float | None = None
         self.bind("<Configure>", lambda _: self.event_generate("<<TimelineResize>>"))
+        self.bind("<Button-1>", self._seek_press)
+        self.bind("<B1-Motion>", self._seek_motion)
+        self.bind("<ButtonRelease-1>", self._seek_release)
+
+    def set_seek_callback(self, callback: Callable[[float], None] | None) -> None:
+        self._on_seek = callback
+
+    def _seek_geometry(self) -> tuple[float, float, float, float, float]:
+        width = max(200, self.winfo_width())
+        height = max(132, self.winfo_height())
+        left = 58.0
+        right = width - 12.0
+        top_a = 12.0
+        bottom_a = height / 2.0 - 6.0
+        return left, right, top_a, bottom_a, max(1.0, right - left)
+
+    def _time_from_pointer(self, x: float, y: float) -> float | None:
+        duration = float(self._last_status.get("duration") or 0.0)
+        if duration <= 0 or not self._last_status.get("current"):
+            return None
+        left, right, top_a, bottom_a, width = self._seek_geometry()
+        if y < top_a - 8 or y > bottom_a + 8:
+            return None
+        ratio = float(np.clip((x - left) / width, 0.0, 1.0))
+        return ratio * duration
+
+    def _seek_press(self, event: tk.Event[tk.Misc]) -> str | None:
+        value = self._time_from_pointer(float(event.x), float(event.y))
+        if value is None:
+            return None
+        self._dragging = True
+        self._preview_seconds = value
+        self.render(self._last_status)
+        return "break"
+
+    def _seek_motion(self, event: tk.Event[tk.Misc]) -> str | None:
+        if not self._dragging:
+            return None
+        value = self._time_from_pointer(float(event.x), float(event.y))
+        if value is not None:
+            self._preview_seconds = value
+            self.render(self._last_status)
+        return "break"
+
+    def _seek_release(self, event: tk.Event[tk.Misc]) -> str | None:
+        if not self._dragging:
+            return None
+        value = self._time_from_pointer(float(event.x), float(event.y))
+        if value is None:
+            value = self._preview_seconds
+        self._dragging = False
+        self._preview_seconds = None
+        self.render(self._last_status)
+        if value is not None and self._on_seek is not None:
+            self._on_seek(float(value))
+        return "break"
 
     @staticmethod
     def _x(time_value: float, duration: float, left: float, width: float) -> float:
@@ -117,7 +186,55 @@ class DJTimeline(tk.Canvas):
                 continue
             self.create_line(x, bottom - 7, x, bottom, fill=color, width=1)
 
+    def _structure_segments(
+        self,
+        segments: object,
+        duration: float,
+        top: float,
+        bottom: float,
+        left: float,
+        width: float,
+    ) -> None:
+        if duration <= 0 or not isinstance(segments, (tuple, list)):
+            return
+        palette = {
+            "INTRO": "#24435a",
+            "VERSE": "#3a3154",
+            "CHORUS": "#5a3a2d",
+            "BREAK": "#284b3b",
+            "BRIDGE": "#4d3d24",
+            "INST": "#30404d",
+            "SOLO": "#54334d",
+            "OUTRO": "#4a2f38",
+            "START": "#2d3945",
+            "END": "#3f3035",
+        }
+        strip_bottom = min(bottom, top + 15.0)
+        for item in segments:
+            if not isinstance(item, (tuple, list)) or len(item) < 3:
+                continue
+            try:
+                start, end, label = float(item[0]), float(item[1]), str(item[2]).upper()
+            except (TypeError, ValueError):
+                continue
+            if end <= start:
+                continue
+            x0 = self._x(start, duration, left, width)
+            x1 = self._x(end, duration, left, width)
+            fill = palette.get(label, "#343a40")
+            self.create_rectangle(x0, top, x1, strip_bottom, fill=fill, outline="#202328")
+            if x1 - x0 >= 34:
+                self.create_text(
+                    x0 + 3,
+                    top + 7,
+                    text=label,
+                    fill="#e6edf3",
+                    font=("Arial", 7, "bold"),
+                    anchor="w",
+                )
+
     def render(self, status: dict[str, Any]) -> None:
+        self._last_status = dict(status)
         self.delete("all")
         width = max(200, self.winfo_width())
         height = max(132, self.winfo_height())
@@ -198,6 +315,15 @@ class DJTimeline(tk.Canvas):
             left,
             plot_width,
             "#3e3824",
+        )
+
+        self._structure_segments(
+            status.get("current_sections"),
+            duration, top_a, bottom_a, left, plot_width
+        )
+        self._structure_segments(
+            status.get("next_sections"),
+            next_duration, top_b, bottom_b, left, plot_width
         )
 
         self._draw_waveform(
@@ -298,6 +424,28 @@ class DJTimeline(tk.Canvas):
                 bottom_a,
                 fill="#ffffff",
                 width=2,
+            )
+
+        if self._preview_seconds is not None and duration > 0:
+            preview_x = self._x(
+                float(self._preview_seconds), duration, left, plot_width
+            )
+            self.create_line(
+                preview_x,
+                top_a,
+                preview_x,
+                bottom_a,
+                fill="#66d9ef",
+                width=2,
+                dash=(4, 3),
+            )
+            self.create_text(
+                preview_x,
+                bottom_a - 4,
+                text=f"跳转 {_time_text(self._preview_seconds)}",
+                fill="#66d9ef",
+                font=("Arial", 9, "bold"),
+                anchor="se" if preview_x > width * 0.72 else "sw",
             )
 
         self.create_rectangle(left, top_a, right, bottom_a, outline="#343a40")

@@ -12,7 +12,8 @@ import torchaudio
 
 from beat_this.inference import File2Beats
 from beat_this.utils import infer_beat_numbers
-from autodj.time_stretch import rubberband_executable
+from autodj.time_stretch import rubberband_probe
+from autodj.allinone_analyzer import probe_allinone
 
 
 def main() -> None:
@@ -40,11 +41,32 @@ def main() -> None:
     print("Beat This!: small0 加载成功")
     print("Beat number helper:", sample_numbers.tolist())
 
-    executable = rubberband_executable()
-    if executable:
-        print("Rubber Band time-map:", executable)
+    try:
+        from muq import MuQ  # noqa: F401
+        print("MuQ: 官方 Python 包可导入")
+        print("MuQ model: OpenMuQ/MuQ-large-msd-iter（首次分析自动下载）")
+    except Exception as exc:
+        print("MuQ: 未安装或导入失败：", exc)
+        print("运行 python install_muq.py 后可启用风格排序；Beat This! 播放仍可使用。")
+
+    aio = probe_allinone()
+    if aio.get("ok"):
+        print(
+            "All-In-One:", aio.get("allin1_version"),
+            "· NATTEN", aio.get("natten_backend")
+        )
     else:
-        print("Rubber Band: 未检测到，将使用连续可变 phase-vocoder 回退")
+        print("All-In-One: 未安装；运行 python install_allinone.py")
+        print("All-In-One 诊断:", aio.get("message"))
+
+    rb = rubberband_probe()
+    if rb.get("ok"):
+        print("Rubber Band R3 time-map:", rb.get("executable"))
+    elif rb.get("executable"):
+        print("Rubber Band: 找到但无法启动：", rb.get("message"))
+    else:
+        print("Rubber Band: 未检测到，将使用 Hybrid HPSS/连续变速回退")
+        print("可在 GUI 中手动选择 rubberband.exe，或设置 AUTODJ_RUBBERBAND。")
 
     try:
         output_devices = [

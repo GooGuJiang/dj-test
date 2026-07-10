@@ -242,18 +242,51 @@ def analyze_edm_structure(
 
     labels: list[str] = []
     energy = _unit(features.rms)
+    # Raveform-compatible functional vocabulary. The public Raveform dataset
+    # annotates intro, buildup, breakdown, drop, cooldown and outro; here we
+    # infer the same roles from bar-synchronous energy, percussion and novelty.
     for index in range(count):
-        before = float(np.mean(energy[max(0, index - 4) : index])) if index > 0 else 0.0
-        after = float(np.mean(energy[index : min(count, index + 4)]))
+        before_slice = energy[max(0, index - 4) : index]
+        after_slice = energy[index : min(count, index + 4)]
+        before = float(np.mean(before_slice)) if before_slice.size else 0.0
+        after = float(np.mean(after_slice)) if after_slice.size else 0.0
+        local = float(energy[index])
         vocal_here = float(np.mean(vocal[index : min(count, index + 4)]))
-        if index <= max(2, int(0.12 * count)):
+        percussion_here = float(np.mean(onset[index : min(count, index + 4)]))
+        low_here = float(np.mean(low[index : min(count, index + 4)]))
+        boundary = float(combined[index])
+        rise = after - before
+        fall = before - after
+
+        if index <= max(2, int(0.10 * count)):
             label = "INTRO"
-        elif index >= int(0.82 * count):
+        elif index >= int(0.86 * count):
             label = "OUTRO"
-        elif after - before > 0.24:
+        elif (
+            rise > 0.16
+            and after > 0.55
+            and (boundary > 0.30 or salience[index] > 0.55)
+        ):
+            label = "BUILDUP"
+        elif (
+            fall > 0.17
+            and after < 0.55
+            and (boundary > 0.25 or percussion_here < 0.45)
+        ):
+            label = "BREAKDOWN"
+        elif (
+            after > 0.62
+            and percussion_here > 0.48
+            and low_here > 0.38
+            and (rise > 0.10 or boundary > 0.42)
+        ):
             label = "DROP"
-        elif before - after > 0.22:
-            label = "BREAK"
+        elif (
+            local > after + 0.10
+            and before > 0.55
+            and after > 0.34
+        ):
+            label = "COOLDOWN"
         elif vocal_here > 0.64:
             label = "VOCAL"
         elif phrase[index] >= 0.85:

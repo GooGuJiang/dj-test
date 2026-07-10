@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import tkinter as tk
@@ -7,9 +8,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from autodj.audio_engine import AutoDJEngine, EngineConfig
+from autodj.allinone_analyzer import AllInOneAnalyzer, probe_allinone
 from autodj.beat_this_analyzer import BeatThisAnalyzer
-from autodj.models import TrackAnalysis
+from autodj.models import AllInOneProfile, MuQProfile, TrackAnalysis
+from autodj.muq_analyzer import MuQAnalyzer
+from autodj.playlist_ranker import PairScore, rank_playlist, style_clusters, transition_compatibility
 from autodj.timeline import DJTimeline
+from autodj.time_stretch import rubberband_probe
+from autodj.settings_store import SettingsStore
 
 
 AUDIO_FILETYPES = [
@@ -110,18 +116,25 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! Research Auto DJ")
-        # 根据实际屏幕尺寸决定首次窗口大小，避免在 1366×768、
-        # 小型笔记本或带系统缩放的屏幕上启动后超出可视范围。
+        self.title("Beat This! + MuQ + All-In-One Auto DJ 1.0.0")
+        self.settings_store = SettingsStore()
+        self.saved_settings = self.settings_store.load()
+        self._settings_after_id: str | None = None
+
+        # 根据实际屏幕尺寸决定首次窗口大小；若上次正常退出时保存了
+        # geometry，则优先恢复用户布局。
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
         window_width = min(1240, max(760, screen_width - 80))
         window_height = min(860, max(560, screen_height - 100))
         window_x = max(0, (screen_width - window_width) // 2)
         window_y = max(0, min(30, (screen_height - window_height) // 3))
-        self.geometry(
-            f"{window_width}x{window_height}+{window_x}+{window_y}"
-        )
+        default_geometry = f"{window_width}x{window_height}+{window_x}+{window_y}"
+        geometry = str(self.saved_settings.get("window_geometry", default_geometry))
+        try:
+            self.geometry(geometry)
+        except tk.TclError:
+            self.geometry(default_geometry)
         self.minsize(
             min(820, max(680, screen_width - 80)),
             min(600, max(520, screen_height - 80)),
@@ -136,12 +149,128 @@ class AutoDJApp(tk.Tk):
         self.last_beat_number = -1
         self.last_engine_index = -1
         self.last_plan_signature: object = object()
+        self.last_preload_signature: object = object()
+        self.muq_profiles: dict[str, MuQProfile] = {}
+        self.muq_groups: dict[str, int] = {}
+        self.muq_pair_scores: dict[str, PairScore] = {}
+        self.muq_ranking_active = False
+        self.allin1_profiles: dict[str, AllInOneProfile] = {}
+        self.allin1_analysis_active = False
+        self._preload_after_id: str | None = None
 
         self._build_style()
         self._build_ui()
+        self._restore_saved_settings()
         self._refresh_devices()
+        self._attach_settings_autosave()
+        self._apply_engine_settings()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Configure>", lambda _event: self._schedule_settings_save(), add="+")
+        self.after(150, self._detect_rubberband)
+        self.after(240, self._detect_allin1)
         self.after(100, self._poll)
+
+    _SETTING_VARIABLES = {
+        "auto_mix": "auto_mix_var",
+        "volume": "volume_var",
+        "transition_bars": "bars_var",
+        "mix_style": "style_var",
+        "effect_strength": "effect_var",
+        "human_style": "human_style_var",
+        "human_variation": "human_variation_var",
+        "human_candidates": "human_candidates_var",
+        "tempo_restore": "restore_var",
+        "automix_policy": "policy_var",
+        "transition_engine": "transition_engine_var",
+        "stretch_backend": "stretch_backend_var",
+        "rubberband_path": "rb_path_var",
+        "max_stretch": "stretch_var",
+        "allin1_enabled": "allin1_enabled_var",
+        "allin1_model": "allin1_model_var",
+        "muq_enabled": "muq_enabled_var",
+        "auto_muq_sort": "auto_muq_sort_var",
+        "preload_enabled": "preload_pair_var",
+        "preload_window": "preload_window_var",
+        "preload_memory_mb": "preload_memory_var",
+        "preload_deadline_seconds": "preload_deadline_var",
+        "beat_this_model": "model_var",
+        "compute_device": "compute_var",
+        "output_device": "output_var",
+    }
+
+    def _restore_saved_settings(self) -> None:
+        for key, attribute in self._SETTING_VARIABLES.items():
+            variable = getattr(self, attribute, None)
+            if variable is None or key not in self.saved_settings:
+                continue
+            try:
+                variable.set(self.saved_settings[key])
+            except (tk.TclError, TypeError, ValueError):
+                continue
+        # Refresh text next to scales immediately.
+        self.effect_label.configure(text=f"{float(self.effect_var.get()):.0f}%")
+        self.human_variation_label.configure(
+            text=f"{float(self.human_variation_var.get()):.0f}%"
+        )
+        self.stretch_label.configure(text=f"±{float(self.stretch_var.get()):.1f}%")
+
+    def _attach_settings_autosave(self) -> None:
+        for attribute in self._SETTING_VARIABLES.values():
+            variable = getattr(self, attribute, None)
+            if variable is not None:
+                variable.trace_add(
+                    "write", lambda *_args: self._settings_changed()
+                )
+
+    def _settings_changed(self) -> None:
+        # Existing widgets keep their focused engine callbacks. Only the new
+        # sliding-window values need a generic trace-based apply step; avoiding a
+        # full _apply_engine_settings() here prevents expensive transition rebuilds
+        # while the user drags the volume/effect sliders.
+        try:
+            if hasattr(self, "preload_window_var"):
+                self.engine.set_preload_window_tracks(int(self.preload_window_var.get()))
+                self.engine.set_preload_memory_mb(int(self.preload_memory_var.get()))
+                self.engine.set_preload_deadline_seconds(
+                    float(self.preload_deadline_var.get())
+                )
+        except (ValueError, tk.TclError):
+            pass
+        self._schedule_settings_save()
+        if hasattr(self, "settings_saved_label"):
+            self.settings_saved_label.configure(text="配置有变更，正在保存…")
+
+    def _collect_settings(self) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for key, attribute in self._SETTING_VARIABLES.items():
+            variable = getattr(self, attribute, None)
+            if variable is not None:
+                values[key] = variable.get()
+        try:
+            values["window_geometry"] = self.geometry()
+        except tk.TclError:
+            pass
+        return values
+
+    def _schedule_settings_save(self, delay_ms: int = 450) -> None:
+        if self._settings_after_id is not None:
+            try:
+                self.after_cancel(self._settings_after_id)
+            except tk.TclError:
+                pass
+        self._settings_after_id = self.after(delay_ms, self._save_settings_now)
+
+    def _save_settings_now(self) -> None:
+        self._settings_after_id = None
+        try:
+            self.settings_store.save(self._collect_settings())
+            if hasattr(self, "settings_saved_label"):
+                self.settings_saved_label.configure(
+                    text=f"配置已自动保存：{self.settings_store.path}"
+                )
+        except Exception as exc:
+            if hasattr(self, "settings_saved_label"):
+                self.settings_saved_label.configure(text=f"配置保存失败：{exc}")
 
     def _build_style(self) -> None:
         self.configure(bg="#15171a")
@@ -217,12 +346,12 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! Research Auto DJ", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + MuQ + All-In-One Auto DJ 1.0.0", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
             header,
-            text="智能 OUT/IN · BPM 自动回归 · 三段 EQ · Filter · Echo Out",
+            text="MuQ 平滑排序 · 滑动窗口预加载 · 配置自动保存 · 智能 OUT/IN",
             justify=tk.LEFT,
         )
         self.header_subtitle.grid(
@@ -302,12 +431,17 @@ class AutoDJApp(tk.Tk):
 
         timeline_card = ttk.Frame(outer, style="Card.TFrame", padding=8)
         timeline_card.pack(fill=tk.X)
-        self.timeline = DJTimeline(timeline_card)
+        self.timeline = DJTimeline(timeline_card, on_seek=self._seek_to)
         self.timeline.pack(fill=tk.X, expand=True)
         time_row = ttk.Frame(timeline_card, style="Card.TFrame")
         time_row.pack(fill=tk.X, padx=55, pady=(2, 0))
         self.time_left = ttk.Label(time_row, text="00:00", style="Muted.TLabel")
         self.time_left.pack(side=tk.LEFT)
+        ttk.Label(
+            time_row,
+            text="点击或拖动上方 A 轨跳转（自动吸附节拍）",
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, expand=True)
         self.time_right = ttk.Label(time_row, text="00:00", style="Muted.TLabel")
         self.time_right.pack(side=tk.RIGHT)
 
@@ -379,13 +513,24 @@ class AutoDJApp(tk.Tk):
             text="重新分析",
             command=self._reanalyze_selected,
         ).pack(side=tk.LEFT, padx=(14, 0))
+        ttk.Button(
+            queue_toolbar,
+            text="All-In-One 结构",
+            command=lambda: self._analyze_allin1(force=True, automatic=False),
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            queue_toolbar,
+            text="MuQ 智能排序",
+            style="Accent.TButton",
+            command=self._rank_with_muq,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         table_frame = ttk.Frame(queue_frame, style="Card.TFrame")
         table_frame.pack(fill=tk.BOTH, expand=True)
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
-        columns = ("index", "title", "bpm", "meter", "duration", "mix", "state")
+        columns = ("index", "title", "bpm", "meter", "duration", "structure", "muq", "compat", "mix", "state")
         self.tree = ttk.Treeview(
             table_frame,
             columns=columns,
@@ -398,6 +543,9 @@ class AutoDJApp(tk.Tk):
             "bpm": "BPM",
             "meter": "拍号",
             "duration": "时长",
+            "structure": "All-In-One结构",
+            "muq": "MuQ风格组",
+            "compat": "与下一首",
             "mix": "智能切歌点",
             "state": "状态",
         }
@@ -407,6 +555,9 @@ class AutoDJApp(tk.Tk):
             "bpm": 65,
             "meter": 55,
             "duration": 65,
+            "structure": 140,
+            "muq": 78,
+            "compat": 86,
             "mix": 110,
             "state": 80,
         }
@@ -432,6 +583,7 @@ class AutoDJApp(tk.Tk):
         vscroll.grid(row=0, column=1, sticky="ns")
         hscroll.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<Double-1>", lambda _: self._play_or_resume())
+        self.tree.bind("<<TreeviewSelect>>", lambda _: self._schedule_preload())
 
         ttk.Label(settings_frame, text="智能混音设置", style="Now.TLabel").pack(
             anchor=tk.W, pady=(0, 14)
@@ -483,6 +635,69 @@ class AutoDJApp(tk.Tk):
             variable=self.effect_var,
             command=self._set_effect_strength,
         ).pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(settings_frame, text="真人 DJ 过渡策略", style="Muted.TLabel").pack(
+            anchor=tk.W
+        )
+        self.human_style_var = tk.StringVar(value="Adaptive Human")
+        human_style_box = ttk.Combobox(
+            settings_frame,
+            textvariable=self.human_style_var,
+            values=(
+                "Adaptive Human",
+                "Long Blend",
+                "Bass Swap",
+                "Echo Out",
+                "Drop Swap",
+                "Loop Out",
+                "Filter Ride",
+            ),
+            state="readonly",
+        )
+        human_style_box.pack(fill=tk.X, pady=(4, 4))
+        human_style_box.bind(
+            "<<ComboboxSelected>>", lambda _: self._apply_human_style()
+        )
+        ttk.Label(
+            settings_frame,
+            text="Adaptive Human 会生成多种候选手法，按响度、低频碰撞、频谱连续性、曲线平滑度、立体声和节拍一致性自动选择。",
+            style="Muted.TLabel",
+            wraplength=280,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        ttk.Label(settings_frame, text="真人变化度", style="Muted.TLabel").pack(
+            anchor=tk.W
+        )
+        self.human_variation_var = tk.DoubleVar(value=58)
+        self.human_variation_label = ttk.Label(
+            settings_frame, text="58%", style="Muted.TLabel"
+        )
+        self.human_variation_label.pack(anchor=tk.E)
+        ttk.Scale(
+            settings_frame,
+            from_=0,
+            to=100,
+            variable=self.human_variation_var,
+            command=self._set_human_variation,
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        candidate_row = ttk.Frame(settings_frame, style="Card.TFrame")
+        candidate_row.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(
+            candidate_row, text="候选手法数", style="Muted.TLabel"
+        ).pack(side=tk.LEFT)
+        self.human_candidates_var = tk.StringVar(value="5")
+        human_candidates_box = ttk.Combobox(
+            candidate_row,
+            textvariable=self.human_candidates_var,
+            values=("2", "3", "4", "5", "6"),
+            state="readonly",
+            width=5,
+        )
+        human_candidates_box.pack(side=tk.RIGHT)
+        human_candidates_box.bind(
+            "<<ComboboxSelected>>", lambda _: self._apply_human_candidates()
+        )
 
         ttk.Label(settings_frame, text="切歌后 BPM 回归", style="Muted.TLabel").pack(
             anchor=tk.W
@@ -550,7 +765,7 @@ class AutoDJApp(tk.Tk):
         stretch_backend_box = ttk.Combobox(
             settings_frame,
             textvariable=self.stretch_backend_var,
-            values=("auto", "Rubber Band R3", "librosa"),
+            values=("auto", "Rubber Band R3", "Hybrid HPSS", "librosa"),
             state="readonly",
         )
         stretch_backend_box.pack(fill=tk.X, pady=(4, 4))
@@ -559,10 +774,44 @@ class AutoDJApp(tk.Tk):
         )
         ttk.Label(
             settings_frame,
-            text="auto 会优先调用 Rubber Band R3；未安装时回退 librosa",
+            text="auto 会优先调用 Rubber Band R3；未安装时回退 Hybrid HPSS + WSOLA，减少电子鼓瞬态涂抹",
             style="Muted.TLabel",
             wraplength=280,
-        ).pack(anchor=tk.W, pady=(0, 10))
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        ttk.Label(settings_frame, text="Rubber Band CLI 路径", style="Muted.TLabel").pack(
+            anchor=tk.W
+        )
+        self.rb_path_var = tk.StringVar(
+            value=(
+                os.environ.get("AUTODJ_RUBBERBAND")
+                or os.environ.get("RUBBERBAND_EXE")
+                or os.environ.get("RUBBERBAND_PATH")
+                or ""
+            )
+        )
+        rb_row = ttk.Frame(settings_frame, style="Card.TFrame")
+        rb_row.pack(fill=tk.X, pady=(4, 4))
+        self.rb_path_entry = ttk.Entry(rb_row, textvariable=self.rb_path_var)
+        self.rb_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            rb_row, text="选择…", width=7, command=self._choose_rubberband
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        rb_actions = ttk.Frame(settings_frame, style="Card.TFrame")
+        rb_actions.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(
+            rb_actions, text="应用并检测", command=self._apply_rubberband_path
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            rb_actions, text="清除手动路径", command=self._clear_rubberband_path
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        self.rb_status_label = ttk.Label(
+            settings_frame,
+            text="正在检测 Rubber Band…",
+            style="Muted.TLabel",
+            wraplength=280,
+        )
+        self.rb_status_label.pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
 
         ttk.Label(settings_frame, text="最大变速百分比", style="Muted.TLabel").pack(
             anchor=tk.W
@@ -581,6 +830,144 @@ class AutoDJApp(tk.Tk):
             variable=self.stretch_var,
             command=self._set_stretch,
         ).pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Separator(settings_frame).pack(fill=tk.X, pady=10)
+        ttk.Label(settings_frame, text="All-In-One 歌曲结构", style="Now.TLabel").pack(
+            anchor=tk.W, pady=(0, 6)
+        )
+        self.allin1_enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            settings_frame,
+            text="启用 All-In-One 功能段模型",
+            variable=self.allin1_enabled_var,
+            command=lambda: self.engine.set_allin1_enabled(self.allin1_enabled_var.get()),
+        ).pack(anchor=tk.W)
+        ttk.Label(settings_frame, text="All-In-One 模型", style="Muted.TLabel").pack(
+            anchor=tk.W, pady=(6, 0)
+        )
+        self.allin1_model_var = tk.StringVar(value="harmonix-all")
+        allin1_box = ttk.Combobox(
+            settings_frame,
+            textvariable=self.allin1_model_var,
+            values=(
+                "harmonix-all",
+                "harmonix-fold0",
+                "harmonix-fold1",
+                "harmonix-fold2",
+                "harmonix-fold3",
+                "harmonix-fold4",
+                "harmonix-fold5",
+                "harmonix-fold6",
+                "harmonix-fold7",
+            ),
+            state="readonly",
+        )
+        allin1_box.pack(fill=tk.X, pady=(4, 4))
+        allin1_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _: self._apply_allin1_model(),
+        )
+        self.allin1_status_label = ttk.Label(
+            settings_frame,
+            text="尚未检测 All-In-One。添加歌曲后会在播放前批量分析。",
+            style="Muted.TLabel",
+            wraplength=280,
+        )
+        self.allin1_status_label.pack(anchor=tk.W, fill=tk.X, pady=(2, 4))
+        allin1_actions = ttk.Frame(settings_frame, style="Card.TFrame")
+        allin1_actions.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(
+            allin1_actions,
+            text="检测模型",
+            command=self._detect_allin1,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            allin1_actions,
+            text="分析全部结构",
+            command=lambda: self._analyze_allin1(force=False, automatic=False),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(
+            settings_frame,
+            text=(
+                "Beat This! 继续负责节拍网格；All-In-One 负责 intro、verse、"
+                "chorus、break、bridge、solo、outro 等功能段。分析会运行 Demucs，"
+                "首次处理较慢，结果会缓存。"
+            ),
+            style="Muted.TLabel",
+            wraplength=280,
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        ttk.Separator(settings_frame).pack(fill=tk.X, pady=10)
+        ttk.Label(settings_frame, text="MuQ 风格与排序", style="Now.TLabel").pack(
+            anchor=tk.W, pady=(0, 6)
+        )
+        self.muq_enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            settings_frame,
+            text="使用 MuQ-large-msd-iter 参与选歌与切点匹配",
+            variable=self.muq_enabled_var,
+            command=lambda: self.engine.set_muq_enabled(self.muq_enabled_var.get()),
+        ).pack(anchor=tk.W)
+        self.auto_muq_sort_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            settings_frame,
+            text="MuQ 分析完成后自动重排未播放队列",
+            variable=self.auto_muq_sort_var,
+        ).pack(anchor=tk.W, pady=(3, 0))
+        self.preload_pair_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            settings_frame,
+            text="启用滑动窗口预加载",
+            variable=self.preload_pair_var,
+            command=self._schedule_preload,
+        ).pack(anchor=tk.W, pady=(3, 0))
+
+        preload_grid = ttk.Frame(settings_frame, style="Card.TFrame")
+        preload_grid.pack(fill=tk.X, pady=(6, 4))
+        preload_grid.grid_columnconfigure(1, weight=1)
+        ttk.Label(preload_grid, text="窗口轨数", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        self.preload_window_var = tk.StringVar(value="3")
+        ttk.Combobox(
+            preload_grid,
+            textvariable=self.preload_window_var,
+            values=("2", "3", "4", "5"),
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=1, sticky="ew", pady=2)
+        ttk.Label(preload_grid, text="内存上限", style="Muted.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        self.preload_memory_var = tk.StringVar(value="1024")
+        ttk.Combobox(
+            preload_grid,
+            textvariable=self.preload_memory_var,
+            values=("512", "768", "1024", "1536", "2048"),
+            state="readonly",
+            width=8,
+        ).grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Label(preload_grid, text="截止保护", style="Muted.TLabel").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        self.preload_deadline_var = tk.StringVar(value="60")
+        ttk.Combobox(
+            preload_grid,
+            textvariable=self.preload_deadline_var,
+            values=("30", "45", "60", "90", "120"),
+            state="readonly",
+            width=8,
+        ).grid(row=2, column=1, sticky="ew", pady=2)
+        ttk.Label(
+            settings_frame,
+            text=(
+                "MuQ 排序会同时考虑全局风格、Outro→Intro、局部轨迹、BPM、"
+                "能量、音色和 All-In-One 段落方向；滑动窗口保留一首热下一轨，"
+                "并提前预热后续轨道。内存上限单位为 MB，截止保护单位为秒。"
+            ),
+            style="Muted.TLabel",
+            wraplength=280,
+        ).pack(anchor=tk.W, pady=(4, 10))
 
         ttk.Label(settings_frame, text="Beat This! 模型", style="Muted.TLabel").pack(
             anchor=tk.W
@@ -628,6 +1015,13 @@ class AutoDJApp(tk.Tk):
         ttk.Button(settings_frame, text="刷新设备", command=self._refresh_devices).pack(
             fill=tk.X
         )
+        self.settings_saved_label = ttk.Label(
+            settings_frame,
+            text="配置会自动保存",
+            style="Muted.TLabel",
+            wraplength=280,
+        )
+        self.settings_saved_label.pack(anchor=tk.W, fill=tk.X, pady=(8, 0))
 
         ttk.Separator(settings_frame).pack(fill=tk.X, pady=12)
         ttk.Label(settings_frame, text="匹配详情", style="Now.TLabel").pack(anchor=tk.W)
@@ -702,6 +1096,17 @@ class AutoDJApp(tk.Tk):
     def _apply_style(self) -> None:
         self.engine.set_mix_style(self.style_var.get())
 
+    def _apply_human_style(self) -> None:
+        self.engine.set_human_style_mode(self.human_style_var.get())
+
+    def _set_human_variation(self, value: str) -> None:
+        number = float(value)
+        self.human_variation_label.configure(text=f"{number:.0f}%")
+        self.engine.set_human_variation(number / 100.0)
+
+    def _apply_human_candidates(self) -> None:
+        self.engine.set_human_candidate_count(int(self.human_candidates_var.get()))
+
     def _apply_policy(self) -> None:
         self.engine.set_automix_policy(self.policy_var.get())
 
@@ -711,10 +1116,219 @@ class AutoDJApp(tk.Tk):
     def _apply_stretch_backend(self) -> None:
         self.engine.set_time_stretch_backend(self.stretch_backend_var.get())
 
+    def _choose_rubberband(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="选择 Rubber Band 命令行程序",
+            filetypes=(
+                ("Rubber Band CLI", "rubberband.exe rubberband-r3.exe rubberband"),
+                ("可执行文件", "*.exe"),
+                ("所有文件", "*.*"),
+            ),
+        )
+        if filename:
+            self.rb_path_var.set(filename)
+            self._apply_rubberband_path()
+
+    def _apply_rubberband_path(self) -> None:
+        value = self.rb_path_var.get().strip().strip('"')
+        if value:
+            os.environ["AUTODJ_RUBBERBAND"] = value
+        else:
+            os.environ.pop("AUTODJ_RUBBERBAND", None)
+        self._detect_rubberband()
+
+    def _clear_rubberband_path(self) -> None:
+        self.rb_path_var.set("")
+        os.environ.pop("AUTODJ_RUBBERBAND", None)
+        self._detect_rubberband()
+
+    def _detect_rubberband(self) -> None:
+        explicit = self.rb_path_var.get().strip() or None
+        result = rubberband_probe(explicit)
+        executable = result.get("executable")
+        if result.get("ok") and executable:
+            self.rb_status_label.configure(
+                text=f"已启用 Rubber Band R3：{executable}",
+                foreground="#7ee787",
+            )
+            self._log(f"Rubber Band R3 已启用：{executable}")
+        elif executable:
+            self.rb_status_label.configure(
+                text=f"找到文件但启动失败：{result.get('message', '未知错误')}",
+                foreground="#ffb86c",
+            )
+        else:
+            self.rb_status_label.configure(
+                text=(
+                    "未检测到。可选择 rubberband.exe，或设置 "
+                    "AUTODJ_RUBBERBAND / RUBBERBAND_EXE / RUBBERBAND_PATH。"
+                ),
+                foreground="#ffb86c",
+            )
+
+    def _apply_allin1_model(self) -> None:
+        self.engine.set_allin1_model(self.allin1_model_var.get())
+        self.allin1_profiles.clear()
+        self.engine.set_preloaded_allin1_profiles({})
+        self.engine.clear_preload()
+        self._refresh_tree()
+        self._log("All-In-One 模型已更改，请点击‘分析全部结构’重新生成缓存。")
+
+    def _detect_allin1(self) -> None:
+        result = probe_allinone()
+        if result.get("ok"):
+            self.allin1_status_label.configure(
+                text=(
+                    f"All-In-One {result.get('allin1_version', '')} 已就绪 · "
+                    f"NATTEN {result.get('natten_backend', '')}: "
+                    f"{result.get('message', '')}"
+                ),
+                foreground="#7ee787",
+            )
+        else:
+            self.allin1_status_label.configure(
+                text=(
+                    "未安装 All-In-One。运行 python install_allinone.py；"
+                    f"诊断：{result.get('message', '')}"
+                ),
+                foreground="#ffb86c",
+            )
+
+    def _analyze_allin1(self, force: bool = False, automatic: bool = False) -> None:
+        if self.allin1_analysis_active:
+            if not automatic:
+                messagebox.showinfo("正在分析", "All-In-One 结构分析正在运行。")
+            return
+        if not self.allin1_enabled_var.get():
+            if automatic:
+                self._continue_after_structure_analysis()
+            else:
+                messagebox.showinfo("未启用", "请先勾选启用 All-In-One 功能段模型。")
+            return
+        if not self.tracks:
+            if not automatic:
+                messagebox.showinfo("没有歌曲", "请先添加歌曲。")
+            return
+
+        self.allin1_analysis_active = True
+        tracks_snapshot = list(self.tracks)
+        snapshot_paths = tuple(track.path for track in tracks_snapshot)
+        model = self.allin1_model_var.get()
+        device = self.compute_var.get()
+        self._log("All-In-One 正在批量分析歌曲结构；首次运行会执行 Demucs…")
+
+        def worker() -> None:
+            try:
+                analyzer = AllInOneAnalyzer(model=model, device=device)
+                profiles = analyzer.analyze_many(
+                    [track.path for track in tracks_snapshot],
+                    status=lambda text: self.ui_events.put(("status", text)),
+                    force=force,
+                )
+                self.ui_events.put(
+                    ("allin1_done", (snapshot_paths, profiles, automatic))
+                )
+            except Exception as exc:
+                self.ui_events.put(("allin1_error", (str(exc), automatic)))
+
+        threading.Thread(
+            target=worker, daemon=True, name="AllInOne-Structure"
+        ).start()
+
+    def _continue_after_structure_analysis(self) -> None:
+        if self.auto_muq_sort_var.get() and self.muq_enabled_var.get():
+            self._log("歌曲结构分析完成，正在进行 MuQ 风格分析与排序…")
+            self._rank_with_muq(automatic=True)
+        else:
+            self._log("Beat This! 与 All-In-One 分析完成。")
+            self._schedule_preload()
+
     def _set_effect_strength(self, value: str) -> None:
         number = float(value)
         self.effect_label.configure(text=f"{number:.0f}%")
         self.engine.set_effect_strength(number / 100.0)
+
+    def _apply_engine_settings(self) -> None:
+        """把 GUI 当前设置同步到引擎，播放和预加载共用。"""
+        self.engine.set_auto_mix(self.auto_mix_var.get())
+        self.engine.set_volume(self.volume_var.get() / 100.0)
+        self.engine.set_crossfade_bars(self._bars_value())
+        self.engine.set_max_stretch_percent(self.stretch_var.get())
+        self.engine.set_tempo_restore_bars(self._restore_bars_value())
+        self.engine.set_mix_style(self.style_var.get())
+        self.engine.set_effect_strength(self.effect_var.get() / 100.0)
+        self.engine.set_human_style_mode(self.human_style_var.get())
+        self.engine.set_human_variation(self.human_variation_var.get() / 100.0)
+        self.engine.set_human_candidate_count(int(self.human_candidates_var.get()))
+        self.engine.set_automix_policy(self.policy_var.get())
+        self.engine.set_transition_engine(self.transition_engine_var.get())
+        self.engine.set_time_stretch_backend(self.stretch_backend_var.get())
+        self.engine.set_muq_enabled(self.muq_enabled_var.get())
+        self.engine.set_muq_device(self.compute_var.get())
+        self.engine.set_preloaded_muq_profiles(self.muq_profiles)
+        self.engine.set_allin1_enabled(self.allin1_enabled_var.get())
+        self.engine.set_allin1_device(self.compute_var.get())
+        self.engine.set_allin1_model(self.allin1_model_var.get())
+        self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
+        self.engine.set_preload_window_tracks(int(self.preload_window_var.get()))
+        self.engine.set_preload_memory_mb(int(self.preload_memory_var.get()))
+        self.engine.set_preload_deadline_seconds(
+            float(self.preload_deadline_var.get())
+        )
+
+    def _schedule_preload(self, delay_ms: int = 450) -> None:
+        if self._preload_after_id is not None:
+            try:
+                self.after_cancel(self._preload_after_id)
+            except tk.TclError:
+                pass
+            self._preload_after_id = None
+        if (
+            not self.preload_pair_var.get()
+            or not self.tracks
+            or self.analysis_active
+            or self.allin1_analysis_active
+            or self.muq_ranking_active
+            or self.engine.get_status().get("playing")
+        ):
+            return
+        self._preload_after_id = self.after(delay_ms, self._preload_selected_pair)
+
+    def _preload_selected_pair(self) -> None:
+        self._preload_after_id = None
+        if (
+            not self.preload_pair_var.get()
+            or not self.tracks
+            or self.analysis_active
+            or self.allin1_analysis_active
+            or self.muq_ranking_active
+            or self.engine.get_status().get("playing")
+        ):
+            return
+        try:
+            self._apply_engine_settings()
+            index = self._selected_index()
+            self.engine.preload_pair(list(self.tracks), start_index=index)
+            next_title = (
+                self.tracks[index + 1].title
+                if index + 1 < len(self.tracks)
+                else "队列末尾"
+            )
+            self._log(
+                f"后台预加载：{self.tracks[index].title} / 下一首 {next_title}"
+            )
+        except Exception as exc:
+            self._log(f"启动预加载失败：{exc}")
+
+    def _seek_to(self, seconds: float) -> None:
+        status = self.engine.get_status()
+        if not status.get("current"):
+            return
+        try:
+            actual = self.engine.seek(seconds, snap_to_beat=True)
+            self._log(f"已跳转到 {format_time(actual)}，切歌规划正在更新")
+        except Exception as exc:
+            self._log(f"跳转失败：{exc}")
 
     def _refresh_devices(self) -> None:
         try:
@@ -770,11 +1384,13 @@ class AutoDJApp(tk.Tk):
             if Path(existing.path) == Path(track.path):
                 self.tracks[index] = track
                 self._refresh_tree()
+                self._schedule_preload()
                 return
         self.tracks.append(track)
         self._refresh_tree()
         if len(self.tracks) == 1:
             self.tree.selection_set("0")
+        self._schedule_preload()
 
     def _refresh_tree(self, status: dict[str, object] | None = None) -> None:
         status = status or self.engine.get_status()
@@ -791,6 +1407,12 @@ class AutoDJApp(tk.Tk):
         playing = bool(status.get("playing", False))
         transition_start = status.get("transition_start")
         next_entry = status.get("next_entry")
+        preload_current = str(status.get("preload_current_path") or "")
+        preload_next = str(status.get("preload_next_path") or "")
+        preload_loading = bool(status.get("preload_loading"))
+        preload_ready = bool(status.get("preload_ready"))
+        warm_ready = set(status.get("warm_ready_paths") or ())
+        warm_loading = set(status.get("warm_loading_paths") or ())
         for index, track in enumerate(self.tracks):
             state = ""
             mix = ""
@@ -803,6 +1425,23 @@ class AutoDJApp(tk.Tk):
                 if next_entry is not None:
                     original_bpm = float(status.get("next_original_bpm", track.bpm))
                     mix = f"IN {format_time(float(next_entry))} → {original_bpm:.0f}"
+            elif not playing and track.path == preload_current:
+                state = "预加载中" if preload_loading else ("已预载" if preload_ready else "")
+            elif not playing and track.path == preload_next:
+                state = "下一首预载" if preload_loading or preload_ready else ""
+            elif track.path in warm_loading:
+                state = "窗口预热"
+            elif track.path in warm_ready:
+                state = "暖轨就绪"
+            structure_profile = self.allin1_profiles.get(track.path)
+            if structure_profile and structure_profile.available:
+                structure_text = "/".join(
+                    label.upper() for label in structure_profile.unique_labels[:4]
+                )
+            elif self.allin1_analysis_active:
+                structure_text = "分析中…"
+            else:
+                structure_text = "—"
             self.tree.insert(
                 "",
                 tk.END,
@@ -813,6 +1452,12 @@ class AutoDJApp(tk.Tk):
                     f"{track.bpm:.1f}",
                     f"{track.beats_per_bar}/4",
                     format_time(track.duration),
+                    structure_text,
+                    (f"组 {self.muq_groups.get(track.path)}" if track.path in self.muq_groups else "—"),
+                    (
+                        f"{self.muq_pair_scores[track.path].total * 100:.0f}分"
+                        if track.path in self.muq_pair_scores else "—"
+                    ),
                     mix,
                     state,
                 ),
@@ -820,18 +1465,132 @@ class AutoDJApp(tk.Tk):
             if track.path == selected_path:
                 self.tree.selection_set(str(index))
 
+    def _rank_with_muq(self, automatic: bool = False) -> None:
+        if self.muq_ranking_active:
+            return
+        if len(self.tracks) < 2:
+            if not automatic:
+                messagebox.showinfo("歌曲不足", "至少添加两首歌曲后才能进行 MuQ 排序。")
+            self._schedule_preload()
+            return
+
+        self.muq_ranking_active = True
+        tracks_snapshot = list(self.tracks)
+        snapshot_paths = tuple(track.path for track in tracks_snapshot)
+        structure_snapshot = dict(self.allin1_profiles)
+        status = self.engine.get_status()
+        playing = bool(status.get("playing"))
+        current_path = str(status.get("current_path") or "")
+        next_path = str(status.get("next_path") or "")
+        transitioning = bool(status.get("transitioning"))
+        selected_index = self._selected_index()
+        self._log("MuQ 正在分析风格并优化播放顺序…")
+
+        def worker() -> None:
+            try:
+                analyzer = MuQAnalyzer(device=self.compute_var.get())
+                profile_map: dict[str, MuQProfile] = {}
+                profiles_in_snapshot: list[MuQProfile] = []
+                for track in tracks_snapshot:
+                    profile = analyzer.analyze(
+                        track.path,
+                        status=lambda text: self.ui_events.put(("status", text)),
+                    )
+                    profile_map[track.path] = profile
+                    profiles_in_snapshot.append(profile)
+
+                group_values = style_clusters(profiles_in_snapshot)
+                group_map = {
+                    track.path: int(group)
+                    for track, group in zip(tracks_snapshot, group_values)
+                }
+
+                fixed_prefix: list[TrackAnalysis] = []
+                segment = list(tracks_snapshot)
+                segment_start = selected_index
+                if playing and current_path:
+                    path_to_index = {track.path: i for i, track in enumerate(tracks_snapshot)}
+                    current_index = path_to_index.get(current_path, 0)
+                    anchor_index = current_index
+                    # 过渡已经开始时，当前 B 不能再替换；从 B 之后排序。
+                    if transitioning and next_path in path_to_index:
+                        anchor_index = path_to_index[next_path]
+                    fixed_prefix = tracks_snapshot[:anchor_index]
+                    segment = tracks_snapshot[anchor_index:]
+                    segment_start = 0
+
+                segment_profiles = [profile_map[track.path] for track in segment]
+                segment_structures = [
+                    structure_snapshot.get(track.path, AllInOneProfile())
+                    for track in segment
+                ]
+                order, _scores = rank_playlist(
+                    segment,
+                    segment_profiles,
+                    start_index=segment_start,
+                    structures=segment_structures,
+                )
+                ordered_segment = [segment[index] for index in order]
+                ordered_tracks = fixed_prefix + ordered_segment
+
+                pair_map: dict[str, PairScore] = {}
+                edge_scores: list[float] = []
+                for outgoing, incoming in zip(ordered_tracks, ordered_tracks[1:]):
+                    pair = transition_compatibility(
+                        outgoing,
+                        incoming,
+                        profile_map[outgoing.path],
+                        profile_map[incoming.path],
+                        structure_snapshot.get(outgoing.path),
+                        structure_snapshot.get(incoming.path),
+                    )
+                    pair_map[outgoing.path] = pair
+                    edge_scores.append(pair.total)
+                average = sum(edge_scores) / max(len(edge_scores), 1)
+                worst = min(edge_scores, default=1.0)
+                self.ui_events.put(
+                    (
+                        "muq_ranked",
+                        (
+                            snapshot_paths,
+                            ordered_tracks,
+                            profile_map,
+                            group_map,
+                            pair_map,
+                            average,
+                            worst,
+                        ),
+                    )
+                )
+            except Exception as exc:
+                self.ui_events.put(("muq_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True, name="MuQ-Ranking").start()
+
     def _remove_selected(self) -> None:
         if self.engine.get_status()["playing"]:
             messagebox.showinfo("播放中", "停止播放后再修改当前队列。")
             return
         selection = self.tree.selection()
         if selection:
+            removed = self.tracks[int(selection[0])]
             del self.tracks[int(selection[0])]
+            self.muq_profiles.pop(removed.path, None)
+            self.muq_groups.pop(removed.path, None)
+            self.muq_pair_scores.pop(removed.path, None)
+            self.allin1_profiles.pop(removed.path, None)
+            self.engine.clear_preload()
             self._refresh_tree()
+            self._schedule_preload()
 
     def _clear(self) -> None:
         self._stop()
         self.tracks.clear()
+        self.muq_profiles.clear()
+        self.muq_groups.clear()
+        self.muq_pair_scores.clear()
+        self.allin1_profiles.clear()
+        self.engine.clear_preload()
         self._refresh_tree()
 
     def _selected_index(self) -> int:
@@ -857,16 +1616,7 @@ class AutoDJApp(tk.Tk):
         self.play_button.state(["disabled"])
         self._log(f"正在提取智能匹配特征：{playlist[index].title}")
 
-        self.engine.set_auto_mix(self.auto_mix_var.get())
-        self.engine.set_volume(self.volume_var.get() / 100.0)
-        self.engine.set_crossfade_bars(self._bars_value())
-        self.engine.set_max_stretch_percent(self.stretch_var.get())
-        self.engine.set_tempo_restore_bars(self._restore_bars_value())
-        self.engine.set_mix_style(self.style_var.get())
-        self.engine.set_effect_strength(self.effect_var.get() / 100.0)
-        self.engine.set_automix_policy(self.policy_var.get())
-        self.engine.set_transition_engine(self.transition_engine_var.get())
-        self.engine.set_time_stretch_backend(self.stretch_backend_var.get())
+        self._apply_engine_settings()
 
         def worker() -> None:
             try:
@@ -888,8 +1638,10 @@ class AutoDJApp(tk.Tk):
             self._log(f"停止播放时出错：{exc}")
         self.last_engine_index = -1
         self.last_plan_signature = object()
+        self.last_preload_signature = object()
         self._refresh_tree()
         self._log("已停止。")
+        self._schedule_preload()
 
     def _next(self) -> None:
         self.engine.request_next()
@@ -917,7 +1669,98 @@ class AutoDJApp(tk.Tk):
                 messagebox.showerror("Beat This! 分析失败", str(payload))
             elif kind == "analysis_done":
                 self.analysis_active = False
-                self._log("Beat This! 分析队列完成。")
+                if self.allin1_enabled_var.get():
+                    self._log("Beat This! 完成，正在运行 All-In-One 功能段分析…")
+                    self._analyze_allin1(force=False, automatic=True)
+                else:
+                    self._continue_after_structure_analysis()
+            elif kind == "allin1_done":
+                snapshot_paths, profiles, automatic = payload  # type: ignore[misc]
+                self.allin1_analysis_active = False
+                current_paths = tuple(track.path for track in self.tracks)
+                if set(snapshot_paths) != set(current_paths):
+                    self._log("队列在结构分析期间发生变化，重新分析 All-In-One…")
+                    self._analyze_allin1(force=False, automatic=True)
+                    continue
+                self.allin1_profiles.update(dict(profiles))
+                self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
+                self._refresh_tree()
+                available = sum(
+                    1 for profile in self.allin1_profiles.values() if profile.available
+                )
+                self.allin1_status_label.configure(
+                    text=f"All-In-One 已完成 {available}/{len(self.tracks)} 首结构分析",
+                    foreground="#7ee787",
+                )
+                if automatic:
+                    self._continue_after_structure_analysis()
+                else:
+                    self._log(f"All-In-One 结构分析完成：{available} 首")
+                    self._schedule_preload(delay_ms=150)
+            elif kind == "allin1_error":
+                message, automatic = payload  # type: ignore[misc]
+                self.allin1_analysis_active = False
+                self.allin1_status_label.configure(
+                    text=f"All-In-One 失败：{message}", foreground="#ffb86c"
+                )
+                self._log(f"All-In-One 失败，保留本地结构估计：{message}")
+                if not automatic:
+                    messagebox.showerror("All-In-One 分析失败", str(message))
+                if automatic:
+                    self._continue_after_structure_analysis()
+                else:
+                    self._schedule_preload()
+            elif kind == "muq_ranked":
+                (
+                    snapshot_paths,
+                    ordered_tracks,
+                    profile_map,
+                    group_map,
+                    pair_map,
+                    average,
+                    worst,
+                ) = payload  # type: ignore[misc]
+                self.muq_ranking_active = False
+                current_paths = tuple(track.path for track in self.tracks)
+                if set(snapshot_paths) != set(current_paths):
+                    self._log("队列在 MuQ 分析期间发生变化，正在重新排序…")
+                    self._rank_with_muq(automatic=True)
+                    continue
+                selected_path = None
+                selection = self.tree.selection()
+                if selection:
+                    old_index = int(selection[0])
+                    if 0 <= old_index < len(self.tracks):
+                        selected_path = self.tracks[old_index].path
+                self.muq_profiles = dict(profile_map)
+                self.muq_groups = dict(group_map)
+                self.muq_pair_scores = dict(pair_map)
+                self.tracks = list(ordered_tracks)
+                self.engine.set_preloaded_muq_profiles(self.muq_profiles)
+                self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
+                if self.engine.get_status().get("playing"):
+                    try:
+                        self.engine.update_playlist_order(self.tracks)
+                    except Exception as exc:
+                        self._log(f"播放顺序同步失败：{exc}")
+                self._refresh_tree()
+                if selected_path:
+                    for index, track in enumerate(self.tracks):
+                        if track.path == selected_path:
+                            self.tree.selection_set(str(index))
+                            break
+                elif self.tracks:
+                    self.tree.selection_set("0")
+                self._log(
+                    "MuQ 平滑排序完成："
+                    f"平均 {average * 100:.0f}分 · 最弱相邻边 {worst * 100:.0f}分"
+                )
+                self._schedule_preload(delay_ms=150)
+            elif kind == "muq_error":
+                self.muq_ranking_active = False
+                self._log(f"MuQ 排序失败：{payload}")
+                messagebox.showerror("MuQ 排序失败", str(payload))
+                self._schedule_preload()
             elif kind == "play_started":
                 self.starting_playback = False
                 self.play_button.state(["!disabled"])
@@ -947,12 +1790,21 @@ class AutoDJApp(tk.Tk):
             tempo_text = f" · BPM {sync_bpm:.1f}→{original_bpm:.1f}/{restore_bars}小节"
         transition_mode = str(status.get("transition_mode", "EQ/Fader"))
         policy_mode = str(status.get("policy_mode", "AutoMix-like"))
+        archetype = str(status.get("human_archetype", ""))
+        archetype_text = f" · {archetype}" if archetype else ""
+        current_function = str(status.get("current_function_label", "") or "")
+        next_function = str(status.get("next_function_label", "") or "")
+        function_text = (
+            f" · {current_function}→{next_function}"
+            if current_function or next_function
+            else ""
+        )
         bars_text = f"{bars} 小节" if bars > 0 else "无缝裁切"
         self.plan_label.configure(
             text=(
-                f"研究型切歌：A OUT {format_time(float(start))}  →  "
-                f"B IN {format_time(float(entry))} · {bars_text} · "
-                f"{transition_mode} / {policy_mode}{tempo_text}"
+                f"真人化切歌：A OUT {format_time(float(start))}  →  "
+                f"B IN {format_time(float(entry))} · {bars_text}{archetype_text}"
+                f"{function_text} · {transition_mode} / {policy_mode}{tempo_text}"
             )
         )
         self.score_label.configure(text=f"MATCH\n{score * 100:.0f}")
@@ -965,10 +1817,26 @@ class AutoDJApp(tk.Tk):
                 f"{str(status.get('current_key', '—'))}→{str(status.get('next_key', '—'))}\n"
                 f"Cue 对齐  {float(metrics.get('cue_alignment', 0.0)) * 100:5.0f}\n"
                 f"Phrase    {float(metrics.get('phrase_alignment', 0.0)) * 100:5.0f}\n"
+                f"AIO 边界  {float(metrics.get('allin1_boundary', 0.0)) * 100:5.0f}\n"
+                f"AIO 角色  {float(metrics.get('allin1_role_compatibility', 0.0)) * 100:5.0f}  "
+                f"{str(status.get('current_function_label', '—'))}→{str(status.get('next_function_label', '—'))}\n"
                 f"节奏      {float(metrics.get('rhythm', 0.0)) * 100:5.0f}\n"
                 f"低频净度  {float(metrics.get('bass_clean', 0.0)) * 100:5.0f}\n"
                 f"人声避让  {float(metrics.get('vocal_clean', 0.0)) * 100:5.0f}\n"
                 f"EDM 置信  {float(metrics.get('edm_confidence', 0.0)) * 100:5.0f}\n"
+                f"MuQ 风格  {float(metrics.get('muq_style', 0.0)) * 100:5.0f}\n"
+                f"MuQ 片段  {float(metrics.get('muq_segment', 0.0)) * 100:5.0f}\n"
+                f"MuQ 轨迹  {float(metrics.get('muq_trajectory', 0.0)) * 100:5.0f}\n"
+                f"微对齐    {float(metrics.get('micro_align_ms', 0.0)):5.1f} ms\n"
+                f"真人手法  {str(status.get('human_archetype', '—'))}\n"
+                f"真人评分  {float(status.get('human_quality_score', 0.0)) * 100:5.0f}\n"
+                f"响度控制  {float(metrics.get('quality_loudness', 0.0)) * 100:5.0f}\n"
+                f"频段避让  {float(metrics.get('quality_collision', 0.0)) * 100:5.0f}\n"
+                f"频谱连续  {float(metrics.get('quality_continuity', 0.0)) * 100:5.0f}\n"
+                f"曲线平滑  {float(metrics.get('quality_smoothness', 0.0)) * 100:5.0f}\n"
+                f"立体声稳  {float(metrics.get('quality_stereo', 0.0)) * 100:5.0f}\n"
+                f"节拍一致  {float(metrics.get('quality_beat', 0.0)) * 100:5.0f}\n"
+                f"结构源    {str(status.get('current_structure_source', '—'))}\n"
                 f"渲染      {str(status.get('transition_mode', '—'))}\n"
                 f"拉伸      {str(status.get('stretch_backend', '—'))}\n"
                 f"风格      {str(status.get('mix_style', 'Club'))} · "
@@ -987,7 +1855,16 @@ class AutoDJApp(tk.Tk):
 
         status = self.engine.get_status()
         self.now_label.configure(text=status["current"] or "尚未播放")
-        next_text = "正在准备…" if status["next_loading"] else (status["next"] or "—")
+        if status.get("next_ready"):
+            next_text = f"{status['next']} · 热轨已就绪"
+        elif status.get("preload_urgent"):
+            next_text = "截止保护：正在最高优先级准备下一首…"
+        elif status["next_loading"]:
+            next_text = "滑动窗口正在分析与预加载…"
+        elif status.get("preload_loading") and not status.get("playing"):
+            next_text = "播放前预加载中…"
+        else:
+            next_text = status["next"] or "—"
         self.next_label.configure(text=f"下一首：{next_text}")
         bpm_now = float(status["bpm"])
         original_bpm = float(status.get("original_bpm", bpm_now))
@@ -1008,16 +1885,36 @@ class AutoDJApp(tk.Tk):
             self.after(100, lambda: self.beat_label.configure(background="#343a40"))
             self.last_beat_number = beat
 
-        self.cpu_label.configure(text=f"Audio CPU {status['cpu_load'] * 100:.0f}%")
+        warm_count = len(status.get("warm_ready_paths") or ())
+        warm_mb = float(status.get("warm_cache_mb", 0.0))
+        urgent_text = " · 截止保护" if status.get("preload_urgent") else ""
+        self.cpu_label.configure(
+            text=(
+                f"Audio CPU {status['cpu_load'] * 100:.0f}% · "
+                f"暖轨 {warm_count} · {warm_mb:.0f}MB{urgent_text}"
+            )
+        )
         if status["callback_status"]:
             self.cpu_label.configure(text=f"音频警告：{status['callback_status']}")
 
+        preload_signature = (
+            status.get("preload_loading"),
+            status.get("preload_ready"),
+            status.get("preload_current_path"),
+            status.get("preload_next_path"),
+            status.get("next_ready"),
+            tuple(status.get("warm_ready_paths") or ()),
+            tuple(status.get("warm_loading_paths") or ()),
+            status.get("preload_urgent"),
+        )
         if (
             status["index"] != self.last_engine_index
             or status["plan_signature"] != self.last_plan_signature
+            or preload_signature != self.last_preload_signature
         ):
             self.last_engine_index = status["index"]
             self.last_plan_signature = status["plan_signature"]
+            self.last_preload_signature = preload_signature
             self._refresh_tree(status)
 
         self.play_button.configure(text="▶ 继续" if status["paused"] else "▶ 播放")
@@ -1025,6 +1922,7 @@ class AutoDJApp(tk.Tk):
 
     def _on_close(self) -> None:
         try:
+            self._save_settings_now()
             self.engine.close()
         finally:
             self.destroy()
