@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.7
+
+- 修复 Spectral Seam 渲染分支未定义 `phrase_length` 导致的 NameError。
+- 谱缝合、echo 缓冲区与 phrase warp 统一使用不可变的锁定乐句长度。
+- 新增谱缝合不回退回归测试。
+
 ## 1.2.6
 
 - 新增逐拍鼓组微对齐：Phrase-Lock 后按每个 beat 检测 kick/percussion 瞬态，并用端点固定的连续小幅 time-map 校正下一首。

@@ -1,8 +1,8 @@
-# Beat This! + MuQ + All-In-One Auto DJ 1.2.6
+# Beat This! + MuQ + All-In-One Auto DJ 1.2.7
 
 本版本把结构分析从 SongFormer 恢复为 `mir-aidj/all-in-one`，并按要求取消独立 worker。All-In-One 直接在主程序进程的后台线程中运行。
 
-## 1.2.6 鼓拍锁定与 Double Drop 交接
+## 1.2.7 鼓拍锁定与 Double Drop 交接
 
 ### 逐拍鼓组对齐
 

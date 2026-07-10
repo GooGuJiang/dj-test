@@ -1542,11 +1542,16 @@ class AutoDJEngine:
         next_track: PreparedTrack,
     ) -> TransitionPlan:
         """Pre-render role-aware or graph-cut transition outside audio callback."""
+        # Keep one explicit, immutable phrase length for every renderer branch.
+        # The spectral-seam branch previously referenced ``phrase_length`` from
+        # the HPSS renderer's local scope, raising NameError and silently
+        # falling back even though spectral rendering itself had succeeded.
+        phrase_length = max(1, int(plan.length))
         is_complex = plan.transition_mode == "Paper EQ/Fader"
         plan.echo_audio = (
             self._render_echo(plan, current)
             if is_complex
-            else np.zeros((plan.length, 2), dtype=np.float32)
+            else np.zeros((phrase_length, 2), dtype=np.float32)
         )
         if not is_complex:
             return plan
@@ -1556,18 +1561,18 @@ class AutoDJEngine:
         # retained as an explicit experimental choice because it can blur dense EDM
         # transients when the seam changes too frequently across frequency bins.
         use_spectral = engine == "spectral seam"
-        if use_spectral and plan.length / self.config.sample_rate <= 24.0:
-            a = current.audio[plan.current_start : plan.current_start + plan.length]
-            b_end = plan.next_resume_sample if plan.next_resume_sample >= 0 else plan.next_start + plan.length
+        if use_spectral and phrase_length / self.config.sample_rate <= 24.0:
+            a = current.audio[plan.current_start : plan.current_start + phrase_length]
+            b_end = plan.next_resume_sample if plan.next_resume_sample >= 0 else plan.next_start + phrase_length
             b_raw = next_track.audio[plan.next_start : b_end]
-            b, phrase_backend = self._fit_phrase_length(b_raw, plan.length)
+            b, phrase_backend = self._fit_phrase_length(b_raw, phrase_length)
             try:
                 result = spectral_seam_crossfade(
-                    outgoing=a[: plan.length],
+                    outgoing=a[:phrase_length],
                     incoming=b,
                     sample_rate=self.config.sample_rate,
                 )
-                rendered = result.audio[: plan.length] + plan.echo_audio[: plan.length]
+                rendered = result.audio[:phrase_length] + plan.echo_audio[:phrase_length]
                 peak = float(np.max(np.abs(rendered)) + 1e-9)
                 if peak > 0.98:
                     rendered *= np.float32(0.98 / peak)
