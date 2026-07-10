@@ -1,0 +1,23 @@
+name: beatthis-auto-dj
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools
+  - wheel
+  - numpy=1.26.4
+  - scipy>=1.11,<1.15
+  - librosa=0.11.*
+  - resampy>=0.4
+  - pysoundfile>=0.12
+  - python-sounddevice>=0.4.6
+  - portaudio
+  - libsndfile
+  - ffmpeg
+  - matplotlib>=3.8
+  - mido>=1.2.6
+  - pyyaml>=6
+  - tk
+  - git
+  - pytest

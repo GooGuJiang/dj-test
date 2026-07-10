@@ -1,0 +1,1450 @@
+from __future__ import annotations
+
+import math
+import queue
+import threading
+from dataclasses import dataclass, replace
+from typing import Any, Sequence
+
+import librosa
+import numpy as np
+try:
+    import sounddevice as sd
+except ImportError:  # 允许在无声卡/测试环境中导入匹配与 DSP 模块。
+    sd = None  # type: ignore[assignment]
+from scipy import signal
+
+from .edm_structure import analyze_edm_structure
+from .models import PreparedTrack, TrackAnalysis, TransitionPlan
+from .spectral_seam import spectral_seam_crossfade
+from .time_stretch import (
+    stretch_stereo as quality_time_stretch,
+    stretch_stereo_time_map,
+)
+from .transition_matcher import (
+    MatcherConfig,
+    TransitionFXConfig,
+    extract_bar_features,
+    find_best_transition,
+    waveform_envelope,
+)
+
+
+@dataclass
+class EngineConfig:
+    sample_rate: int = 44_100
+    channels: int = 2
+    # 0 表示由匹配器在 4/8/16/32 小节中自动选择。
+    crossfade_bars: int = 0
+    max_stretch_percent: float = 12.0
+    cue_on_first_downbeat: bool = True
+    target_rms_db: float = -18.0
+    bass_split_hz: float = 180.0
+    high_split_hz: float = 6_000.0
+    # 混音后用多少小节把下一首从同步 BPM 恢复到其原 BPM。0 表示关闭。
+    # -1 表示根据 BPM 差和 EDM 置信度自动选择 4/8/16/32 小节。
+    tempo_restore_bars: int = -1
+    mix_style: str = "Club"
+    effect_strength: float = 0.72
+    limiter_drive: float = 1.18
+    # Adaptive: high-confidence EDM uses graph-cut spectral seam, otherwise EQ/fader.
+    transition_engine: str = "Adaptive"
+    # AutoMix-like: complex DJ transition / simple crossfade / gapless trim are selected by score.
+    automix_policy: str = "AutoMix-like"
+    time_stretch_backend: str = "auto"
+    min_complex_score: float = 0.60
+    latency: str = "high"
+
+
+def related_bpm(source_bpm: float, target_bpm: float) -> float:
+    candidates = np.asarray(
+        [source_bpm * 0.5, source_bpm, source_bpm * 2.0],
+        dtype=np.float64,
+    )
+    distance = np.abs(np.log2(candidates / target_bpm))
+    return float(candidates[int(np.argmin(distance))])
+
+
+def _smoothstep(value: float | np.ndarray) -> float | np.ndarray:
+    clipped = np.clip(value, 0.0, 1.0)
+    return clipped * clipped * (3.0 - 2.0 * clipped)
+
+
+def _smootherstep(value: float | np.ndarray) -> float | np.ndarray:
+    """五次缓动：端点的一阶、二阶导数均为 0，适合 BPM 自动化。"""
+    clipped = np.clip(value, 0.0, 1.0)
+    return clipped**3 * (clipped * (clipped * 6.0 - 15.0) + 10.0)
+
+
+def _to_stereo(audio: np.ndarray) -> np.ndarray:
+    if audio.ndim == 1:
+        return np.column_stack((audio, audio)).astype(np.float32, copy=False)
+    if audio.shape[0] <= 8:
+        audio = audio[:2].T
+    if audio.shape[1] == 1:
+        audio = np.repeat(audio, 2, axis=1)
+    elif audio.shape[1] > 2:
+        audio = audio[:, :2]
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def _normalize_audio(audio: np.ndarray, target_db: float) -> np.ndarray:
+    rms = float(np.sqrt(np.mean(np.square(audio), dtype=np.float64) + 1e-12))
+    target = 10.0 ** (target_db / 20.0)
+    gain = float(np.clip(target / max(rms, 1e-8), 0.25, 4.0))
+    audio = audio * gain
+    peak = float(np.max(np.abs(audio)) + 1e-9)
+    if peak > 0.98:
+        audio = audio * (0.98 / peak)
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def _nearest_zero_crossing(
+    audio: np.ndarray, sample: int, radius: int
+) -> int:
+    """Snap a join point to the nearest mono zero crossing to reduce clicks."""
+    if audio.size == 0:
+        return 0
+    sample = int(np.clip(sample, 0, len(audio) - 1))
+    start = max(1, sample - max(1, radius))
+    end = min(len(audio) - 1, sample + max(1, radius))
+    mono = np.mean(audio[start - 1 : end + 1], axis=1, dtype=np.float64)
+    crossings = np.flatnonzero(np.signbit(mono[:-1]) != np.signbit(mono[1:])) + start
+    if crossings.size == 0:
+        return sample
+    return int(crossings[np.argmin(np.abs(crossings - sample))])
+
+
+def _split_three_bands(
+    audio: np.ndarray,
+    sample_rate: int,
+    bass_cutoff_hz: float,
+    high_cutoff_hz: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """互补式三段分频，三段相加严格还原原音频。"""
+    nyquist = sample_rate / 2.0
+    low_norm = float(np.clip(bass_cutoff_hz / nyquist, 0.001, 0.90))
+    high_norm = float(np.clip(high_cutoff_hz / nyquist, low_norm + 0.01, 0.98))
+
+    low_sos = signal.butter(4, low_norm, btype="lowpass", output="sos")
+    low = signal.sosfilt(low_sos, audio, axis=0).astype(np.float32)
+    remainder = np.ascontiguousarray(audio - low, dtype=np.float32)
+
+    high_sos = signal.butter(4, high_norm, btype="highpass", output="sos")
+    high = signal.sosfilt(high_sos, remainder, axis=0).astype(np.float32)
+    mid = np.ascontiguousarray(remainder - high, dtype=np.float32)
+    return np.ascontiguousarray(low), mid, np.ascontiguousarray(high)
+
+
+def _stretch_stereo(
+    audio: np.ndarray,
+    rate: float,
+    sample_rate: int = 44_100,
+    backend: str = "auto",
+) -> np.ndarray:
+    stretched, _ = quality_time_stretch(
+        audio,
+        sample_rate=sample_rate,
+        rate=rate,
+        backend=backend,
+    )
+    return stretched
+
+
+def _append_crossfade(
+    base: np.ndarray,
+    addition: np.ndarray,
+    overlap: int,
+) -> tuple[np.ndarray, int]:
+    """拼接立体声音频，返回新数组和 addition 在结果中的起点。"""
+    if base.size == 0:
+        return np.ascontiguousarray(addition, dtype=np.float32), 0
+    if addition.size == 0:
+        return np.ascontiguousarray(base, dtype=np.float32), len(base)
+    overlap = int(max(0, min(overlap, len(base), len(addition))))
+    if overlap == 0:
+        start = len(base)
+        return np.ascontiguousarray(np.concatenate([base, addition], axis=0)), start
+
+    phase = np.linspace(0.0, np.pi / 2.0, overlap, dtype=np.float32)
+    mixed = (
+        base[-overlap:] * np.cos(phase)[:, None]
+        + addition[:overlap] * np.sin(phase)[:, None]
+    )
+    start = len(base) - overlap
+    result = np.concatenate(
+        [base[:-overlap], mixed, addition[overlap:]],
+        axis=0,
+    )
+    return np.ascontiguousarray(result, dtype=np.float32), start
+
+
+def _unique_grid(
+    samples: list[int],
+    numbers: list[int],
+    total_samples: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    pairs = sorted(
+        {
+            (int(sample), int(number))
+            for sample, number in zip(samples, numbers)
+            if 0 <= sample < total_samples
+        },
+        key=lambda pair: pair[0],
+    )
+    if not pairs:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int32)
+    return (
+        np.asarray([pair[0] for pair in pairs], dtype=np.int64),
+        np.asarray([pair[1] for pair in pairs], dtype=np.int32),
+    )
+
+
+class AutoDJEngine:
+    """Beat This! 重拍驱动、连续 BPM 回归与专业过渡的实时 DJ 引擎。"""
+
+    def __init__(self, config: EngineConfig | None = None) -> None:
+        self.config = config or EngineConfig()
+        self.matcher_config = MatcherConfig()
+        self._lock = threading.RLock()
+        self._events: queue.SimpleQueue[str] = queue.SimpleQueue()
+
+        self._playlist: list[TrackAnalysis] = []
+        self._index = -1
+        self._current: PreparedTrack | None = None
+        self._next: PreparedTrack | None = None
+        # 未加入 BPM 恢复桥的同步版，用于重新规划。
+        self._next_synced_base: PreparedTrack | None = None
+        self._plan: TransitionPlan | None = None
+
+        self._current_pos = 0
+        self._next_pos = 0
+        self._transition_pos = 0
+        self._transitioning = False
+
+        self._stream: sd.OutputStream | None = None
+        self._playing = False
+        self._paused = False
+        self._auto_mix = True
+        self._master_volume = 0.9
+        self._device: int | str | None = None
+
+        self._next_loader: threading.Thread | None = None
+        self._next_loading = False
+        self._loader_generation = 0
+        self._last_callback_status = ""
+
+    def emit(self, message: str) -> None:
+        self._events.put(message)
+
+    def drain_events(self) -> list[str]:
+        messages: list[str] = []
+        while True:
+            try:
+                messages.append(self._events.get_nowait())
+            except queue.Empty:
+                break
+        return messages
+
+    @staticmethod
+    def output_devices() -> list[tuple[int, str]]:
+        if sd is None:
+            return []
+        devices = sd.query_devices()
+        result: list[tuple[int, str]] = []
+        for index, item in enumerate(devices):
+            if int(item.get("max_output_channels", 0)) > 0:
+                hostapi = sd.query_hostapis(int(item["hostapi"]))["name"]
+                result.append((index, f"{item['name']} ({hostapi})"))
+        return result
+
+    def _finish_prepared_track(
+        self,
+        *,
+        analysis: TrackAnalysis,
+        audio: np.ndarray,
+        source_audio: np.ndarray,
+        playback_bpm: float,
+        original_bpm: float,
+        stretch_rate: float,
+        beat_samples: np.ndarray,
+        beat_numbers: np.ndarray,
+        downbeat_samples: np.ndarray,
+        source_beat_samples: np.ndarray,
+        source_beat_numbers: np.ndarray,
+        source_downbeat_samples: np.ndarray,
+        cue_sample: int,
+        tempo_restore_start: int = -1,
+        tempo_restore_end: int = -1,
+        tempo_restore_bars: int = 0,
+        stretch_backend: str = "librosa",
+    ) -> PreparedTrack:
+        low, mid, high = _split_three_bands(
+            audio,
+            self.config.sample_rate,
+            self.config.bass_split_hz,
+            self.config.high_split_hz,
+        )
+        features = extract_bar_features(
+            audio=audio,
+            sample_rate=self.config.sample_rate,
+            downbeat_samples=downbeat_samples,
+            bpm=original_bpm if tempo_restore_end >= 0 else playback_bpm,
+            beats_per_bar=max(2, analysis.beats_per_bar),
+            feature_sample_rate=self.matcher_config.feature_sample_rate,
+        )
+        structure = analyze_edm_structure(
+            audio=audio,
+            sample_rate=self.config.sample_rate,
+            features=features,
+            beats_per_bar=max(2, analysis.beats_per_bar),
+        )
+        envelope = waveform_envelope(audio, bins=self.matcher_config.waveform_bins)
+        return PreparedTrack(
+            analysis=analysis,
+            audio=np.ascontiguousarray(audio, dtype=np.float32),
+            low_audio=low,
+            mid_audio=mid,
+            high_audio=high,
+            source_audio=np.ascontiguousarray(source_audio, dtype=np.float32),
+            sample_rate=self.config.sample_rate,
+            playback_bpm=float(playback_bpm),
+            original_bpm=float(original_bpm),
+            stretch_rate=float(stretch_rate),
+            beat_samples=np.asarray(beat_samples, dtype=np.int64),
+            beat_numbers=np.asarray(beat_numbers, dtype=np.int32),
+            downbeat_samples=np.asarray(downbeat_samples, dtype=np.int64),
+            source_beat_samples=np.asarray(source_beat_samples, dtype=np.int64),
+            source_beat_numbers=np.asarray(source_beat_numbers, dtype=np.int32),
+            source_downbeat_samples=np.asarray(source_downbeat_samples, dtype=np.int64),
+            cue_sample=int(cue_sample),
+            waveform_envelope=envelope,
+            bar_features=features,
+            tempo_restore_start=int(tempo_restore_start),
+            tempo_restore_end=int(tempo_restore_end),
+            tempo_restore_bars=int(tempo_restore_bars),
+            structure=structure,
+            stretch_backend=stretch_backend,
+        )
+
+    def prepare_track(
+        self,
+        analysis: TrackAnalysis,
+        target_bpm: float | None = None,
+    ) -> PreparedTrack:
+        audio_cf, _ = librosa.load(
+            analysis.path,
+            sr=self.config.sample_rate,
+            mono=False,
+            dtype=np.float32,
+        )
+        source_audio = _normalize_audio(_to_stereo(audio_cf), self.config.target_rms_db)
+
+        source_beat_samples_all = np.asarray(
+            np.rint(np.asarray(analysis.beat_times) * self.config.sample_rate),
+            dtype=np.int64,
+        )
+        source_beat_numbers_all = np.asarray(analysis.beat_numbers, dtype=np.int32)
+        valid_source_beats = (
+            (source_beat_samples_all >= 0)
+            & (source_beat_samples_all < source_audio.shape[0])
+        )
+        source_beat_samples = source_beat_samples_all[valid_source_beats]
+        if source_beat_numbers_all.size == source_beat_samples_all.size:
+            source_beat_numbers = source_beat_numbers_all[valid_source_beats]
+        else:
+            source_beat_numbers = source_beat_numbers_all[: source_beat_samples.size]
+            if source_beat_numbers.size < source_beat_samples.size:
+                source_beat_numbers = np.pad(
+                    source_beat_numbers,
+                    (0, source_beat_samples.size - source_beat_numbers.size),
+                    constant_values=0,
+                )
+
+        source_downbeats = np.asarray(
+            np.rint(np.asarray(analysis.downbeat_times) * self.config.sample_rate),
+            dtype=np.int64,
+        )
+        source_downbeats = source_downbeats[
+            (source_downbeats >= 0) & (source_downbeats < source_audio.shape[0])
+        ]
+
+        stretch_rate = 1.0
+        playback_bpm = float(analysis.bpm)
+        original_bpm = float(analysis.bpm)
+        if target_bpm and target_bpm > 0:
+            interpreted = related_bpm(analysis.bpm, target_bpm)
+            original_bpm = float(interpreted)
+            proposed_rate = target_bpm / interpreted
+            limit = self.config.max_stretch_percent / 100.0
+            if abs(proposed_rate - 1.0) <= limit:
+                stretch_rate = float(proposed_rate)
+                playback_bpm = float(interpreted * stretch_rate)
+            else:
+                self.emit(
+                    f"速度差过大，{analysis.title} 不强制同步："
+                    f"{interpreted:.1f} → {target_bpm:.1f} BPM"
+                )
+
+        audio, stretch_backend = quality_time_stretch(
+            source_audio,
+            sample_rate=self.config.sample_rate,
+            rate=stretch_rate,
+            backend=self.config.time_stretch_backend,
+        )
+        if not math.isclose(stretch_rate, 1.0, abs_tol=1e-4):
+            self.emit(
+                f"已同步 {analysis.title}：{original_bpm:.1f} → "
+                f"{playback_bpm:.1f} BPM · {stretch_backend}"
+            )
+
+        scale = 1.0 / stretch_rate
+        beat_samples = np.asarray(np.rint(source_beat_samples * scale), dtype=np.int64)
+        valid = (beat_samples >= 0) & (beat_samples < audio.shape[0])
+        beat_samples = beat_samples[valid]
+        beat_numbers = source_beat_numbers[valid]
+        downbeat_samples = np.asarray(
+            np.rint(source_downbeats * scale),
+            dtype=np.int64,
+        )
+        downbeat_samples = downbeat_samples[
+            (downbeat_samples >= 0) & (downbeat_samples < audio.shape[0])
+        ]
+
+        cue_sample = 0
+        if self.config.cue_on_first_downbeat and downbeat_samples.size:
+            candidates = downbeat_samples[
+                downbeat_samples >= int(0.25 * self.config.sample_rate)
+            ]
+            if candidates.size:
+                cue_sample = int(candidates[0])
+
+        return self._finish_prepared_track(
+            analysis=analysis,
+            audio=audio,
+            source_audio=source_audio,
+            playback_bpm=playback_bpm,
+            original_bpm=original_bpm,
+            stretch_rate=stretch_rate,
+            beat_samples=beat_samples,
+            beat_numbers=beat_numbers,
+            downbeat_samples=downbeat_samples,
+            source_beat_samples=source_beat_samples,
+            source_beat_numbers=source_beat_numbers,
+            source_downbeat_samples=source_downbeats,
+            cue_sample=cue_sample,
+            stretch_backend=stretch_backend,
+        )
+
+    def _source_bar_boundaries(self, track: PreparedTrack) -> np.ndarray:
+        downbeats = np.unique(track.source_downbeat_samples)
+        if downbeats.size >= 2:
+            return downbeats
+        bar_length = int(
+            round(
+                max(2, track.analysis.beats_per_bar)
+                * 60.0
+                / max(track.original_bpm, 1.0)
+                * track.sample_rate
+            )
+        )
+        return np.arange(
+            0,
+            track.source_audio.shape[0],
+            max(bar_length, track.sample_rate),
+            dtype=np.int64,
+        )
+
+    def _apply_tempo_restore(
+        self,
+        synced: PreparedTrack,
+        restore_start: int,
+    ) -> PreparedTrack:
+        """
+        使用一条连续 source->target 时间映射恢复原 BPM。
+
+        旧实现逐小节单独 time-stretch 后用 12ms crossfade 拼接，电子鼓和低频会
+        在每个小节边界产生相位/瞬态变化。新实现一次渲染整首歌曲：恢复前保持
+        同步速度，恢复区用五次缓动逐小节改变局部速度，恢复后保持原速。
+        """
+        bars_requested = int(self.config.tempo_restore_bars)
+        if math.isclose(synced.stretch_rate, 1.0, abs_tol=1e-3):
+            return synced
+        if bars_requested < 0:
+            difference = abs(float(synced.stretch_rate) - 1.0)
+            if difference <= 0.008:
+                bars_requested = 4
+            elif difference <= 0.020:
+                bars_requested = 8
+            elif difference <= 0.040:
+                bars_requested = 16
+            else:
+                bars_requested = 32
+            # 稳定电子音乐对 kick/bass 的速度自动化更敏感，至少留 16 小节。
+            if synced.structure.edm_confidence >= 0.55 and difference > 0.015:
+                bars_requested = max(16, bars_requested)
+        if (
+            bars_requested <= 0
+            or restore_start >= synced.total_samples - synced.sample_rate
+        ):
+            return synced
+
+        source_length = int(synced.source_audio.shape[0])
+        initial_rate = float(synced.stretch_rate)
+        source_start = int(round(restore_start * initial_rate))
+        source_start = int(np.clip(source_start, 0, max(0, source_length - 1)))
+
+        boundaries = self._source_bar_boundaries(synced)
+        boundaries = np.unique(boundaries[(boundaries > source_start) & (boundaries <= source_length)])
+        if boundaries.size == 0:
+            return synced
+
+        endpoints = boundaries[:bars_requested]
+        if endpoints.size == 0:
+            return synced
+        bars = int(endpoints.size)
+
+        # 保证恢复开始前的时间坐标与原同步版本完全一致，因而已有 IN/MIX
+        # 位置不需要重新计算。
+        keyframes: list[tuple[int, int]] = [(0, 0)]
+        if source_start > 0:
+            keyframes.append((source_start, int(restore_start)))
+
+        source_cursor = source_start
+        target_cursor = float(restore_start)
+        log_initial_rate = math.log(max(initial_rate, 1e-6))
+
+        for index, source_end in enumerate(endpoints):
+            source_end = int(source_end)
+            if source_end <= source_cursor:
+                continue
+            midpoint = (index + 0.5) / max(bars, 1)
+            eased = float(_smootherstep(midpoint))
+            # BPM/速度用几何插值，比线性 rate 插值的听感更均匀。
+            local_rate = math.exp(log_initial_rate * (1.0 - eased))
+            target_cursor += (source_end - source_cursor) / max(local_rate, 1e-6)
+            keyframes.append((source_end, int(round(target_cursor))))
+            source_cursor = source_end
+
+        if source_cursor >= source_length:
+            return synced
+        # 恢复结束后 1:1 映射，原速尾段与恢复桥在同一次渲染中连续生成。
+        keyframes.append(
+            (source_length, int(round(target_cursor + source_length - source_cursor)))
+        )
+
+        rendered, backend, source_map, target_map = stretch_stereo_time_map(
+            synced.source_audio,
+            sample_rate=synced.sample_rate,
+            keyframes=keyframes,
+            backend=self.config.time_stretch_backend,
+        )
+        if rendered.size == 0:
+            return synced
+
+        def map_samples(values: np.ndarray) -> np.ndarray:
+            values = np.asarray(values, dtype=np.float64)
+            mapped = np.interp(values, source_map, target_map)
+            return np.asarray(np.rint(mapped), dtype=np.int64)
+
+        beat_grid = map_samples(synced.source_beat_samples)
+        valid_beats = (beat_grid >= 0) & (beat_grid < len(rendered))
+        beat_grid = beat_grid[valid_beats]
+        number_grid = synced.source_beat_numbers[: valid_beats.size]
+        if synced.source_beat_numbers.size == valid_beats.size:
+            number_grid = synced.source_beat_numbers[valid_beats]
+        elif number_grid.size < beat_grid.size:
+            number_grid = np.pad(
+                number_grid,
+                (0, beat_grid.size - number_grid.size),
+                constant_values=0,
+            )
+
+        downbeat_grid = map_samples(synced.source_downbeat_samples)
+        downbeat_grid = np.unique(
+            downbeat_grid[(downbeat_grid >= 0) & (downbeat_grid < len(rendered))]
+        )
+        source_cue = int(round(synced.cue_sample * initial_rate))
+        cue_sample = int(
+            round(float(np.interp(source_cue, source_map, target_map)))
+        )
+
+        restore_end_source = int(endpoints[-1])
+        restore_end = int(
+            round(float(np.interp(restore_end_source, source_map, target_map)))
+        )
+        restore_start_mapped = int(
+            round(float(np.interp(source_start, source_map, target_map)))
+        )
+
+        result = self._finish_prepared_track(
+            analysis=synced.analysis,
+            audio=rendered,
+            source_audio=synced.source_audio,
+            playback_bpm=synced.playback_bpm,
+            original_bpm=synced.original_bpm,
+            stretch_rate=synced.stretch_rate,
+            beat_samples=beat_grid,
+            beat_numbers=number_grid,
+            downbeat_samples=downbeat_grid,
+            source_beat_samples=synced.source_beat_samples,
+            source_beat_numbers=synced.source_beat_numbers,
+            source_downbeat_samples=synced.source_downbeat_samples,
+            cue_sample=cue_sample,
+            tempo_restore_start=restore_start_mapped,
+            tempo_restore_end=restore_end,
+            tempo_restore_bars=bars,
+            stretch_backend=backend,
+        )
+        self.emit(
+            f"连续 BPM 恢复：{synced.playback_bpm:.1f} → "
+            f"{synced.original_bpm:.1f} BPM / {bars} 小节 · {backend}"
+        )
+        return result
+
+    def _render_echo(self, plan: TransitionPlan, current: PreparedTrack) -> np.ndarray:
+        strength = float(np.clip(self.config.effect_strength, 0.0, 1.0))
+        style = self.config.mix_style.lower()
+        style_amount = {
+            "smooth": 0.08,
+            "club": 0.20,
+            "filter": 0.12,
+            "echo": 0.42,
+        }.get(style, 0.20)
+        amount = style_amount * strength
+        if amount <= 1e-4 or plan.length < 256:
+            return np.zeros((plan.length, 2), dtype=np.float32)
+
+        segment = (
+            current.mid_audio[plan.current_start : plan.current_end]
+            + current.high_audio[plan.current_start : plan.current_end]
+        )
+        if len(segment) < plan.length:
+            segment = np.pad(segment, ((0, plan.length - len(segment)), (0, 0)))
+        segment = segment[: plan.length]
+
+        phase = np.linspace(0.0, 1.0, plan.length, dtype=np.float32)
+        send_start = 0.58 if style == "echo" else 0.68
+        send = np.asarray(_smoothstep((phase - send_start) / (1.0 - send_start)), dtype=np.float32)
+        source = segment * send[:, None] * np.float32(amount)
+
+        delay = int(
+            round(
+                current.sample_rate
+                * 60.0
+                / max(current.bpm_at_sample(plan.current_start), 1.0)
+                * 0.5
+            )
+        )
+        delay = max(64, delay)
+        feedback = 0.43 if style == "echo" else 0.31
+        echo = np.zeros((plan.length, 2), dtype=np.float32)
+        for repeat in range(1, 6):
+            shift = delay * repeat
+            if shift >= plan.length:
+                break
+            contribution = source[: plan.length - shift] * np.float32(feedback ** (repeat - 1))
+            if repeat % 2:
+                contribution = contribution[:, ::-1]
+            echo[shift:] += contribution
+
+        tail_shape = np.sin(np.pi * np.clip((phase - 0.45) / 0.55, 0.0, 1.0))
+        return np.ascontiguousarray(echo * tail_shape[:, None], dtype=np.float32)
+
+    def start_playlist(
+        self,
+        playlist: Sequence[TrackAnalysis],
+        start_index: int = 0,
+        device: int | str | None = None,
+    ) -> None:
+        if not playlist:
+            raise ValueError("播放列表为空。")
+        if not 0 <= start_index < len(playlist):
+            raise IndexError("start_index 超出播放列表范围。")
+
+        if sd is None:
+            raise RuntimeError(
+                "缺少 sounddevice。请在 beatthis-auto-dj 环境中安装 "
+                "python-sounddevice/portaudio 后再启动实时播放。"
+            )
+
+        self.close()
+        self.emit(f"正在提取当前歌曲的智能匹配特征：{playlist[start_index].title}")
+        current = self.prepare_track(playlist[start_index])
+
+        with self._lock:
+            self._playlist = list(playlist)
+            self._index = start_index
+            self._current = current
+            self._next = None
+            self._next_synced_base = None
+            self._plan = None
+            self._current_pos = 0
+            self._next_pos = 0
+            self._transition_pos = 0
+            self._transitioning = False
+            self._playing = True
+            self._paused = False
+            self._device = device
+            self._loader_generation += 1
+
+        stream = sd.OutputStream(
+            samplerate=self.config.sample_rate,
+            blocksize=0,
+            device=device,
+            channels=self.config.channels,
+            dtype="float32",
+            latency=self.config.latency,
+            callback=self._audio_callback,
+        )
+        stream.start()
+        with self._lock:
+            self._stream = stream
+
+        self.emit(f"开始播放：{current.title}")
+        self.service()
+
+    def _fx_config(self) -> TransitionFXConfig:
+        return TransitionFXConfig(
+            style=self.config.mix_style,
+            strength=self.config.effect_strength,
+        )
+
+    @staticmethod
+    def _neutral_curves(length: int, gain: float = 1.0) -> tuple[np.ndarray, ...]:
+        phase = np.linspace(0.0, np.pi / 2.0, max(1, length), dtype=np.float32)
+        fade_out = np.cos(phase).astype(np.float32)
+        fade_in = (np.sin(phase) * np.float32(gain)).astype(np.float32)
+        return tuple(
+            np.ascontiguousarray(value, dtype=np.float32)
+            for value in (fade_out, fade_in, fade_out, fade_in, fade_out, fade_in)
+        )
+
+    def _simple_transition_plan(
+        self,
+        current: PreparedTrack,
+        next_track: PreparedTrack,
+        earliest_start: int,
+        base_plan: TransitionPlan,
+        mode: str,
+    ) -> TransitionPlan:
+        """Build a short silence-trim or beat-aligned equal-power transition."""
+        sr = self.config.sample_rate
+        if mode == "Gapless Trim":
+            duration_seconds = 0.38
+            next_start = int(max(0, next_track.structure.silence_start_sample))
+            active_end = int(current.structure.silence_end_sample)
+            if active_end <= 0:
+                active_end = current.total_samples
+            length = min(
+                max(256, int(round(duration_seconds * sr))),
+                max(1, current.total_samples - earliest_start),
+                max(1, next_track.total_samples - next_start),
+            )
+            current_start = max(earliest_start, active_end - length)
+            current_start = min(current_start, max(0, current.total_samples - length))
+            radius = int(0.020 * sr)
+            current_start = _nearest_zero_crossing(current.audio, current_start, radius)
+            next_start = _nearest_zero_crossing(next_track.audio, next_start, radius)
+            length = min(
+                length,
+                current.total_samples - current_start,
+                next_track.total_samples - next_start,
+            )
+            length = max(1, int(length))
+            bars = 0
+            policy = "Silence-trim gapless"
+        else:
+            # Keep phrase-aligned paper cue points but use a conservative fader.
+            current_start = max(earliest_start, base_plan.current_start)
+            next_start = base_plan.next_start
+            max_length = int(round(8 * max(2, current.analysis.beats_per_bar) * 60.0 /
+                                   max(current.bpm_at_sample(current_start), 1.0) * sr))
+            length = min(
+                base_plan.length,
+                max_length,
+                current.total_samples - current_start,
+                next_track.total_samples - next_start,
+            )
+            length = max(1, int(length))
+            bars = min(base_plan.bars, 8)
+            policy = "Simple beat crossfade"
+
+        gain = float(base_plan.metrics.get("local_gain", 1.0))
+        fade_out, fade_in, bass_out, bass_in, high_out, high_in = self._neutral_curves(length, gain)
+        metrics = dict(base_plan.metrics)
+        metrics["policy_complexity"] = 0.15 if mode == "Gapless Trim" else 0.42
+        return TransitionPlan(
+            current_start=int(current_start),
+            next_start=int(next_start),
+            length=int(length),
+            bars=int(bars),
+            current_bar_index=base_plan.current_bar_index,
+            next_bar_index=base_plan.next_bar_index,
+            score=base_plan.score,
+            fade_out=fade_out,
+            fade_in=fade_in,
+            bass_out=bass_out,
+            bass_in=bass_in,
+            high_out=high_out,
+            high_in=high_in,
+            echo_audio=np.zeros((length, 2), dtype=np.float32),
+            metrics=metrics,
+            automatic=base_plan.automatic,
+            style="Smooth",
+            effect_strength=0.0,
+            transition_mode=mode,
+            policy_mode=policy,
+            switch_position=0.50,
+        )
+
+    def _apply_automix_policy(
+        self,
+        current: PreparedTrack,
+        next_track: PreparedTrack,
+        earliest_start: int,
+        plan: TransitionPlan,
+    ) -> TransitionPlan:
+        policy = self.config.automix_policy.strip().lower()
+        if policy == "always dj":
+            plan.policy_mode = "Forced complex DJ"
+            return plan
+        if policy == "crossfade":
+            return self._simple_transition_plan(
+                current, next_track, earliest_start, plan, "Simple Crossfade"
+            )
+
+        edm_pair = float(np.sqrt(
+            max(current.structure.edm_confidence, 0.0)
+            * max(next_track.structure.edm_confidence, 0.0)
+        ))
+        cue = float(plan.metrics.get("cue_alignment", 0.0))
+        phrase = float(plan.metrics.get("phrase_alignment", 0.0))
+        complex_confidence = 0.58 * plan.score + 0.24 * edm_pair + 0.11 * cue + 0.07 * phrase
+        plan.metrics["automix_confidence"] = float(np.clip(complex_confidence, 0.0, 1.0))
+        if complex_confidence >= self.config.min_complex_score:
+            plan.policy_mode = "Complex DJ transition"
+            return plan
+        if plan.score >= 0.43 or cue >= 0.46:
+            return self._simple_transition_plan(
+                current, next_track, earliest_start, plan, "Simple Crossfade"
+            )
+        return self._simple_transition_plan(
+            current, next_track, earliest_start, plan, "Gapless Trim"
+        )
+
+    def _render_advanced_transition(
+        self,
+        plan: TransitionPlan,
+        current: PreparedTrack,
+        next_track: PreparedTrack,
+    ) -> TransitionPlan:
+        """Pre-render echo or graph-cut spectral seam outside the audio callback."""
+        is_complex = plan.transition_mode == "Paper EQ/Fader"
+        plan.echo_audio = (
+            self._render_echo(plan, current)
+            if is_complex
+            else np.zeros((plan.length, 2), dtype=np.float32)
+        )
+        engine = self.config.transition_engine.strip().lower()
+        edm_pair = float(np.sqrt(
+            max(current.structure.edm_confidence, 0.0)
+            * max(next_track.structure.edm_confidence, 0.0)
+        ))
+        use_spectral = is_complex and (engine == "spectral seam" or (
+            engine == "adaptive"
+            and plan.policy_mode == "Complex DJ transition"
+            and edm_pair >= 0.48
+            and plan.score >= 0.54
+        ))
+        # Full-STFT rendering of very long 32-bar transitions is memory-heavy;
+        # parametric three-band DSP remains the safer renderer there.
+        maximum_seconds = 24.0
+        if use_spectral and plan.length / self.config.sample_rate <= maximum_seconds:
+            a = current.audio[plan.current_start : plan.current_end]
+            b = next_track.audio[plan.next_start : plan.next_end]
+            try:
+                result = spectral_seam_crossfade(
+                    outgoing=a,
+                    incoming=b,
+                    sample_rate=self.config.sample_rate,
+                )
+                rendered = result.audio[: plan.length]
+                if len(rendered) < plan.length:
+                    rendered = np.pad(rendered, ((0, plan.length - len(rendered)), (0, 0)))
+                rendered = rendered + plan.echo_audio[: len(rendered)]
+                peak = float(np.max(np.abs(rendered)) + 1e-9)
+                if peak > 0.98:
+                    rendered *= np.float32(0.98 / peak)
+                plan.rendered_audio = np.ascontiguousarray(rendered, dtype=np.float32)
+                plan.transition_mode = "Spectral Graph-Cut"
+                plan.metrics["seam_mean_seconds"] = result.seam_seconds_mean
+                plan.metrics["seam_std_seconds"] = result.seam_seconds_std
+                plan.metrics["graph_flow"] = result.flow_value
+            except Exception as exc:
+                self.emit(f"谱缝合回退到三段 EQ：{exc}")
+                plan.transition_mode = "Paper EQ/Fader"
+        elif plan.transition_mode not in {"Simple Crossfade", "Gapless Trim"}:
+            plan.transition_mode = "Paper EQ/Fader"
+        return plan
+
+    def _calculate_plan(
+        self,
+        current: PreparedTrack,
+        next_track: PreparedTrack,
+        earliest_start: int,
+        force_current_start: int | None = None,
+    ) -> TransitionPlan:
+        plan = find_best_transition(
+            current=current,
+            next_track=next_track,
+            earliest_start=earliest_start,
+            requested_bars=self.config.crossfade_bars,
+            force_current_start=force_current_start,
+            config=self.matcher_config,
+            fx_config=self._fx_config(),
+        )
+        plan = self._apply_automix_policy(current, next_track, earliest_start, plan)
+        plan = self._render_advanced_transition(plan, current, next_track)
+        plan.metrics["tempo_sync_bpm"] = next_track.playback_bpm
+        plan.metrics["tempo_original_bpm"] = next_track.original_bpm
+        plan.metrics["current_edm_confidence"] = current.structure.edm_confidence
+        plan.metrics["next_edm_confidence"] = next_track.structure.edm_confidence
+        return plan
+
+    def _load_next_worker(
+        self,
+        generation: int,
+        source_index: int,
+        analysis: TrackAnalysis,
+        target_bpm: float,
+    ) -> None:
+        try:
+            self.emit(f"正在分析下一首匹配片段：{analysis.title}")
+            synced_base = self.prepare_track(analysis, target_bpm=target_bpm)
+            with self._lock:
+                still_valid = (
+                    generation == self._loader_generation
+                    and source_index == self._index
+                    and self._current is not None
+                    and self._playing
+                )
+                current = self._current
+                earliest = self._current_pos + int(0.25 * self.config.sample_rate)
+
+            plan: TransitionPlan | None = None
+            prepared = synced_base
+            if still_valid and current is not None:
+                plan = self._calculate_plan(current, synced_base, earliest)
+                with self._lock:
+                    latest = self._current_pos
+                if latest >= plan.current_start:
+                    plan = self._calculate_plan(
+                        current,
+                        synced_base,
+                        latest + int(0.15 * self.config.sample_rate),
+                    )
+                prepared = self._apply_tempo_restore(synced_base, plan.next_end)
+                plan = self._render_advanced_transition(plan, current, prepared)
+
+            with self._lock:
+                if (
+                    generation == self._loader_generation
+                    and source_index == self._index
+                    and self._playing
+                ):
+                    self._next_synced_base = synced_base
+                    self._next = prepared
+                    self._plan = plan
+                    if plan is not None:
+                        self.emit(
+                            "专业切歌已规划："
+                            f"A {plan.current_start / self.config.sample_rate:.1f}s → "
+                            f"B {plan.next_start / self.config.sample_rate:.1f}s | "
+                            f"{(str(plan.bars) + ' 小节') if plan.bars else '无缝裁切'} | {plan.transition_mode} | "
+                            f"匹配 {plan.score * 100:.0f}分"
+                        )
+        except Exception as exc:
+            self.emit(f"准备下一首失败：{exc}")
+        finally:
+            with self._lock:
+                self._next_loading = False
+
+    def service(self) -> None:
+        with self._lock:
+            if (
+                not self._playing
+                or self._current is None
+                or self._next is not None
+                or self._next_loading
+                or self._index + 1 >= len(self._playlist)
+            ):
+                return
+            analysis = self._playlist[self._index + 1]
+            # 下一次切歌通常发生在当前歌曲已恢复原 BPM 之后。
+            target_bpm = self._current.original_bpm
+            generation = self._loader_generation
+            source_index = self._index
+            self._next_loading = True
+
+        worker = threading.Thread(
+            target=self._load_next_worker,
+            args=(generation, source_index, analysis, target_bpm),
+            daemon=True,
+            name="AutoDJ-NextLoader",
+        )
+        self._next_loader = worker
+        worker.start()
+
+    def _replan(self, force_start: int | None = None) -> TransitionPlan | None:
+        with self._lock:
+            current = self._current
+            synced_base = self._next_synced_base
+            earliest = self._current_pos + int(0.15 * self.config.sample_rate)
+        if current is None or synced_base is None:
+            return None
+        plan = self._calculate_plan(
+            current,
+            synced_base,
+            earliest_start=earliest,
+            force_current_start=force_start,
+        )
+        prepared = self._apply_tempo_restore(synced_base, plan.next_end)
+        plan = self._render_advanced_transition(plan, current, prepared)
+        with self._lock:
+            if self._current is current and self._next_synced_base is synced_base:
+                self._next = prepared
+                self._plan = plan
+        return plan
+
+    def rebuild_transition(self) -> None:
+        try:
+            plan = self._replan()
+            if plan is not None:
+                self.emit(
+                    f"切歌点已更新：{plan.bars} 小节，{plan.style}，"
+                    f"匹配 {plan.score * 100:.0f}分"
+                )
+        except Exception as exc:
+            self.emit(f"重新计算切歌点失败：{exc}")
+
+    def request_next(self) -> bool:
+        with self._lock:
+            if self._current is None or self._next_synced_base is None:
+                self.emit("下一首仍在准备，暂时不能切歌。")
+                return False
+            earliest = self._current_pos + int(0.08 * self.config.sample_rate)
+        try:
+            plan = self._replan(force_start=earliest)
+        except Exception as exc:
+            self.emit(f"安排立即切歌失败：{exc}")
+            return False
+        if plan is None:
+            return False
+        with self._lock:
+            self._auto_mix = True
+        self.emit(
+            f"已安排在下一个重拍切歌：{plan.bars} 小节，"
+            f"{plan.style}，匹配 {plan.score * 100:.0f}分"
+        )
+        return True
+
+    def _begin_transition_locked(self) -> None:
+        if self._plan is None or self._next is None:
+            return
+        self._transitioning = True
+        self._transition_pos = max(0, self._current_pos - self._plan.current_start)
+        self._next_pos = self._plan.next_start + self._transition_pos
+
+    def _promote_next_locked(self) -> None:
+        if self._next is None:
+            self._playing = False
+            return
+        self._current = self._next
+        self._current_pos = self._next_pos
+        self._index += 1
+        self._next = None
+        self._next_synced_base = None
+        self._plan = None
+        self._transitioning = False
+        self._transition_pos = 0
+        self._next_pos = 0
+        self._loader_generation += 1
+
+    def _soft_limit(self, data: np.ndarray) -> None:
+        drive = float(max(1.0, self.config.limiter_drive))
+        peak = float(np.max(np.abs(data)))
+        if peak > 0.86:
+            data[:] = np.tanh(data * drive) / np.tanh(drive)
+        np.clip(data, -1.0, 1.0, out=data)
+
+    def _audio_callback(
+        self,
+        outdata: np.ndarray,
+        frames: int,
+        time_info: Any,
+        status: sd.CallbackFlags,
+    ) -> None:
+        outdata.fill(0.0)
+        if status:
+            self._last_callback_status = str(status)
+
+        with self._lock:
+            if not self._playing or self._paused or self._current is None:
+                return
+
+            written = 0
+            while written < frames and self._playing and self._current is not None:
+                current = self._current
+                if (
+                    not self._transitioning
+                    and self._auto_mix
+                    and self._plan is not None
+                    and self._next is not None
+                    and self._current_pos >= self._plan.current_start
+                ):
+                    self._begin_transition_locked()
+
+                if self._transitioning and self._plan is not None and self._next is not None:
+                    plan = self._plan
+                    next_track = self._next
+                    remaining = plan.length - self._transition_pos
+                    count = min(
+                        frames - written,
+                        remaining,
+                        current.total_samples - self._current_pos,
+                        next_track.total_samples - self._next_pos,
+                    )
+                    if count <= 0:
+                        self._promote_next_locked()
+                        continue
+
+                    t0 = self._transition_pos
+                    t1 = t0 + count
+                    a0 = self._current_pos
+                    a1 = a0 + count
+                    b0 = self._next_pos
+                    b1 = b0 + count
+
+                    if plan.rendered_audio is not None:
+                        mixed = plan.rendered_audio[t0:t1]
+                    else:
+                        # 三段 EQ：低频独立交换，中频等功率，高频执行滤波扫频。
+                        mixed = (
+                            current.low_audio[a0:a1] * plan.bass_out[t0:t1, None]
+                            + next_track.low_audio[b0:b1] * plan.bass_in[t0:t1, None]
+                            + current.mid_audio[a0:a1] * plan.fade_out[t0:t1, None]
+                            + next_track.mid_audio[b0:b1] * plan.fade_in[t0:t1, None]
+                            + current.high_audio[a0:a1] * plan.high_out[t0:t1, None]
+                            + next_track.high_audio[b0:b1] * plan.high_in[t0:t1, None]
+                            + plan.echo_audio[t0:t1]
+                        )
+                    outdata[written : written + count] = mixed
+                    self._current_pos = a1
+                    self._next_pos = b1
+                    self._transition_pos = t1
+                    written += count
+                    if self._transition_pos >= plan.length:
+                        self._promote_next_locked()
+                    continue
+
+                if self._current_pos >= current.total_samples:
+                    if self._next is not None:
+                        self._next_pos = self._next.cue_sample
+                        self._promote_next_locked()
+                        continue
+                    self._playing = False
+                    break
+
+                stop_at = current.total_samples
+                if self._auto_mix and self._plan is not None and self._next is not None:
+                    stop_at = min(stop_at, self._plan.current_start)
+                count = min(frames - written, max(0, stop_at - self._current_pos))
+                if count <= 0:
+                    if self._plan is not None and self._next is not None:
+                        self._begin_transition_locked()
+                        continue
+                    self._playing = False
+                    break
+
+                a0 = self._current_pos
+                a1 = a0 + count
+                outdata[written : written + count] = current.audio[a0:a1]
+                self._current_pos = a1
+                written += count
+
+            if self._master_volume != 1.0:
+                outdata *= np.float32(self._master_volume)
+            self._soft_limit(outdata)
+
+    def pause(self) -> None:
+        with self._lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        with self._lock:
+            if self._current is not None:
+                self._paused = False
+                self._playing = True
+
+    def stop(self) -> None:
+        with self._lock:
+            self._playing = False
+            self._paused = False
+            self._loader_generation += 1
+        stream = self._stream
+        self._stream = None
+        if stream is not None:
+            try:
+                stream.abort()
+            finally:
+                stream.close()
+        with self._lock:
+            self._current = None
+            self._next = None
+            self._next_synced_base = None
+            self._plan = None
+            self._playlist = []
+            self._index = -1
+            self._current_pos = 0
+            self._next_pos = 0
+            self._transition_pos = 0
+            self._transitioning = False
+
+    def close(self) -> None:
+        self.stop()
+
+    def set_auto_mix(self, enabled: bool) -> None:
+        with self._lock:
+            self._auto_mix = bool(enabled)
+
+    def set_volume(self, value: float) -> None:
+        with self._lock:
+            self._master_volume = float(np.clip(value, 0.0, 1.25))
+
+    def set_crossfade_bars(self, bars: int) -> None:
+        self.config.crossfade_bars = int(max(0, bars))
+        self.rebuild_transition()
+
+    def set_max_stretch_percent(self, percent: float) -> None:
+        self.config.max_stretch_percent = float(np.clip(percent, 0.0, 30.0))
+
+    def set_tempo_restore_bars(self, bars: int) -> None:
+        value = int(bars)
+        self.config.tempo_restore_bars = -1 if value < 0 else max(0, value)
+        self.rebuild_transition()
+
+    def set_mix_style(self, style: str) -> None:
+        if style not in {"Smooth", "Club", "Filter", "Echo"}:
+            raise ValueError(f"未知混音风格：{style}")
+        self.config.mix_style = style
+        self.rebuild_transition()
+
+    def set_effect_strength(self, strength: float) -> None:
+        self.config.effect_strength = float(np.clip(strength, 0.0, 1.0))
+        self.rebuild_transition()
+
+    def set_transition_engine(self, value: str) -> None:
+        if value not in {"Adaptive", "Spectral Seam", "EQ/Fader"}:
+            raise ValueError(f"未知过渡引擎：{value}")
+        self.config.transition_engine = value
+        self.rebuild_transition()
+
+    def set_automix_policy(self, value: str) -> None:
+        if value not in {"AutoMix-like", "Always DJ", "Crossfade"}:
+            raise ValueError(f"未知 AutoMix 策略：{value}")
+        self.config.automix_policy = value
+        self.rebuild_transition()
+
+    def set_time_stretch_backend(self, value: str) -> None:
+        if value not in {"auto", "Rubber Band R3", "librosa"}:
+            raise ValueError(f"未知时间拉伸后端：{value}")
+        self.config.time_stretch_backend = value
+
+    def set_cue_on_first_downbeat(self, enabled: bool) -> None:
+        self.config.cue_on_first_downbeat = bool(enabled)
+
+    def get_status(self) -> dict[str, Any]:
+        with self._lock:
+            current = self._current
+            next_track = self._next
+            plan = self._plan
+            stream = self._stream
+            if current is None:
+                return {
+                    "playing": False,
+                    "paused": False,
+                    "current": "",
+                    "next": "",
+                    "position": 0.0,
+                    "duration": 0.0,
+                    "next_duration": 0.0,
+                    "progress": 0.0,
+                    "bpm": 0.0,
+                    "sync_bpm": 0.0,
+                    "original_bpm": 0.0,
+                    "beat_number": 0,
+                    "transitioning": False,
+                    "transition_progress": 0.0,
+                    "index": -1,
+                    "next_loading": self._next_loading,
+                    "cpu_load": 0.0,
+                    "callback_status": self._last_callback_status,
+                    "current_waveform": None,
+                    "next_waveform": None,
+                    "transition_start": None,
+                    "transition_end": None,
+                    "next_entry": None,
+                    "next_transition_end": None,
+                    "tempo_restore_start": None,
+                    "tempo_restore_end": None,
+                    "next_tempo_restore_start": None,
+                    "next_tempo_restore_end": None,
+                    "tempo_restore_progress": 0.0,
+                    "transition_bars": 0,
+                    "tempo_restore_bars": 0,
+                    "match_score": 0.0,
+                    "match_metrics": {},
+                    "mix_style": self.config.mix_style,
+                    "effect_strength": self.config.effect_strength,
+                    "transition_mode": "",
+                    "policy_mode": self.config.automix_policy,
+                    "stretch_backend": "",
+                    "current_key": "—",
+                    "next_key": "—",
+                    "current_edm_confidence": 0.0,
+                    "next_edm_confidence": 0.0,
+                    "current_cues": (),
+                    "next_cues": (),
+                    "switch_time_a": None,
+                    "switch_time_b": None,
+                    "plan_signature": None,
+                }
+
+            current_pos = self._current_pos
+            beat_number = 0
+            if current.beat_samples.size:
+                beat_index = int(
+                    np.searchsorted(current.beat_samples, current_pos, side="right") - 1
+                )
+                if 0 <= beat_index < current.beat_numbers.size:
+                    beat_number = int(current.beat_numbers[beat_index])
+
+            duration = current.duration
+            position = current_pos / float(self.config.sample_rate)
+            progress = position / duration if duration > 0 else 0.0
+            transition_progress = (
+                self._transition_pos / plan.length
+                if self._transitioning and plan and plan.length
+                else 0.0
+            )
+            if current.has_tempo_restore:
+                tempo_restore_progress = float(
+                    np.clip(
+                        (current_pos - current.tempo_restore_start)
+                        / max(current.tempo_restore_end - current.tempo_restore_start, 1),
+                        0.0,
+                        1.0,
+                    )
+                )
+            else:
+                tempo_restore_progress = 0.0
+            try:
+                cpu_load = float(stream.cpu_load) if stream else 0.0
+            except Exception:
+                cpu_load = 0.0
+
+            transition_start = plan.current_start / self.config.sample_rate if plan else None
+            transition_end = plan.current_end / self.config.sample_rate if plan else None
+            next_entry = plan.next_start / self.config.sample_rate if plan else None
+            next_transition_end = plan.next_end / self.config.sample_rate if plan else None
+            signature = (
+                self._index,
+                plan.current_start,
+                plan.next_start,
+                plan.length,
+                plan.bars,
+                plan.style,
+                round(plan.effect_strength, 2),
+                self.config.tempo_restore_bars,
+                plan.transition_mode,
+                plan.policy_mode,
+            ) if plan else None
+
+            return {
+                "playing": self._playing,
+                "paused": self._paused,
+                "current": current.title,
+                "next": next_track.title if next_track else "",
+                "position": position,
+                "duration": duration,
+                "next_duration": next_track.duration if next_track else 0.0,
+                "progress": float(np.clip(progress, 0.0, 1.0)),
+                "bpm": current.bpm_at_sample(current_pos),
+                "sync_bpm": current.playback_bpm,
+                "original_bpm": current.original_bpm,
+                "next_sync_bpm": next_track.playback_bpm if next_track else 0.0,
+                "next_original_bpm": next_track.original_bpm if next_track else 0.0,
+                "beat_number": beat_number,
+                "transitioning": self._transitioning,
+                "transition_progress": float(np.clip(transition_progress, 0.0, 1.0)),
+                "index": self._index,
+                "next_loading": self._next_loading,
+                "cpu_load": cpu_load,
+                "callback_status": self._last_callback_status,
+                "current_waveform": current.waveform_envelope,
+                "next_waveform": next_track.waveform_envelope if next_track else None,
+                "transition_start": transition_start,
+                "transition_end": transition_end,
+                "next_entry": next_entry,
+                "next_transition_end": next_transition_end,
+                "tempo_restore_start": (
+                    current.tempo_restore_start / self.config.sample_rate
+                    if current.has_tempo_restore else None
+                ),
+                "tempo_restore_end": (
+                    current.tempo_restore_end / self.config.sample_rate
+                    if current.has_tempo_restore else None
+                ),
+                "next_tempo_restore_start": (
+                    next_track.tempo_restore_start / self.config.sample_rate
+                    if next_track and next_track.has_tempo_restore else None
+                ),
+                "next_tempo_restore_end": (
+                    next_track.tempo_restore_end / self.config.sample_rate
+                    if next_track and next_track.has_tempo_restore else None
+                ),
+                "tempo_restore_progress": tempo_restore_progress,
+                "transition_bars": plan.bars if plan else 0,
+                "tempo_restore_bars": (
+                    next_track.tempo_restore_bars
+                    if next_track and next_track.has_tempo_restore
+                    else current.tempo_restore_bars
+                ),
+                "match_score": plan.score if plan else 0.0,
+                "match_metrics": dict(plan.metrics) if plan else {},
+                "mix_style": plan.style if plan else self.config.mix_style,
+                "effect_strength": (
+                    plan.effect_strength if plan else self.config.effect_strength
+                ),
+                "transition_mode": plan.transition_mode if plan else "",
+                "policy_mode": plan.policy_mode if plan else self.config.automix_policy,
+                "stretch_backend": next_track.stretch_backend if next_track else current.stretch_backend,
+                "current_key": current.structure.camelot,
+                "next_key": next_track.structure.camelot if next_track else "—",
+                "current_edm_confidence": current.structure.edm_confidence,
+                "next_edm_confidence": next_track.structure.edm_confidence if next_track else 0.0,
+                "current_cues": tuple(
+                    float(current.bar_features.start_samples[index] / self.config.sample_rate)
+                    for index in current.structure.cue_indices[:48]
+                    if index < current.bar_features.count
+                ),
+                "next_cues": tuple(
+                    float(next_track.bar_features.start_samples[index] / self.config.sample_rate)
+                    for index in next_track.structure.cue_indices[:48]
+                    if next_track and index < next_track.bar_features.count
+                ) if next_track else (),
+                "switch_time_a": plan.switch_sample_a / self.config.sample_rate if plan else None,
+                "switch_time_b": plan.switch_sample_b / self.config.sample_rate if plan else None,
+                "plan_signature": signature,
+            }
