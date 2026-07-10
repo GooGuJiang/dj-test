@@ -1,6 +1,6 @@
-# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.12
+# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.13
 
-这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.12 重点解决“切点被尾部→头部硬规则锁死”和“自动效果过多导致衔接突兀”两个问题。
+这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.13 把 CUE-DETR 标记从“长过渡起点”改为真正的换曲交接点：切点前只做一拍低电平预入，切点当拍完成鼓组与低频主导权交接，切点后约一拍内平滑释放旧歌。
 
 ## 模型分工
 
@@ -10,7 +10,7 @@
 - **MuQ**：播放顺序、风格连续性和 cue 对兼容度。
 - **本地 DSP**：BPM 同步、逐拍相位锁定、低频所有权、HPSS 和最终转场渲染。
 
-## 1.2.12 的核心变化
+## 1.2.13 的核心变化
 
 ### 1. 取消“尾部接头部”硬约束
 
@@ -21,7 +21,7 @@ A OUT：后 42% / 最后 48 小节
 B IN ：前 35% / 前 32 小节
 ```
 
-1.2.12 已完全移除这些位置门槛和 `tail_to_head` 加分。现在所有有效 CUE-DETR cue 都可以参加配对，候选只根据以下因素排序：
+1.2.13 已完全移除这些位置门槛和 `tail_to_head` 加分。现在所有有效 CUE-DETR cue 都可以参加配对，候选只根据以下因素排序：
 
 - downbeat 与乐句边界；
 - CUE-DETR IN/OUT 置信度；
@@ -32,46 +32,39 @@ B IN ：前 35% / 前 32 小节
 
 歌曲中的位置仍会写入诊断指标，但权重为 0，不会淘汰中段或后段的优秀 cue。
 
-### 2. 自动转场收敛为三种保守手法
+### 2. CUE-DETR cue 是主交接点
+
+每个选中的 OUT/IN cue 都保留为精确交接锚点，而不是把 cue 当成长淡化的开始。默认可听窗口为 **2 拍**：
+
+```text
+cue 前 1 拍：B 只做低电平鼓组预入，A 仍保持主体
+cue 当拍   ：B 的鼓组已经占优，bass 所有权快速交换
+cue 后 <1 拍：A 的鼓组与主体平滑归零，B 完全接管
+```
+
+如果 cue 靠近歌曲边界，窗口只会按可用音频缩短，不会另造切点，也不会移动 CUE-DETR 结果。
+
+### 3. 自动转场只保留三种短手法
 
 保留：
 
-- **Long Blend**：适合调性、人声和能量兼容的长乐句融合。
-- **Bass Swap**：下一首鼓组先建立，在乐句中点附近交换低频所有权。
-- **Echo Out**：只在双人声风险高或调性兼容较低时作为安全退出候选。
+- **Short Blend**：默认短融合，适合大多数兼容 cue 对。
+- **Bass Swap**：在 cue 附近更快交换低频所有权。
+- **Echo Out**：仅在人声重叠或调性风险较高时，给旧歌和声层增加极短尾音。
 
-删除自动渲染分支：
+删除自动渲染分支：Drop Swap、Double Drop、Loop Out、Filter Ride、Post-Drop Relay、Breakdown Lift。
 
-- Drop Swap
-- Double Drop
-- Loop Out
-- Filter Ride
-- Post-Drop Relay
-- Breakdown Lift
-
-旧设置中的 `Adaptive Human` 会自动迁移为 `Natural Auto`。被删除的手法无法再直接渲染。
-
-### 3. 按真实接歌公式渲染
-
-自动转场统一执行：
+统一执行：
 
 ```text
-1. 两首歌按 BPM、beat 和 downbeat 对齐
-2. 在乐句边界开始重叠
-3. B 的鼓组先平滑进入，B 的低频保持关闭
-4. A 的鼓组继续维持 groove，避免提前出现能量洞
-5. 乐句中段交换 bass 所有权
-6. A 的和声/人声与鼓组平滑退出
-7. B 在过渡终点完全接管
+1. BPM、beat、downbeat 和局部 kick 相位对齐
+2. cue 前一拍只轻量预入 B 的鼓组
+3. cue 当拍让 B 的鼓组强于 A，并交换 bass 所有权
+4. cue 后不到一拍释放 A 的鼓组/人声/和声
+5. B 在窗口结束时以正常电平无缝继续播放
 ```
 
-低频使用互补增益：
-
-```text
-bass_A + bass_B = 1
-```
-
-不再使用会在交接中点造成双低频增益的 equal-power bass 叠加。Echo 仅处理旧歌的和声层，低频不会送入 delay，反馈也限制在保守范围。
+低频使用互补增益 `bass_A + bass_B = 1`。主包络使用连续 equal-power 曲线，因此切换明确但不会像突然停止播放。Echo 只处理旧歌的和声层，不把 kick 和 sub 送进 delay。
 
 ### 4. 去除“为了变化而变化”
 
@@ -83,7 +76,7 @@ bass_A + bass_B = 1
 
 ```powershell
 conda activate beatthis-auto-dj
-cd beatthis_muq_cuedetr_auto_dj_gui_v1212
+cd beatthis_muq_cuedetr_auto_dj_gui_v1213
 python verify_cuedetr.py
 python app.py
 ```
@@ -99,7 +92,7 @@ python app.py
 ## 推荐设置
 
 ```text
-过渡长度：自动（8 / 16 / 32 小节）
+Cue 配对上下文：自动（4 / 8 / 16 小节；实际重叠固定约 2 拍）
 自然接歌策略：Natural Auto
 候选手法数：3
 效果强度：45%–70%
@@ -137,15 +130,16 @@ python check_natural_transition.py
 当前结果：
 
 ```text
-71 passed
-PASS: natural transition renderer invariants satisfied
+74 passed
+PASS: cue-centered transition invariants satisfied
 ```
 
 专项覆盖：
 
 - 所有 CUE-DETR cue 均可参与，不存在 42%/48 小节与 35%/32 小节门槛；
 - 歌曲位置不参与评分；
-- 下一首鼓组先建立，再释放上一首；
+- cue 前只允许低电平鼓组预入，cue 当拍下一首鼓组占优；
+- cue 后不到一拍释放上一首，且不存在硬切；
 - bass 所有权之和恒为 1；
 - 控制曲线连续，首尾所有权正确；
 - 干净的歌曲配对不会滥用 Echo；

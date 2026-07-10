@@ -26,10 +26,12 @@ def _roles(sample_rate: int = 8_000, seconds: float = 8.0):
 
 
 def test_only_conservative_transition_modes_are_exposed() -> None:
-    assert SUPPORTED_ARCHETYPES == ("Long Blend", "Bass Swap", "Echo Out")
+    assert SUPPORTED_ARCHETYPES == ("Short Blend", "Bass Swap", "Echo Out")
     engine = AutoDJEngine()
     engine.set_human_style_mode("Adaptive Human")
     assert engine.config.human_style_mode == "Natural Auto"
+    engine.set_human_style_mode("Long Blend")
+    assert engine.config.human_style_mode == "Short Blend"
 
 
 @pytest.mark.parametrize("removed", [
@@ -88,7 +90,7 @@ def test_clean_pair_uses_two_natural_candidates_without_echo() -> None:
         next_label="INTRO",
         config=HumanTransitionConfig(mode="Natural Auto", max_candidates=3, evaluation_sample_rate=8_000),
     )
-    assert result.archetype in {"Long Blend", "Bass Swap"}
+    assert result.archetype in {"Short Blend", "Bass Swap"}
     assert result.quality["human_candidate_count"] == 2.0
     assert float(np.max(np.abs(result.audio))) <= 0.90
 
@@ -128,7 +130,7 @@ def test_risky_vocal_pair_adds_echo_as_safety_candidate() -> None:
 def test_natural_control_curves_are_continuous_and_end_owned() -> None:
     roles = _roles()
     _, _, _, controls = _render_archetype(
-        "Long Blend",
+        "Short Blend",
         a_low=roles[0],
         b_low=roles[1],
         a_harm=roles[2],

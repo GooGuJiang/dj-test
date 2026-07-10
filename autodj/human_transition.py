@@ -4,7 +4,7 @@ from __future__ import annotations
 Human-style automatic DJ transition generation and reference-aware scoring.
 
 The module deliberately separates two concerns:
-1. Generate conservative phrase-quantized DJ transitions: a long blend, a
+1. Generate conservative phrase-quantized DJ transitions: a cue-centered short blend, a
    controlled bass handover, or a short vocal echo exit when blending is unsafe.
 2. Rank the rendered candidates with interpretable engineering/perceptual
    metrics: loudness/headroom, spectral collision, spectral continuity, gain
@@ -24,7 +24,7 @@ from scipy import signal
 
 
 SUPPORTED_ARCHETYPES = (
-    "Long Blend",
+    "Short Blend",
     "Bass Swap",
     "Echo Out",
 )
@@ -72,8 +72,8 @@ def _bar_quantized(value: float, bars: int, subdivision: int = 2) -> float:
 def _equal_power(progress: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     p = np.clip(progress, 0.0, 1.0)
     return (
-        np.cos(p * np.pi / 2.0).astype(np.float32),
-        np.sin(p * np.pi / 2.0).astype(np.float32),
+        np.clip(np.cos(p * np.pi / 2.0), 0.0, 1.0).astype(np.float32),
+        np.clip(np.sin(p * np.pi / 2.0), 0.0, 1.0).astype(np.float32),
     )
 
 
@@ -585,13 +585,13 @@ def _intent_bonus(archetype: str, metrics: dict[str, float]) -> float:
     """Small deterministic preference; never selects an impact transition."""
     code = int(round(float(metrics.get("dj_intent_code", 0.0))))
     preferred = {
-        1: ("Long Blend", "Bass Swap", "Echo Out"),
-        2: ("Bass Swap", "Long Blend", "Echo Out"),
-        3: ("Long Blend", "Bass Swap", "Echo Out"),
-        4: ("Long Blend", "Bass Swap", "Echo Out"),
-        5: ("Bass Swap", "Long Blend", "Echo Out"),
-        6: ("Echo Out", "Long Blend", "Bass Swap"),
-    }.get(code, ("Long Blend", "Bass Swap", "Echo Out"))
+        1: ("Short Blend", "Bass Swap", "Echo Out"),
+        2: ("Bass Swap", "Short Blend", "Echo Out"),
+        3: ("Short Blend", "Bass Swap", "Echo Out"),
+        4: ("Short Blend", "Bass Swap", "Echo Out"),
+        5: ("Bass Swap", "Short Blend", "Echo Out"),
+        6: ("Echo Out", "Short Blend", "Bass Swap"),
+    }.get(code, ("Short Blend", "Bass Swap", "Echo Out"))
     if archetype == preferred[0]:
         return 0.16
     if archetype == preferred[1]:
@@ -617,7 +617,7 @@ def _context_style_fit(
     vocal_exit = current_role in {"VOCAL", "VERSE", "CHORUS", "SOLO"}
     intent = _intent_bonus(archetype, metrics)
 
-    if archetype == "Long Blend":
+    if archetype == "Short Blend":
         return float(np.clip(
             0.26 + 0.24 * harmonic + 0.20 * phrase + 0.14 * bass_clean
             + 0.10 * float(clean_entry) + 0.06 * (1.0 - vocal_risk) + intent,
@@ -650,7 +650,7 @@ def _candidate_order(
 
     vocal_risk = float(np.clip(1.0 - metrics.get("vocal_clean", 0.5), 0.0, 1.0))
     harmonic = float(np.clip(metrics.get("harmonic", 0.5), 0.0, 1.0))
-    candidates = ["Long Blend", "Bass Swap"]
+    candidates = ["Short Blend", "Bass Swap"]
     # Echo is a safety fallback, not a decorative default.
     if vocal_risk >= 0.45 or harmonic <= 0.42:
         candidates.append("Echo Out")
@@ -680,13 +680,18 @@ def _render_archetype(
     effect_strength: float,
     vocal_risk: float,
     drop_landing_phase: float = 1.0,
+    handoff_phase: float = 0.5,
+    transition_beats: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """Render the practical DJ formula: drums in, bass swap, old deck out.
+    """Render a cue-centered DJ handoff without a hard cut.
 
-    ``drop_landing_phase`` remains in the signature for project compatibility
-    but is deliberately ignored; automatic impact/drop swaps were removed.
+    The CUE-DETR marker is the ownership-change point, not the beginning of a
+    long blend.  Deck B is teased for roughly one beat before the cue, takes
+    rhythmic/low-frequency ownership at the cue, and deck A is released within
+    roughly one beat afterwards.  Curves remain smooth so the switch is clear
+    but never sounds like an accidental stop.
     """
-    del drop_landing_phase
+    del drop_landing_phase, bars
     if archetype not in SUPPORTED_ARCHETYPES:
         raise ValueError(f"unsupported natural transition: {archetype}")
 
@@ -694,48 +699,48 @@ def _render_archetype(
     phase = np.linspace(0.0, 1.0, length, endpoint=True, dtype=np.float32)
     strength = float(np.clip(effect_strength, 0.0, 1.0))
     vocal_risk = float(np.clip(vocal_risk, 0.0, 1.0))
-    bars = max(1, int(bars))
+    handoff = float(np.clip(handoff_phase, 0.20, 0.80))
+    beat_width = 1.0 / max(float(transition_beats), 1.0)
 
-    if archetype == "Long Blend":
-        swap = _bar_quantized(0.58, bars, subdivision=2)
-        bass_width = max(2.0 / bars, 0.10)
-        incoming_drum_full = _bar_quantized(0.34, bars, subdivision=2)
-        incoming_harm_start = _bar_quantized(0.08 + 0.20 * vocal_risk, bars, 2)
-        outgoing_harm_end = _bar_quantized(0.94 - 0.12 * vocal_risk, bars, 2)
-    elif archetype == "Bass Swap":
-        swap = _bar_quantized(0.50, bars, subdivision=2)
-        bass_width = max(0.55 / bars, 0.03)
-        incoming_drum_full = _bar_quantized(0.30, bars, subdivision=2)
-        incoming_harm_start = _bar_quantized(0.18 + 0.24 * vocal_risk, bars, 2)
-        outgoing_harm_end = _bar_quantized(0.82 - 0.08 * vocal_risk, bars, 2)
-    else:  # Echo Out
-        swap = _bar_quantized(0.56, bars, subdivision=2)
-        bass_width = max(0.75 / bars, 0.05)
-        incoming_drum_full = _bar_quantized(0.34, bars, subdivision=2)
-        incoming_harm_start = _bar_quantized(0.48 + 0.12 * vocal_risk, bars, 2)
-        outgoing_harm_end = _bar_quantized(0.72, bars, 2)
+    # Bass changes ownership almost exactly on the cue. Bass Swap is the
+    # tightest version; Short Blend leaves a slightly softer quarter-beat move.
+    bass_half = (0.10 if archetype == "Bass Swap" else 0.16) * beat_width
+    if archetype == "Echo Out":
+        bass_half = 0.12 * beat_width
+    bass_progress = _ramp(phase, handoff - bass_half, handoff + bass_half)
+    bass_a = np.clip(1.0 - bass_progress, 0.0, 1.0).astype(np.float32)
+    bass_b = np.clip(bass_progress, 0.0, 1.0).astype(np.float32)
 
-    # Low-frequency ownership uses complementary gains rather than equal-power
-    # summing. This avoids a +3 dB double-bass hump and phasey kick overlap.
-    bass_progress = _ramp(phase, swap - bass_width / 2.0, swap + bass_width / 2.0)
-    bass_a = (1.0 - bass_progress).astype(np.float32)
-    bass_b = bass_progress.astype(np.float32)
+    # A quiet one-beat drum teaser precedes the cue.  The actual drum cross is
+    # biased slightly early so B is already dominant at the cue, while A still
+    # has a short, smooth release tail afterwards.
+    teaser_end = max(0.0, handoff - 0.34 * beat_width)
+    teaser = 0.22 * np.sqrt(np.clip(_ramp(phase, 0.0, teaser_end), 0.0, 1.0))
+    drum_progress = _ramp(
+        phase,
+        handoff - 0.48 * beat_width,
+        handoff + 0.24 * beat_width,
+    )
+    drum_a, drum_b_cross = _equal_power(drum_progress)
+    drum_b = np.maximum(teaser, drum_b_cross).astype(np.float32)
+    drum_a = drum_a.astype(np.float32)
 
-    # Incoming percussion establishes the groove first; outgoing percussion is
-    # released only after the new beat is clearly audible.
-    drum_b = np.sqrt(np.clip(_ramp(phase, 0.0, max(incoming_drum_full, 0.12)), 0.0, 1.0)).astype(np.float32)
-    drum_release_start = max(0.34, swap - 0.10)
-    drum_a = np.sqrt(np.clip(1.0 - _ramp(phase, drum_release_start, 0.94), 0.0, 1.0)).astype(np.float32)
-
-    # Harmonic/vocal layers cross more conservatively than drums. Higher vocal
-    # risk shortens the overlap and creates a small center gap.
-    harm_b_end = min(0.94, incoming_harm_start + 0.44 - 0.10 * vocal_risk)
-    harm_a_start = max(0.18, outgoing_harm_end - (0.48 - 0.14 * vocal_risk))
-    _, harm_b = _equal_power(_ramp(phase, incoming_harm_start, harm_b_end))
-    harm_a, _ = _equal_power(_ramp(phase, harm_a_start, outgoing_harm_end))
-    vocal_gap = 1.0 - 0.18 * vocal_risk * np.sin(np.pi * phase) ** 2
-    harm_a = (harm_a * vocal_gap).astype(np.float32)
-    harm_b = (harm_b * vocal_gap).astype(np.float32)
+    # Main musical content crosses around the cue and is fully released within
+    # less than one beat.  Vocal risk narrows the overlap rather than creating a
+    # silence gap or letting two lead vocals run together.
+    harm_half_before = (0.34 - 0.10 * vocal_risk) * beat_width
+    harm_half_after = (0.54 - 0.16 * vocal_risk) * beat_width
+    harm_progress = _ramp(
+        phase,
+        handoff - harm_half_before,
+        handoff + harm_half_after,
+    )
+    harm_a, harm_b = _equal_power(harm_progress)
+    if vocal_risk > 0.0:
+        center = np.exp(-0.5 * ((phase - handoff) / max(0.16 * beat_width, 1e-4)) ** 2)
+        vocal_duck = 1.0 - (0.10 * vocal_risk) * center
+        harm_a = (harm_a * vocal_duck).astype(np.float32)
+        harm_b = (harm_b * vocal_duck).astype(np.float32)
 
     gain_release = float(local_gain) + (1.0 - float(local_gain)) * _smootherstep(phase)
     b_gain = gain_release.astype(np.float32)
@@ -754,19 +759,27 @@ def _render_archetype(
     echo = np.zeros_like(a_contribution, dtype=np.float32)
     echo_send = np.zeros(length, dtype=np.float32)
     if archetype == "Echo Out":
-        echo_start = _bar_quantized(0.56, bars, 2)
-        echo_send = _ramp(phase, echo_start, min(0.90, echo_start + 0.22))
+        # Send only the outgoing harmonic/vocal body, beginning just before the
+        # cue. The short feedback tail bridges the handoff without extending
+        # two full songs beyond the cue.
+        echo_start = max(0.0, handoff - 0.30 * beat_width)
+        echo_end = min(1.0, handoff + 0.18 * beat_width)
+        echo_send = _ramp(phase, echo_start, echo_end) * (1.0 - _ramp(
+            phase, handoff + 0.55 * beat_width, handoff + 0.95 * beat_width
+        ))
         echo = _delay_echo(
             a_harm[:length],
             sample_rate=sample_rate,
             bpm=bpm,
             send_curve=echo_send,
-            feedback=0.24 + 0.12 * strength,
+            feedback=0.18 + 0.10 * strength,
         )
 
-    # Reserve headroom in the overlap instead of relying on the limiter to fix
-    # a two-deck level build-up after the fact.
-    center_space = 1.0 - (0.08 + 0.08 * strength) * np.sin(np.pi * phase) ** 2
+    # A small, local headroom dip only around the handoff avoids a level bump;
+    # it does not create an audible hole before or after the cue.
+    handoff_sigma = max(0.24 * beat_width, 1e-4)
+    center_shape = np.exp(-0.5 * ((phase - handoff) / handoff_sigma) ** 2)
+    center_space = 1.0 - (0.06 + 0.05 * strength) * center_shape
     mixed = (a_contribution + b_contribution) * center_space[:, None] + echo
     mixed = _soft_limit(mixed)
 
@@ -776,9 +789,9 @@ def _render_archetype(
         "drum_a": drum_a,
         "drum_b": drum_b,
         "drum_overlap": np.minimum(drum_a, drum_b).astype(np.float32),
-        "harm_a": harm_a,
-        "harm_b": harm_b,
-        "echo_send": echo_send,
+        "harm_a": np.asarray(harm_a, dtype=np.float32),
+        "harm_b": np.asarray(harm_b, dtype=np.float32),
+        "echo_send": np.asarray(echo_send, dtype=np.float32),
     }
     return (
         mixed,
@@ -786,7 +799,6 @@ def _render_archetype(
         np.ascontiguousarray(b_contribution, dtype=np.float32),
         controls,
     )
-
 
 def evaluate_transition(
     *,
@@ -936,10 +948,15 @@ def render_human_transition(
     plan_metrics: dict[str, float],
     current_label: str,
     next_label: str,
+    handoff_phase: float = 0.5,
+    transition_beats: float = 2.0,
     config: HumanTransitionConfig | None = None,
 ) -> HumanTransitionResult:
     config = config or HumanTransitionConfig()
-    mode = "Natural Auto" if config.mode == "Adaptive Human" else config.mode
+    mode = {
+        "Adaptive Human": "Natural Auto",
+        "Long Blend": "Short Blend",
+    }.get(config.mode, config.mode)
     if mode not in {"Natural Auto", *SUPPORTED_ARCHETYPES}:
         raise ValueError(f"unsupported natural transition mode: {config.mode}")
     vocal_risk = float(np.clip(1.0 - plan_metrics.get("vocal_clean", 0.5), 0.0, 1.0))
@@ -969,6 +986,8 @@ def render_human_transition(
             effect_strength=effect_strength,
             vocal_risk=vocal_risk,
             drop_landing_phase=float(plan_metrics.get("drop_landing_phase", 1.0)),
+            handoff_phase=handoff_phase,
+            transition_beats=transition_beats,
         )
         context_fit = _context_style_fit(archetype, current_label, next_label, plan_metrics)
         quality = evaluate_transition(

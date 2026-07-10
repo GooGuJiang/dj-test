@@ -88,9 +88,12 @@ def test_auto_transition_returns_professional_curves() -> None:
         fx_config=TransitionFXConfig(style="Club", strength=0.8),
     )
 
-    assert plan.bars in (8, 16, 32)
-    assert plan.current_start >= int(a.total_samples * 0.35)
-    assert plan.next_start <= int(b.total_samples * 0.5)
+    assert plan.bars == 1
+    assert plan.metrics["matching_context_bars"] in (4.0, 8.0, 16.0)
+    assert plan.metrics["transition_beats"] <= 2.01
+    assert plan.current_start < plan.current_cue_sample < plan.current_end
+    assert plan.next_start < plan.next_cue_sample < plan.next_end
+    assert plan.switch_sample_a == plan.current_cue_sample
     assert 0.0 <= plan.score <= 1.0
     for curve in (
         plan.fade_out,
@@ -110,11 +113,13 @@ def test_auto_transition_returns_professional_curves() -> None:
     assert plan.style == "Club"
 
 
-def test_fixed_transition_length_is_respected() -> None:
+def test_requested_bars_only_controls_matching_context() -> None:
     a = make_track("A", np.linspace(0.6, 0.2, 64), 0)
     b = make_track("B", np.linspace(0.2, 0.6, 64), 7)
     plan = find_best_transition(a, b, requested_bars=8)
-    assert plan.bars == 8
+    assert plan.bars == 1
+    assert plan.metrics["matching_context_bars"] == 8.0
+    assert plan.metrics["transition_beats"] <= 2.01
 
 
 def test_bpm_at_sample_returns_to_original() -> None:

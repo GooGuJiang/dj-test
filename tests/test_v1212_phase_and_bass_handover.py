@@ -82,8 +82,12 @@ def test_bass_swap_has_single_low_frequency_owner() -> None:
     assert np.allclose(controls["bass_a"] + controls["bass_b"], 1.0, atol=1e-6)
     assert controls["bass_b"][int(0.35 * length)] < 0.02
     assert controls["bass_a"][int(0.65 * length)] < 0.02
-    assert controls["drum_b"][int(0.20 * length)] > 0.55
+    # Before the cue, B is only a quiet drum teaser; at the cue it already
+    # owns the rhythm, and A releases smoothly shortly afterwards.
+    assert 0.10 < controls["drum_b"][int(0.20 * length)] < 0.25
     assert controls["drum_a"][int(0.20 * length)] > 0.95
+    assert controls["drum_b"][int(0.50 * length)] > controls["drum_a"][int(0.50 * length)]
+    assert controls["drum_a"][int(0.65 * length)] < 0.02
 
 
 def test_drop_landing_policy_maps_to_safe_bass_handover() -> None:

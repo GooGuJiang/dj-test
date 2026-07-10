@@ -192,13 +192,13 @@ def _role_path_score(
 
 def _recommended(intent: str) -> tuple[str, ...]:
     mapping = {
-        "Energy Relay Blend": ("Bass Swap", "Long Blend", "Echo Out"),
-        "Breakdown Blend": ("Long Blend", "Bass Swap", "Echo Out"),
-        "Phrase Landing Blend": ("Long Blend", "Bass Swap", "Echo Out"),
-        "Bass Handover": ("Bass Swap", "Long Blend", "Echo Out"),
-        "Outro-Intro Blend": ("Long Blend", "Bass Swap", "Echo Out"),
-        "Vocal Echo Exit": ("Echo Out", "Long Blend", "Bass Swap"),
-        "Safe Phrase Blend": ("Long Blend", "Bass Swap", "Echo Out"),
+        "Energy Relay Blend": ("Bass Swap", "Short Blend", "Echo Out"),
+        "Breakdown Blend": ("Short Blend", "Bass Swap", "Echo Out"),
+        "Phrase Landing Blend": ("Short Blend", "Bass Swap", "Echo Out"),
+        "Bass Handover": ("Bass Swap", "Short Blend", "Echo Out"),
+        "Outro-Intro Blend": ("Short Blend", "Bass Swap", "Echo Out"),
+        "Vocal Echo Exit": ("Echo Out", "Short Blend", "Bass Swap"),
+        "Safe Phrase Blend": ("Short Blend", "Bass Swap", "Echo Out"),
     }
     return mapping.get(intent, mapping["Safe Phrase Blend"])
 

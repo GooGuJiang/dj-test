@@ -69,7 +69,7 @@ class _RenderedPair:
 class EngineConfig:
     sample_rate: int = 44_100
     channels: int = 2
-    # 0 表示自动选择 8/16/32 小节；用户显式固定 4 小节时仍会尊重。
+    # 仅作为 cue 配对的上下文长度；实际可听重叠固定为 cue 前后各约 1 拍。
     crossfade_bars: int = 0
     max_stretch_percent: float = 12.0
     cue_on_first_downbeat: bool = True
@@ -1514,6 +1514,33 @@ class AutoDJEngine:
             for value in (fade_out, fade_in, fade_out, fade_in, fade_out, fade_in)
         )
 
+    @staticmethod
+    def _cue_centered_curves(
+        length: int,
+        gain: float,
+        switch_position: float,
+    ) -> tuple[np.ndarray, ...]:
+        """Short smooth fallback centered on the CUE-DETR handoff."""
+        phase = np.linspace(0.0, 1.0, max(1, length), dtype=np.float32)
+        switch = float(np.clip(switch_position, 0.15, 0.85))
+
+        def ramp(start: float, end: float) -> np.ndarray:
+            if end <= start + 1e-6:
+                return (phase >= end).astype(np.float32)
+            x = np.clip((phase - start) / (end - start), 0.0, 1.0)
+            return (x * x * (3.0 - 2.0 * x)).astype(np.float32)
+
+        main = ramp(switch - 0.18, switch + 0.22)
+        bass = ramp(switch - 0.06, switch + 0.06)
+        fade_out = np.cos(main * np.pi / 2.0).astype(np.float32)
+        fade_in = (np.sin(main * np.pi / 2.0) * np.float32(gain)).astype(np.float32)
+        bass_out = (1.0 - bass).astype(np.float32)
+        bass_in = (bass * np.float32(gain)).astype(np.float32)
+        return tuple(
+            np.ascontiguousarray(value, dtype=np.float32)
+            for value in (fade_out, fade_in, bass_out, bass_in, fade_out, fade_in)
+        )
+
     def _simple_transition_plan(
         self,
         current: PreparedTrack,
@@ -1530,32 +1557,27 @@ class AutoDJEngine:
         # mix to a newly invented location.
         current_start = int(base_plan.current_start)
         next_start = int(base_plan.next_start)
-        if mode == "Gapless Trim":
-            duration_seconds = 0.38
-            requested = max(256, int(round(duration_seconds * sr)))
-            length = min(
-                requested,
-                max(1, current.total_samples - current_start),
-                max(1, next_track.total_samples - next_start),
-            )
-            length = max(1, int(length))
-            bars = 0
-            policy = "CUE-DETR short gapless"
-        else:
-            max_length = int(round(8 * max(2, current.analysis.beats_per_bar) * 60.0 /
-                                   max(current.bpm_at_sample(current_start), 1.0) * sr))
-            length = min(
-                base_plan.length,
-                max_length,
-                current.total_samples - current_start,
-                next_track.total_samples - next_start,
-            )
-            length = max(1, int(length))
-            bars = min(base_plan.bars, 8)
-            policy = "CUE-DETR simple beat crossfade"
+        # Every fallback keeps the same two-beat cue-centered window.  It may
+        # simplify DSP, but it may not move the neural cue or finish before it.
+        length = min(
+            base_plan.length,
+            max(1, current.total_samples - current_start),
+            max(1, next_track.total_samples - next_start),
+        )
+        length = max(1, int(length))
+        bars = base_plan.bars
+        policy = (
+            "CUE-DETR short smooth handoff"
+            if mode == "Gapless Trim"
+            else "CUE-DETR short beat crossfade"
+        )
 
         gain = float(base_plan.metrics.get("local_gain", 1.0))
-        fade_out, fade_in, bass_out, bass_in, high_out, high_in = self._neutral_curves(length, gain)
+        fade_out, fade_in, bass_out, bass_in, high_out, high_in = self._cue_centered_curves(
+            length,
+            gain,
+            base_plan.switch_position,
+        )
         metrics = dict(base_plan.metrics)
         metrics["policy_complexity"] = 0.15 if mode == "Gapless Trim" else 0.42
         return TransitionPlan(
@@ -1579,7 +1601,12 @@ class AutoDJEngine:
             effect_strength=0.0,
             transition_mode=mode,
             policy_mode=policy,
-            switch_position=0.50,
+            switch_position=base_plan.switch_position,
+            next_resume_sample=base_plan.next_resume_sample,
+            micro_offset_samples=base_plan.micro_offset_samples,
+            current_cue_sample=base_plan.current_cue_sample,
+            next_cue_sample=base_plan.next_cue_sample,
+            handoff_offset_samples=base_plan.handoff_offset_samples,
             dj_intent=base_plan.dj_intent,
             current_role=base_plan.current_role,
             current_landing_role=base_plan.current_landing_role,
@@ -1809,6 +1836,8 @@ class AutoDJEngine:
             plan_metrics=plan.metrics,
             current_label=current_label,
             next_label=next_label,
+            handoff_phase=plan.switch_position,
+            transition_beats=float(plan.metrics.get("transition_beats", 2.0)),
             config=HumanTransitionConfig(
                 mode=self.config.human_style_mode,
                 max_candidates=self.config.human_max_candidates,
@@ -1845,7 +1874,7 @@ class AutoDJEngine:
         # the HPSS renderer's local scope, raising NameError and silently
         # falling back even though spectral rendering itself had succeeded.
         phrase_length = max(1, int(plan.length))
-        is_complex = plan.transition_mode == "Paper EQ/Fader"
+        is_complex = plan.transition_mode in {"Paper EQ/Fader", "Cue-Centered EQ/Fader"}
         plan.echo_audio = (
             self._render_echo(plan, current)
             if is_complex
@@ -2461,6 +2490,8 @@ class AutoDJEngine:
         # Keep the previous saved value as a migration alias.
         if value == "Adaptive Human":
             value = "Natural Auto"
+        elif value == "Long Blend":
+            value = "Short Blend"
         allowed = {"Natural Auto", *SUPPORTED_ARCHETYPES}
         if value not in allowed:
             raise ValueError(f"未知自然接歌策略：{value}")

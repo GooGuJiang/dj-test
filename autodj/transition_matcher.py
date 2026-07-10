@@ -16,10 +16,12 @@ from .muq_analyzer import cosine_similarity
 
 @dataclass(frozen=True)
 class MatcherConfig:
-    # Automatic intro/outro blends use at least 8 bars so deck B becomes
-    # perceptible before deck A reaches its final few bars. A user-requested
-    # fixed 4-bar transition is still honored through ``requested_bars``.
-    allowed_bars: tuple[int, ...] = (8, 16, 32)
+    # These bars are analysis context only. The audible overlap is deliberately
+    # limited around the selected CUE-DETR switch point (one beat before and one
+    # beat after) so a strong cue never becomes the start of a long blend.
+    allowed_bars: tuple[int, ...] = (4, 8, 16)
+    pre_roll_beats: float = 1.0
+    release_beats: float = 1.0
     max_exit_candidates: int = 32
     max_entry_candidates: int = 24
     # CUE-DETR remains the only cue source. Positional tail/head windows are
@@ -741,6 +743,49 @@ def _make_curves(
     )  # type: ignore[return-value]
 
 
+def _cue_centered_window(
+    *,
+    current: PreparedTrack,
+    next_track: PreparedTrack,
+    current_cue: int,
+    next_cue: int,
+    earliest_start: int,
+    pre_roll_beats: float,
+    release_beats: float,
+) -> tuple[int, int, int, int, int]:
+    """Return a common short window centered on the two neural cue points.
+
+    The selected CUE-DETR points are aligned as the handoff instant.  At most
+    one beat is exposed before the cue and one beat after it.  Near a track
+    boundary or playback deadline the two sides are shortened symmetrically so
+    the handoff remains aligned and never starts in the past.
+    """
+    sr = int(current.sample_rate)
+    beat_samples = max(1, int(round(60.0 / max(current.playback_bpm, 1.0) * sr)))
+    desired_pre = max(0, int(round(float(pre_roll_beats) * beat_samples)))
+    desired_post = max(1, int(round(float(release_beats) * beat_samples)))
+
+    available_pre = min(
+        max(0, int(current_cue) - int(max(0, earliest_start))),
+        max(0, int(next_cue)),
+        desired_pre,
+    )
+    available_post = min(
+        max(0, current.total_samples - int(current_cue)),
+        max(0, next_track.total_samples - int(next_cue)),
+        desired_post,
+    )
+    if available_post < 1:
+        raise RuntimeError("CUE-DETR cue 点之后没有足够音频完成平滑交接。")
+
+    current_start = int(current_cue) - int(available_pre)
+    next_start = int(next_cue) - int(available_pre)
+    length = int(available_pre + available_post)
+    handoff_offset = int(available_pre)
+    next_resume = int(next_cue) + int(available_post)
+    return current_start, next_start, length, handoff_offset, next_resume
+
+
 def find_best_transition(
     current: PreparedTrack,
     next_track: PreparedTrack,
@@ -781,6 +826,32 @@ def find_best_transition(
         next_track,
         earliest_sample=0,
     )
+
+    beat_samples = max(
+        1,
+        int(round(60.0 / max(current.playback_bpm, 1.0) * current.sample_rate)),
+    )
+    required_pre = int(round(config.pre_roll_beats * beat_samples))
+    required_post = int(round(config.release_beats * beat_samples))
+
+    def feasible(
+        indices: np.ndarray,
+        track: PreparedTrack,
+        floor: int,
+    ) -> np.ndarray:
+        starts = track.bar_features.start_samples[indices]
+        mask = (
+            (starts - required_pre >= int(floor))
+            & (starts + required_post < track.total_samples)
+        )
+        preferred = indices[mask]
+        # Preserve CUE-DETR-only behavior for unusually short tracks: if no cue
+        # can hold the full two-beat window, keep the neural cues and let the
+        # window helper shorten symmetrically instead of inventing a new point.
+        return preferred if preferred.size else indices
+
+    exit_indices = feasible(exit_indices, current, earliest_start)
+    entry_indices = feasible(entry_indices, next_track, 0)
     exit_scores = np.asarray(current.structure.mix_out_score, dtype=np.float32)
     entry_scores = np.asarray(next_track.structure.mix_in_score, dtype=np.float32)
     if force_current_start is None:
@@ -832,27 +903,41 @@ def find_best_transition(
         )
         best = (score, current_index, next_index, bars, metrics)
 
-    score, current_index, next_index, bars, metrics = best
-    current_start = int(a.start_samples[current_index])
-    next_start = int(b.start_samples[next_index])
-    current_end = int(a.end_samples[current_index + bars - 1])
-    next_end = int(b.end_samples[next_index + bars - 1])
+    score, current_index, next_index, context_bars, metrics = best
+    current_cue = int(a.start_samples[current_index])
+    next_cue = int(b.start_samples[next_index])
     micro_offset, micro_confidence = estimate_micro_alignment(
-        current, next_track, current_start, next_start
+        current, next_track, current_cue, next_cue
     )
-    adjusted_next_start = int(
-        np.clip(next_start + micro_offset, 0, max(0, next_end - 1))
+    adjusted_next_cue = int(
+        np.clip(next_cue + micro_offset, 0, max(0, next_track.total_samples - 1))
     )
     metrics["micro_align_ms"] = 1000.0 * micro_offset / current.sample_rate
     metrics["micro_align_confidence"] = micro_confidence
-    next_start = adjusted_next_start
-    # The outgoing phrase defines wall-clock transition duration. The incoming
-    # phrase is rendered to this exact duration later, then resumes at next_end.
-    length = min(
-        current_end - current_start,
-        current.total_samples - current_start,
+
+    current_start, next_start, length, handoff_offset, next_resume = _cue_centered_window(
+        current=current,
+        next_track=next_track,
+        current_cue=current_cue,
+        next_cue=adjusted_next_cue,
+        earliest_start=earliest_start,
+        pre_roll_beats=config.pre_roll_beats,
+        release_beats=config.release_beats,
     )
-    length = max(1, int(length))
+    handoff_phase = float(handoff_offset / max(length, 1))
+    transition_beats = float(
+        length * max(current.playback_bpm, 1.0) / (60.0 * current.sample_rate)
+    )
+    metrics["matching_context_bars"] = float(context_bars)
+    metrics["transition_beats"] = transition_beats
+    metrics["pre_roll_beats"] = float(
+        handoff_offset * max(current.playback_bpm, 1.0) / (60.0 * current.sample_rate)
+    )
+    metrics["release_beats"] = max(0.0, transition_beats - metrics["pre_roll_beats"])
+    metrics["cue_handoff_phase"] = handoff_phase
+    metrics["cue_handoff_sample_a"] = float(current_cue)
+    metrics["cue_handoff_sample_b"] = float(adjusted_next_cue)
+
     fade_out, fade_in, bass_out, bass_in, high_out, high_in = _make_curves(
         length,
         metrics.get("local_gain", 1.0),
@@ -863,7 +948,7 @@ def find_best_transition(
         next_track,
         current_index,
         next_index,
-        bars,
+        context_bars,
         harmonic=float(metrics.get("harmonic", 0.5)),
         bass_clean=float(metrics.get("bass_clean", 0.5)),
     )
@@ -871,7 +956,7 @@ def find_best_transition(
         current_start=current_start,
         next_start=next_start,
         length=length,
-        bars=bars,
+        bars=1,
         current_bar_index=current_index,
         next_bar_index=next_index,
         score=score,
@@ -886,15 +971,13 @@ def find_best_transition(
         automatic=(requested_bars == 0 and force_current_start is None),
         style=fx_config.style,
         effect_strength=float(np.clip(fx_config.strength, 0.0, 1.0)),
-        transition_mode="Paper EQ/Fader",
-        switch_position=(
-            0.64
-            if next_index < len(next_track.structure.labels)
-            and next_track.structure.labels[next_index] == "DROP"
-            else 0.55
-        ),
-        next_resume_sample=int(next_end),
+        transition_mode="Cue-Centered EQ/Fader",
+        switch_position=handoff_phase,
+        next_resume_sample=next_resume,
         micro_offset_samples=int(micro_offset),
+        current_cue_sample=current_cue,
+        next_cue_sample=adjusted_next_cue,
+        handoff_offset_samples=handoff_offset,
         dj_intent=phrase_policy.intent,
         current_role=phrase_policy.current_role,
         current_landing_role=phrase_policy.current_landing_role,

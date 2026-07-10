@@ -126,7 +126,7 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.12")
+        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.13")
         self.settings_store = SettingsStore()
         self.saved_settings = self.settings_store.load()
         self._settings_after_id: str | None = None
@@ -183,7 +183,7 @@ class AutoDJApp(tk.Tk):
         self.after(150, self._detect_rubberband)
         self.after(240, self._detect_allin1)
         self.after(320, self._detect_cuedetr)
-        LOGGER.info("Auto DJ 1.2.12 GUI 启动，主环境 Python=%s", os.sys.executable)
+        LOGGER.info("Auto DJ 1.2.13 GUI 启动，主环境 Python=%s", os.sys.executable)
         self.after(100, self._poll)
 
     _SETTING_VARIABLES = {
@@ -236,6 +236,8 @@ class AutoDJApp(tk.Tk):
         # Refresh text next to scales immediately.
         if self.human_style_var.get() == "Adaptive Human":
             self.human_style_var.set("Natural Auto")
+        elif self.human_style_var.get() == "Long Blend":
+            self.human_style_var.set("Short Blend")
         self.effect_label.configure(text=f"{float(self.effect_var.get()):.0f}%")
         self.stretch_label.configure(text=f"±{float(self.stretch_var.get()):.1f}%")
 
@@ -373,7 +375,7 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.12", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.13", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
@@ -617,7 +619,7 @@ class AutoDJApp(tk.Tk):
         )
         ttk.Label(
             settings_frame,
-            text="过渡长度",
+            text="Cue 配对上下文",
             style="Muted.TLabel",
         ).pack(anchor=tk.W)
         self.bars_var = tk.StringVar(value="自动")
@@ -631,7 +633,7 @@ class AutoDJApp(tk.Tk):
         bars.bind("<<ComboboxSelected>>", lambda _: self._apply_bars())
         ttk.Label(
             settings_frame,
-            text="自动模式会同时比较多个 OUT/IN 组合和长度",
+            text="只影响 cue 前后的结构评分；实际可听过渡固定为 cue 前后各约 1 拍。",
             style="Muted.TLabel",
             wraplength=280,
         ).pack(anchor=tk.W, pady=(0, 12))
@@ -672,7 +674,7 @@ class AutoDJApp(tk.Tk):
             textvariable=self.human_style_var,
             values=(
                 "Natural Auto",
-                "Long Blend",
+                "Short Blend",
                 "Bass Swap",
                 "Echo Out",
             ),
@@ -684,7 +686,7 @@ class AutoDJApp(tk.Tk):
         )
         ttk.Label(
             settings_frame,
-            text="Natural Auto 只使用乐句长混、低频交接和必要的人声 Echo 退出；不再自动触发 Drop Swap、Double Drop、Loop 或冲击式效果。",
+            text="Natural Auto 只使用 cue 居中的短融合、低频交接和必要的人声 Echo 退出；切点后下一首立即占主导，但保留极短平滑尾巴避免硬断。",
             style="Muted.TLabel",
             wraplength=280,
         ).pack(anchor=tk.W, pady=(0, 8))

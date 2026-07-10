@@ -166,7 +166,7 @@ def test_matcher_and_simple_fallback_preserve_cuedetr_pair() -> None:
     )
     assert fallback.current_start == plan.current_start
     assert fallback.next_start == plan.next_start
-    assert fallback.policy_mode == "CUE-DETR short gapless"
+    assert fallback.policy_mode == "CUE-DETR short smooth handoff"
 
 
 def test_matcher_does_not_enforce_tail_to_head_position_windows() -> None:

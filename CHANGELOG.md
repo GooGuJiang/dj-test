@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.13
+
+- 将 CUE-DETR OUT/IN cue 从“长过渡起点”改为精确主交接点。
+- 默认可听窗口固定为 2 拍：cue 前 1 拍低电平预入，cue 后约 1 拍释放旧歌。
+- 新增 `current_cue_sample`、`next_cue_sample` 和 `handoff_offset_samples`，明确区分过渡窗口起点与实际换曲点。
+- 自动/手动小节数只用于 cue 配对的结构上下文评分，不再扩大实际双歌重叠。
+- `Long Blend` 替换为 `Short Blend`；自动手法仍只保留 Short Blend、Bass Swap、Echo Out。
+- cue 当拍新鼓组已经强于旧鼓组；低频在 cue 附近以互补曲线快速换手。
+- 旧歌鼓组与主体在 cue 后不到一拍内平滑归零，避免长重叠，同时不使用硬切。
+- Simple Crossfade、Gapless 等回退路径也必须保留同一 neural cue 和同一短窗口。
+- cue 靠近歌曲边界时只缩短可用预入/释放窗口，不移动 cue、不生成规则切点。
+- GUI 将“过渡长度”改为“Cue 配对上下文”，明确实际过渡约 2 拍。
+- 新增 cue 交接、短预入、快速主导权切换、无硬断和边界缩短测试；共 74 项测试通过。
+
 ## 1.2.12
 
 - 删除上一首后 42%/最后 48 小节、下一首先 35%/前 32 小节的自动切点硬约束。

@@ -14,6 +14,8 @@ These sources support the implementation principles, not a claim that the projec
 
 ## CUE-DETR
 
+- ISMIR 2024 paper — “Cue Point Estimation using Object Detection”: https://arxiv.org/abs/2407.06823
+
 - Official repository: https://github.com/ETH-DISCO/cue-detr
 - Official checkpoint: https://huggingface.co/disco-eth/cue-detr
 - Official example: `cue_points.py` uses 22.05 kHz Mel spectrograms, width-355 windows, 75% overlap and peak filtering.

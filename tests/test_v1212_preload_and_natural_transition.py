@@ -86,7 +86,7 @@ def test_natural_transitions_establish_incoming_groove_before_bass_swap() -> Non
         0.12 * np.sin(2 * np.pi * 220.0 * t),
     ]).astype(np.float32)
 
-    for archetype in ("Long Blend", "Bass Swap"):
+    for archetype in ("Short Blend", "Bass Swap"):
         _, _, incoming, controls = _render_archetype(
             archetype,
             a_low=zeros,
@@ -105,8 +105,11 @@ def test_natural_transitions_establish_incoming_groove_before_bass_swap() -> Non
         )
         early = incoming[int(0.08 * length) : int(0.22 * length)]
         assert float(np.sqrt(np.mean(np.square(early)))) > 0.006
-        assert float(np.max(controls["drum_b"][: int(0.22 * length)])) >= 0.45
+        assert 0.10 <= float(np.max(controls["drum_b"][: int(0.22 * length)])) <= 0.25
         assert float(np.min(controls["drum_a"][: int(0.22 * length)])) >= 0.95
+        cue = int(0.50 * length)
+        assert controls["drum_b"][cue] > controls["drum_a"][cue]
+        assert controls["drum_a"][int(0.65 * length)] < 0.02
 
 
 def test_play_pressed_before_prime_current_is_ready_waits_for_same_job(monkeypatch) -> None:
