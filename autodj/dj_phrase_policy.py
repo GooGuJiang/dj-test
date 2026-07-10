@@ -220,8 +220,8 @@ def _choose_intent(
     if (
         current_landing in {"DROP", "CHORUS"}
         and next_landing in {"DROP", "CHORUS"}
-        and harmonic >= 0.72
-        and bass_clean >= 0.64
+        and harmonic >= 0.58
+        and bass_clean >= 0.50
     ):
         return "Double Drop"
     if (

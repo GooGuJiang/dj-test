@@ -184,6 +184,111 @@ def _onset_similarity(a: np.ndarray, b: np.ndarray, sample_rate: int) -> float:
     return float(np.clip(0.5 + 0.5 * correlation, 0.0, 1.0))
 
 
+
+
+def align_percussive_beat_grid(
+    *,
+    a_low: np.ndarray,
+    b_low: np.ndarray,
+    a_perc: np.ndarray,
+    b_perc: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+    beats_per_bar: int,
+    bars: int,
+    max_shift_ms: float = 42.0,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Micro-warp incoming kick/percussion so every beat follows deck A.
+
+    The phrase endpoints remain fixed.  Only small, smooth residual corrections
+    are applied after the phrase-level Rubber Band warp, so the next track can
+    resume at the original complete-beat endpoint without a seam.
+    """
+    length = min(len(a_low), len(b_low), len(a_perc), len(b_perc))
+    if length < 512 or bpm <= 1.0:
+        return b_low, b_perc, {
+            "beat_grid_alignment_score": 0.5,
+            "beat_grid_align_ms": 0.0,
+            "beat_grid_aligned_beats": 0.0,
+        }
+
+    beat_samples = float(sample_rate) * 60.0 / float(bpm)
+    expected = min(max(1, int(bars) * max(1, int(beats_per_bar))), int(length / beat_samples) + 1)
+    search = max(8, int(round(0.075 * sample_rate)))
+    smooth = max(1, int(round(0.0035 * sample_rate)))
+    maximum = max(1, int(round(max_shift_ms * sample_rate / 1000.0)))
+
+    # Mix the click/body of the separated drum with a little low-end kick energy.
+    detector_a = np.mean(a_perc[:length] + 0.38 * a_low[:length], axis=1, dtype=np.float64)
+    detector_b = np.mean(b_perc[:length] + 0.38 * b_low[:length], axis=1, dtype=np.float64)
+    onset_a = np.abs(np.diff(detector_a, prepend=detector_a[0]))
+    onset_b = np.abs(np.diff(detector_b, prepend=detector_b[0]))
+    kernel = np.ones(smooth, dtype=np.float64) / smooth
+    onset_a = np.convolve(onset_a, kernel, mode="same")
+    onset_b = np.convolve(onset_b, kernel, mode="same")
+
+    anchors: list[int] = []
+    offsets: list[float] = []
+    confidences: list[float] = []
+    for beat_index in range(expected):
+        nominal = int(round(beat_index * beat_samples))
+        if nominal <= search or nominal >= length - search:
+            continue
+        lo, hi = nominal - search, nominal + search + 1
+        pa = lo + int(np.argmax(onset_a[lo:hi]))
+        pb = lo + int(np.argmax(onset_b[lo:hi]))
+        offset = float(np.clip(pb - pa, -maximum, maximum))
+        floor_a = float(np.median(onset_a[lo:hi]) + 1e-9)
+        floor_b = float(np.median(onset_b[lo:hi]) + 1e-9)
+        confidence = float(np.clip(min(onset_a[pa] / floor_a, onset_b[pb] / floor_b) / 10.0, 0.0, 1.0))
+        if confidence >= 0.16:
+            anchors.append(nominal)
+            offsets.append(offset)
+            confidences.append(confidence)
+
+    if len(offsets) < 2:
+        return b_low, b_perc, {
+            "beat_grid_alignment_score": 0.5,
+            "beat_grid_align_ms": 0.0,
+            "beat_grid_aligned_beats": float(len(offsets)),
+        }
+
+    values = np.asarray(offsets, dtype=np.float64)
+    if len(values) >= 3:
+        values = signal.medfilt(values, kernel_size=3)
+    # Prevent one odd onset from creating audible local speed jumps.
+    max_step = max(1.0, 0.010 * sample_rate)
+    for i in range(1, len(values)):
+        values[i] = np.clip(values[i], values[i - 1] - max_step, values[i - 1] + max_step)
+    for i in range(len(values) - 2, -1, -1):
+        values[i] = np.clip(values[i], values[i + 1] - max_step, values[i + 1] + max_step)
+
+    # Fade the correction to zero at both phrase endpoints to preserve continuity.
+    anchor_x = np.asarray([0, *anchors, length - 1], dtype=np.float64)
+    anchor_y = np.asarray([0.0, *values.tolist(), 0.0], dtype=np.float64)
+    target = np.arange(length, dtype=np.float64)
+    correction = np.interp(target, anchor_x, anchor_y)
+    source = np.clip(target + correction, 0.0, length - 1.0)
+    # Monotonicity is required for a click-free time map.
+    source = np.maximum.accumulate(source)
+    source[-1] = length - 1.0
+
+    def warp(audio: np.ndarray) -> np.ndarray:
+        out = np.empty((length, audio.shape[1]), dtype=np.float32)
+        x = np.arange(length, dtype=np.float64)
+        for channel in range(audio.shape[1]):
+            out[:, channel] = np.interp(source, x, audio[:length, channel]).astype(np.float32)
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    weighted_ms = 1000.0 * float(np.average(np.abs(values), weights=np.maximum(confidences, 1e-3))) / sample_rate
+    confidence = float(np.mean(confidences))
+    score = float(np.clip(0.55 + 0.45 * confidence, 0.0, 1.0))
+    return warp(b_low), warp(b_perc), {
+        "beat_grid_alignment_score": score,
+        "beat_grid_align_ms": weighted_ms,
+        "beat_grid_aligned_beats": float(len(values)),
+    }
+
 def _delay_echo(
     audio: np.ndarray,
     sample_rate: int,
@@ -249,7 +354,7 @@ def _intent_bonus(archetype: str, metrics: dict[str, float]) -> float:
         6: ("Echo Out", "Loop Out", "Filter Ride"),
     }.get(code, ("Long Blend", "Bass Swap", "Echo Out"))
     if archetype == preferred[0]:
-        return 0.24
+        return 0.36 if archetype == "Double Drop" else 0.24
     if archetype in preferred[1:]:
         return 0.12
     return 0.0
@@ -314,6 +419,9 @@ def _candidate_order(
         recent_penalty = 0.0
         if archetype in tuple(history)[-2:]:
             recent_penalty = 0.16 if history and archetype == history[-1] else 0.08
+        if int(round(float(metrics.get("dj_intent_code", 0.0)))) == 5 and archetype == "Double Drop":
+            fit += 0.16
+            recent_penalty *= 0.35
         scored.append((fit - recent_penalty, archetype))
     scored.sort(reverse=True)
     return [name for _, name in scored[: max(1, int(maximum))]]
@@ -335,6 +443,7 @@ def _render_archetype(
     local_gain: float,
     effect_strength: float,
     vocal_risk: float,
+    drop_landing_phase: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     length = min(len(a_low), len(b_low), len(a_harm), len(b_harm), len(a_perc), len(b_perc))
     phase = np.linspace(0.0, 1.0, length, endpoint=True, dtype=np.float32)
@@ -426,17 +535,19 @@ def _render_archetype(
             * (1.0 - _ramp(phase, swap, hole_end, smoother=False))
         )
     elif archetype == "Double Drop":
-        # Both phrases land together.  Keep overlap deliberately sparse and
-        # switch bass/drums in a narrow window around the final downbeat.
-        swap = _bar_quantized(0.88, bars, subdivision=4)
-        bass_width = max(0.18 / bars, 0.008)
-        drum_in_start = max(0.0, swap - max(0.75 / bars, 0.025))
-        harm_in_start = max(0.0, swap - max(0.25 / bars, 0.010))
-        harm_out_end = swap
-        beat_fraction = 1.0 / max(bars * beats_per_bar, 1)
-        gap_start = max(0.0, swap - 0.55 * beat_fraction)
-        gap_end = min(1.0, swap + 0.08 * beat_fraction)
-        impact_duck = 1.0 - (0.62 + 0.16 * strength) * (
+        # Land both drops on the same downbeat. Incoming drums become audible
+        # first; the outgoing drums stay present for roughly three quarters of
+        # a beat, then release over the following beat like a human deck handoff.
+        beat_fraction = float(np.clip((60.0 / max(bpm, 1.0) * sample_rate) / max(length, 1), 1e-4, 0.25))
+        swap = float(np.clip(drop_landing_phase, 0.50, 0.94))
+        bass_width = max(0.24 * beat_fraction, 0.006)
+        drum_in_start = max(0.0, swap - 0.55 * beat_fraction)
+        harm_in_start = max(0.0, swap - 0.30 * beat_fraction)
+        harm_out_end = min(1.0, swap + 1.55 * beat_fraction)
+        gap_start = max(0.0, swap - 0.28 * beat_fraction)
+        gap_end = min(1.0, swap + 0.06 * beat_fraction)
+        # Only a small pre-impact pocket; do not erase the intended double hit.
+        impact_duck = 1.0 - (0.10 + 0.08 * strength) * (
             _ramp(phase, gap_start, swap, smoother=False)
             * (1.0 - _ramp(phase, swap, gap_end, smoother=False))
         )
@@ -444,8 +555,10 @@ def _render_archetype(
     bass_progress = _ramp(phase, swap - bass_width / 2.0, swap + bass_width / 2.0)
     bass_a, bass_b = _equal_power(bass_progress)
 
-    drum_progress = _ramp(phase, drum_in_start, min(0.78, drum_in_start + 0.48))
-    drum_a_progress = _ramp(phase, max(0.28, swap - 0.18), min(1.0, swap + 0.32))
+    drum_progress = _ramp(phase, drum_in_start, min(0.82, drum_in_start + 0.42))
+    # Let deck B establish a groove before reducing deck A.
+    drum_a_fade_start = max(0.30, drum_in_start + 0.22, swap - 0.10)
+    drum_a_progress = _ramp(phase, drum_a_fade_start, min(1.0, drum_a_fade_start + 0.34))
     drum_a = np.sqrt(np.clip(1.0 - drum_a_progress, 0.0, 1.0)).astype(np.float32)
     drum_b = np.sqrt(np.clip(drum_progress, 0.0, 1.0)).astype(np.float32)
     if archetype == "Post-Drop Relay":
@@ -455,8 +568,13 @@ def _render_archetype(
         drum_a *= (1.0 - 0.34 * _ramp(phase, 0.55, 0.90)).astype(np.float32)
         drum_b = np.sqrt(np.clip(_ramp(phase, drum_in_start, swap), 0.0, 1.0)).astype(np.float32)
     elif archetype == "Double Drop":
-        drum_a = np.sqrt(np.clip(1.0 - _ramp(phase, swap - 0.025, swap + 0.012, smoother=False), 0.0, 1.0)).astype(np.float32)
-        drum_b = np.sqrt(np.clip(_ramp(phase, swap - 0.025, swap + 0.012, smoother=False), 0.0, 1.0)).astype(np.float32)
+        beat_fraction = float(np.clip((60.0 / max(bpm, 1.0) * sample_rate) / max(length, 1), 1e-4, 0.25))
+        b_entry = _ramp(phase, swap - 0.55 * beat_fraction, swap, smoother=False)
+        b_full = _ramp(phase, swap + 0.45 * beat_fraction, swap + 1.05 * beat_fraction)
+        drum_b = (0.78 * b_entry + 0.22 * b_full).astype(np.float32)
+        a_pretrim = 1.0 - 0.12 * _ramp(phase, swap - 0.55 * beat_fraction, swap, smoother=False)
+        a_release = _ramp(phase, swap + 0.72 * beat_fraction, swap + 1.72 * beat_fraction)
+        drum_a = (a_pretrim * np.sqrt(np.clip(1.0 - a_release, 0.0, 1.0))).astype(np.float32)
 
     harm_b_progress = _ramp(phase, harm_in_start, min(1.0, harm_in_start + 0.48))
     harm_a_progress = _ramp(phase, max(0.0, harm_out_end - 0.48), harm_out_end)
@@ -514,6 +632,7 @@ def _render_archetype(
         "bass_b": bass_b,
         "drum_a": drum_a,
         "drum_b": drum_b,
+        "drum_overlap": np.minimum(drum_a, drum_b).astype(np.float32),
         "harm_a": harm_a,
         "harm_b": harm_b,
         "impact_duck": impact_duck,
@@ -616,6 +735,16 @@ def evaluate_transition(
     # 6. Beat consistency from coincident percussive onset envelopes.
     beat = _onset_similarity(a, b, target_sr)
 
+    # Drum handover: reward a short aligned overlap followed by a clear deck-A release.
+    drum_overlap_curve = np.asarray(controls.get("drum_overlap", np.zeros(1)), dtype=np.float64)
+    if drum_overlap_curve.size > 4:
+        overlap_ratio = float(np.mean(drum_overlap_curve > 0.42))
+        overlap_shape = float(np.exp(-abs(overlap_ratio - 0.13) / 0.16))
+    else:
+        overlap_ratio = 0.0
+        overlap_shape = 0.55
+    drum_handover = float(np.clip((0.58 + 0.42 * beat) * overlap_shape, 0.0, 1.0))
+
     # Additional human/style terms.
     harm_a = np.asarray(controls.get("harm_a", np.zeros(1)), dtype=np.float64)
     harm_b = np.asarray(controls.get("harm_b", np.zeros(1)), dtype=np.float64)
@@ -637,7 +766,7 @@ def evaluate_transition(
         + 0.10 * stereo
         + 0.05 * beat
     )
-    total = (0.76 * engineering + 0.14 * context_fit + 0.10 * vocal_score) * repetition
+    total = (0.72 * engineering + 0.14 * context_fit + 0.10 * vocal_score + 0.04 * drum_handover) * repetition
     return {
         "human_quality": float(np.clip(total, 0.0, 1.0)),
         "quality_loudness": loudness,
@@ -646,6 +775,8 @@ def evaluate_transition(
         "quality_smoothness": smoothness,
         "quality_stereo": stereo,
         "quality_beat": beat,
+        "quality_drum_handover": drum_handover,
+        "drum_overlap_ratio": overlap_ratio,
         "quality_vocal": vocal_score,
         "quality_context": float(np.clip(context_fit, 0.0, 1.0)),
         "quality_repetition": repetition,
@@ -701,6 +832,7 @@ def render_human_transition(
             local_gain=local_gain,
             effect_strength=effect_strength,
             vocal_risk=vocal_risk,
+            drop_landing_phase=float(plan_metrics.get("drop_landing_phase", 1.0)),
         )
         context_fit = _context_style_fit(archetype, current_label, next_label, plan_metrics)
         quality = evaluate_transition(
@@ -737,6 +869,11 @@ def render_human_transition(
         raise RuntimeError("没有生成可用的真人 DJ 过渡候选。")
     results.sort(key=lambda item: item.score, reverse=True)
     best = results[0]
+    if int(round(float(plan_metrics.get("dj_intent_code", 0.0)))) == 5:
+        double_drop = next((item for item in results if item.archetype == "Double Drop"), None)
+        if double_drop is not None and double_drop.score >= best.score - 0.10:
+            best = double_drop
+            best.quality["double_drop_preference_applied"] = 1.0
     best.quality["human_candidate_count"] = float(len(results))
     # Persist compact candidate scores for diagnostics without storing audio.
     for index, item in enumerate(results[:6]):

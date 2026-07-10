@@ -561,6 +561,10 @@ def _score_candidate(
     # low-level similarity metrics happen to look good.  A deliberate double
     # drop or final one/two-bar swap remains available through the policy guard.
     score *= 0.74 + 0.26 * phrase_policy.drop_guard_score
+    if phrase_policy.intent == "Double Drop":
+        # Prefer structurally valid dual-drop candidates, while the renderer still
+        # rejects them when low-frequency or perceptual quality is clearly worse.
+        score += 0.045 * phrase_policy.drop_landing_score
     metrics = {
         "continuity": continuity,
         "harmonic": harmonic,

@@ -125,7 +125,7 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! + MuQ + All-In-One Auto DJ 1.2.5")
+        self.title("Beat This! + MuQ + All-In-One Auto DJ 1.2.6")
         self.settings_store = SettingsStore()
         self.saved_settings = self.settings_store.load()
         self._settings_after_id: str | None = None
@@ -178,7 +178,7 @@ class AutoDJApp(tk.Tk):
         self.bind("<Configure>", lambda _event: self._schedule_settings_save(), add="+")
         self.after(150, self._detect_rubberband)
         self.after(240, self._detect_allin1)
-        LOGGER.info("Auto DJ 1.2.5 GUI 启动，主环境 Python=%s", os.sys.executable)
+        LOGGER.info("Auto DJ 1.2.6 GUI 启动，主环境 Python=%s", os.sys.executable)
         self.after(100, self._poll)
 
     _SETTING_VARIABLES = {
@@ -366,7 +366,7 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! + MuQ + All-In-One Auto DJ 1.2.5", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + MuQ + All-In-One Auto DJ 1.2.6", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
@@ -2008,7 +2008,8 @@ class AutoDJApp(tk.Tk):
                 f"MuQ 风格  {float(metrics.get('muq_style', 0.0)) * 100:5.0f}\n"
                 f"MuQ 片段  {float(metrics.get('muq_segment', 0.0)) * 100:5.0f}\n"
                 f"MuQ 轨迹  {float(metrics.get('muq_trajectory', 0.0)) * 100:5.0f}\n"
-                f"微对齐    {float(metrics.get('micro_align_ms', 0.0)):5.1f} ms\n"
+                f"首拍微调  {float(metrics.get('micro_align_ms', 0.0)):5.1f} ms\n"
+                f"逐拍校正  {float(metrics.get('beat_grid_align_ms', 0.0)):5.1f} ms / {float(metrics.get('beat_grid_aligned_beats', 0.0)):2.0f} 拍\n"
                 f"真人手法  {str(status.get('human_archetype', '—'))}\n"
                 f"真人评分  {float(status.get('human_quality_score', 0.0)) * 100:5.0f}\n"
                 f"响度控制  {float(metrics.get('quality_loudness', 0.0)) * 100:5.0f}\n"
@@ -2017,6 +2018,7 @@ class AutoDJApp(tk.Tk):
                 f"曲线平滑  {float(metrics.get('quality_smoothness', 0.0)) * 100:5.0f}\n"
                 f"立体声稳  {float(metrics.get('quality_stereo', 0.0)) * 100:5.0f}\n"
                 f"节拍一致  {float(metrics.get('quality_beat', 0.0)) * 100:5.0f}\n"
+                f"双鼓交接  {float(metrics.get('quality_drum_handover', 0.0)) * 100:5.0f}\n"
                 f"结构源    {str(status.get('current_structure_source', '—'))}\n"
                 f"渲染      {str(status.get('transition_mode', '—'))}\n"
                 f"拉伸      {str(status.get('stretch_backend', '—'))}\n"

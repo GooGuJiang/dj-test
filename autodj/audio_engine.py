@@ -20,6 +20,7 @@ from .allinone_structure import fuse_allinone_structure
 from .human_transition import (
     HumanTransitionConfig,
     SUPPORTED_ARCHETYPES,
+    align_percussive_beat_grid,
     render_human_transition,
 )
 from .models import AllInOneProfile, MuQProfile, PreparedTrack, TrackAnalysis, TransitionPlan
@@ -1413,17 +1414,46 @@ class AutoDJEngine:
         next_track: PreparedTrack,
     ) -> TransitionPlan:
         """Generate several human-style phrase-locked transitions and rank them."""
-        a = current.audio[plan.current_start : plan.current_start + plan.length]
+        phrase_length = int(plan.length)
         b_end = (
             plan.next_resume_sample
             if plan.next_resume_sample >= 0
-            else plan.next_start + plan.length
+            else plan.next_start + phrase_length
         )
         b_raw = next_track.audio[plan.next_start : b_end]
-        if len(a) < plan.length:
-            a = np.pad(a, ((0, plan.length - len(a)), (0, 0)))
-        a = np.ascontiguousarray(a[: plan.length], dtype=np.float32)
-        b, phrase_backend = self._fit_phrase_length(b_raw, plan.length)
+        b_phrase, phrase_backend = self._fit_phrase_length(b_raw, phrase_length)
+
+        # A valid double drop needs a short post-landing window: both drum kits
+        # hit together first, then deck A releases.  Extend by up to two beats
+        # without re-warping the already phrase-locked section.
+        tail = 0
+        wants_double_drop = (
+            plan.dj_intent == "Double Drop"
+            or self.config.human_style_mode == "Double Drop"
+        )
+        if wants_double_drop:
+            requested_tail = int(round(2.0 * 60.0 / max(current.playback_bpm, 1.0) * self.config.sample_rate))
+            tail = max(0, min(
+                requested_tail,
+                current.total_samples - (plan.current_start + phrase_length),
+                next_track.total_samples - b_end,
+            ))
+
+        total_length = phrase_length + tail
+        a = current.audio[plan.current_start : plan.current_start + total_length]
+        if len(a) < total_length:
+            a = np.pad(a, ((0, total_length - len(a)), (0, 0)))
+        a = np.ascontiguousarray(a[:total_length], dtype=np.float32)
+        if tail > 0:
+            b_tail = np.ascontiguousarray(next_track.audio[b_end : b_end + tail], dtype=np.float32)
+            b = np.ascontiguousarray(np.concatenate([b_phrase, b_tail], axis=0), dtype=np.float32)
+            plan.length = total_length
+            plan.next_resume_sample = int(b_end + tail)
+            plan.metrics["double_drop_tail_beats"] = float(tail * current.playback_bpm / (60.0 * self.config.sample_rate))
+            plan.metrics["drop_landing_phase"] = float(phrase_length / max(total_length, 1))
+        else:
+            b = b_phrase
+            plan.metrics["drop_landing_phase"] = 1.0
 
         a_low, _, _ = _split_three_bands(
             a, self.config.sample_rate, self.config.bass_split_hz, self.config.high_split_hz
@@ -1435,6 +1465,23 @@ class AutoDJEngine:
         b_body = np.ascontiguousarray(b - b_low, dtype=np.float32)
         a_harm, a_perc = self._hpss_stereo(a_body)
         b_harm, b_perc = self._hpss_stereo(b_body)
+        b_low, b_perc, grid_metrics = align_percussive_beat_grid(
+            a_low=a_low,
+            b_low=b_low,
+            a_perc=a_perc,
+            b_perc=b_perc,
+            sample_rate=self.config.sample_rate,
+            bpm=current.playback_bpm,
+            beats_per_bar=max(2, current.analysis.beats_per_bar),
+            bars=max(1, plan.bars),
+        )
+        plan.metrics.update(grid_metrics)
+        if grid_metrics.get("beat_grid_aligned_beats", 0.0) >= 2:
+            self.emit(
+                f"鼓拍微对齐：{next_track.analysis.title} · "
+                f"{grid_metrics.get('beat_grid_aligned_beats', 0.0):.0f} 拍 · "
+                f"平均校正 {grid_metrics.get('beat_grid_align_ms', 0.0):.1f} ms"
+            )
 
         current_label = plan.current_role or (
             current.structure.labels[plan.current_bar_index]
@@ -1475,7 +1522,7 @@ class AutoDJEngine:
         plan.human_quality_score = human.score
         plan.human_quality_metrics = dict(human.quality)
         plan.metrics.update(human.quality)
-        plan.metrics["phrase_warp_ratio"] = len(b_raw) / max(plan.length, 1)
+        plan.metrics["phrase_warp_ratio"] = len(b_raw) / max(phrase_length, 1)
         plan.metrics["phrase_warp_backend"] = (
             1.0 if "rubber" in phrase_backend.lower() else 0.0
         )
@@ -1529,7 +1576,7 @@ class AutoDJEngine:
                 plan.metrics["seam_mean_seconds"] = result.seam_seconds_mean
                 plan.metrics["seam_std_seconds"] = result.seam_seconds_std
                 plan.metrics["graph_flow"] = result.flow_value
-                plan.metrics["phrase_warp_ratio"] = len(b_raw) / max(plan.length, 1)
+                plan.metrics["phrase_warp_ratio"] = len(b_raw) / max(phrase_length, 1)
                 plan.metrics["phrase_warp_backend"] = 1.0 if "rubber" in phrase_backend.lower() else 0.0
                 return plan
             except Exception as exc:
