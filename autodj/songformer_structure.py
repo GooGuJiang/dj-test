@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .models import AllInOneProfile, BarFeatures, EDMStructure
+from .models import SongFormerProfile, BarFeatures, EDMStructure
 
 
 def _unit(values: np.ndarray) -> np.ndarray:
@@ -55,19 +55,19 @@ def _role_for_label(
     return base_role
 
 
-def fuse_allinone_structure(
+def fuse_songformer_structure(
     base: EDMStructure,
-    profile: AllInOneProfile,
+    profile: SongFormerProfile,
     features: BarFeatures,
     source_downbeat_samples: np.ndarray,
     sample_rate: int,
 ) -> EDMStructure:
-    """Fuse All-In-One functional segments with local EDM role estimates.
+    """Fuse a neural functional-segmentation profile with local EDM roles.
 
-    Beat This! remains the timing authority. All-In-One labels are sampled on the
-    corresponding original-audio downbeats, then converted into DJ-oriented roles.
-    Its boundaries boost cue, mix-in and mix-out probabilities instead of blindly
-    replacing local energy/phrase evidence.
+    Beat This! remains the timing authority. SongFormer labels are
+    sampled on the corresponding original-audio downbeats, then converted into
+    DJ-oriented roles. Neural boundaries boost cue probabilities instead of
+    blindly replacing local energy and phrase evidence.
     """
     count = features.count
     if count == 0 or not profile.available:
@@ -97,18 +97,18 @@ def fuse_allinone_structure(
         if starts.size:
             nearest = int(np.argmin(np.abs(starts - time_value)))
             distance = abs(float(starts[nearest] - time_value))
+            confidence = float(np.clip(profile.segments[nearest].confidence, 0.0, 1.0))
             if distance <= boundary_radius:
-                # A neural segment boundary is not guaranteed to land exactly on
-                # Beat This!'s downbeat. Snapping it to the nearest bar should
-                # retain high confidence instead of being punished by sub-beat
-                # offsets between the two models.
-                boundary_score[index] = float(
-                    0.75 + 0.25 * np.clip(1.0 - distance / boundary_radius, 0.0, 1.0)
+                # Neural boundaries rarely land exactly on Beat This! downbeats.
+                # Snap to the nearest bar while retaining model confidence.
+                geometric = 0.75 + 0.25 * np.clip(
+                    1.0 - distance / boundary_radius, 0.0, 1.0
                 )
             else:
-                boundary_score[index] = float(
-                    0.35 * np.exp(-0.5 * (distance / max(boundary_radius, 1e-6)) ** 2)
+                geometric = 0.35 * np.exp(
+                    -0.5 * (distance / max(boundary_radius, 1e-6)) ** 2
                 )
+            boundary_score[index] = float(geometric * (0.70 + 0.30 * confidence))
             boundary_labels.append(profile.segments[nearest].label.upper())
         else:
             boundary_labels.append("")
@@ -139,9 +139,9 @@ def fuse_allinone_structure(
     base.phrase_mask = np.clip(phrase, 0.0, 1.0).astype(np.float32)
     base.labels = tuple(roles)
     base.functional_labels = tuple(functional)
-    base.allin1_boundary_score = np.ascontiguousarray(boundary_score, dtype=np.float32)
-    base.structure_source = f"All-In-One/{profile.model_name} + local EDM"
-    base.allin1_backend = profile.backend
+    base.songformer_boundary_score = np.ascontiguousarray(boundary_score, dtype=np.float32)
+    base.structure_source = f"SongFormer/{profile.model_name} + local EDM"
+    base.songformer_backend = profile.backend
     # Functional segmentation evidence increases confidence but cannot force an
     # EDM classification on non-EDM songs.
     base.edm_confidence = float(

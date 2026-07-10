@@ -30,6 +30,9 @@ SUPPORTED_ARCHETYPES = (
     "Drop Swap",
     "Loop Out",
     "Filter Ride",
+    "Post-Drop Relay",
+    "Breakdown Lift",
+    "Double Drop",
 )
 
 
@@ -235,6 +238,23 @@ def _loop_percussion(
     return output * (decay * gate)[:, None]
 
 
+def _intent_bonus(archetype: str, metrics: dict[str, float]) -> float:
+    code = int(round(float(metrics.get("dj_intent_code", 0.0))))
+    preferred = {
+        1: ("Long Blend", "Bass Swap", "Filter Ride"),
+        2: ("Post-Drop Relay", "Bass Swap", "Long Blend"),
+        3: ("Breakdown Lift", "Filter Ride", "Drop Swap"),
+        4: ("Breakdown Lift", "Drop Swap", "Filter Ride"),
+        5: ("Double Drop", "Drop Swap", "Bass Swap"),
+        6: ("Echo Out", "Loop Out", "Filter Ride"),
+    }.get(code, ("Long Blend", "Bass Swap", "Echo Out"))
+    if archetype == preferred[0]:
+        return 0.24
+    if archetype in preferred[1:]:
+        return 0.12
+    return 0.0
+
+
 def _context_style_fit(
     archetype: str,
     current_label: str,
@@ -253,18 +273,25 @@ def _context_style_fit(
     current_vocal = current_role in {"VOCAL", "VERSE", "CHORUS", "SOLO"}
     clean_intro = next_role in {"INTRO", "PHRASE", "SECTION"}
 
+    intent = _intent_bonus(archetype, metrics)
     if archetype == "Long Blend":
-        return float(np.clip(0.25 + 0.28 * harmonic + 0.18 * phrase + 0.16 * (1.0 - vocal_risk) + 0.13 * float(clean_intro), 0.0, 1.0))
+        return float(np.clip(0.25 + 0.28 * harmonic + 0.18 * phrase + 0.16 * (1.0 - vocal_risk) + 0.13 * float(clean_intro) + intent, 0.0, 1.0))
     if archetype == "Bass Swap":
-        return float(np.clip(0.16 + 0.42 * edm + 0.16 * cue + 0.14 * phrase + 0.12 * float(clean_intro), 0.0, 1.0))
+        return float(np.clip(0.16 + 0.42 * edm + 0.16 * cue + 0.14 * phrase + 0.12 * float(clean_intro) + intent, 0.0, 1.0))
     if archetype == "Echo Out":
-        return float(np.clip(0.22 + 0.25 * vocal_risk + 0.18 * cue + 0.16 * (1.0 - harmonic) + 0.19 * float(current_vocal), 0.0, 1.0))
+        return float(np.clip(0.22 + 0.25 * vocal_risk + 0.18 * cue + 0.16 * (1.0 - harmonic) + 0.19 * float(current_vocal) + intent, 0.0, 1.0))
     if archetype == "Drop Swap":
-        return float(np.clip(0.10 + 0.46 * float(next_drop) + 0.20 * edm + 0.15 * phrase + 0.09 * float(current_break), 0.0, 1.0))
+        return float(np.clip(0.10 + 0.46 * float(next_drop) + 0.20 * edm + 0.15 * phrase + 0.09 * float(current_break) + intent, 0.0, 1.0))
     if archetype == "Loop Out":
-        return float(np.clip(0.17 + 0.28 * edm + 0.21 * cue + 0.25 * float(current_break) + 0.09 * float(clean_intro), 0.0, 1.0))
+        return float(np.clip(0.17 + 0.28 * edm + 0.21 * cue + 0.25 * float(current_break) + 0.09 * float(clean_intro) + intent, 0.0, 1.0))
     if archetype == "Filter Ride":
-        return float(np.clip(0.20 + 0.24 * edm + 0.22 * harmonic + 0.20 * cue + 0.14 * float(current_vocal), 0.0, 1.0))
+        return float(np.clip(0.20 + 0.24 * edm + 0.22 * harmonic + 0.20 * cue + 0.14 * float(current_vocal) + intent, 0.0, 1.0))
+    if archetype == "Post-Drop Relay":
+        return float(np.clip(0.28 + 0.28 * metrics.get("dj_post_drop", 0.0) + 0.24 * metrics.get("dj_drop_landing", 0.0) + 0.12 * phrase + 0.08 * edm + intent, 0.0, 1.0))
+    if archetype == "Breakdown Lift":
+        return float(np.clip(0.24 + 0.30 * metrics.get("dj_drop_landing", 0.0) + 0.20 * metrics.get("dj_energy_arc", 0.0) + 0.14 * phrase + 0.12 * edm + intent, 0.0, 1.0))
+    if archetype == "Double Drop":
+        return float(np.clip(0.12 + 0.28 * metrics.get("dj_drop_landing", 0.0) + 0.22 * harmonic + 0.18 * metrics.get("bass_clean", 0.0) + 0.12 * phrase + 0.08 * edm + intent, 0.0, 1.0))
     return 0.5
 
 
@@ -373,6 +400,46 @@ def _render_archetype(
         drum_in_start = 0.0
         harm_in_start = _bar_quantized(0.30 + 0.12 * vocal_risk, bars, 2)
         harm_out_end = _bar_quantized(0.80, bars, 2)
+    elif archetype == "Post-Drop Relay":
+        # The outgoing drop has finished: keep its groove briefly, introduce the
+        # incoming drums early, then hand bass ownership over around the final
+        # third so the incoming drop/chorus can arrive cleanly.
+        swap = _bar_quantized(0.66, bars, subdivision=2)
+        bass_width = max(0.65 / bars, 0.025)
+        drum_in_start = 0.0
+        harm_in_start = _bar_quantized(0.46 + 0.10 * vocal_risk, bars, 2)
+        harm_out_end = _bar_quantized(0.64, bars, 2)
+    elif archetype == "Breakdown Lift":
+        # Preserve the breakdown atmosphere while the incoming buildup rises.
+        # A short pre-drop hole creates a perceptual arrival instead of a mushy
+        # full-level overlap.
+        swap = _bar_quantized(0.84, bars, subdivision=4)
+        bass_width = max(0.30 / bars, 0.012)
+        drum_in_start = _bar_quantized(0.26, bars, 2)
+        harm_in_start = _bar_quantized(0.20, bars, 2)
+        harm_out_end = _bar_quantized(0.84, bars, 2)
+        beat_fraction = 1.0 / max(bars * beats_per_bar, 1)
+        hole_start = max(0.0, swap - 0.72 * beat_fraction)
+        hole_end = min(1.0, swap + 0.10 * beat_fraction)
+        impact_duck = 1.0 - (0.46 + 0.22 * strength) * (
+            _ramp(phase, hole_start, swap, smoother=False)
+            * (1.0 - _ramp(phase, swap, hole_end, smoother=False))
+        )
+    elif archetype == "Double Drop":
+        # Both phrases land together.  Keep overlap deliberately sparse and
+        # switch bass/drums in a narrow window around the final downbeat.
+        swap = _bar_quantized(0.88, bars, subdivision=4)
+        bass_width = max(0.18 / bars, 0.008)
+        drum_in_start = max(0.0, swap - max(0.75 / bars, 0.025))
+        harm_in_start = max(0.0, swap - max(0.25 / bars, 0.010))
+        harm_out_end = swap
+        beat_fraction = 1.0 / max(bars * beats_per_bar, 1)
+        gap_start = max(0.0, swap - 0.55 * beat_fraction)
+        gap_end = min(1.0, swap + 0.08 * beat_fraction)
+        impact_duck = 1.0 - (0.62 + 0.16 * strength) * (
+            _ramp(phase, gap_start, swap, smoother=False)
+            * (1.0 - _ramp(phase, swap, gap_end, smoother=False))
+        )
 
     bass_progress = _ramp(phase, swap - bass_width / 2.0, swap + bass_width / 2.0)
     bass_a, bass_b = _equal_power(bass_progress)
@@ -381,6 +448,15 @@ def _render_archetype(
     drum_a_progress = _ramp(phase, max(0.28, swap - 0.18), min(1.0, swap + 0.32))
     drum_a = np.sqrt(np.clip(1.0 - drum_a_progress, 0.0, 1.0)).astype(np.float32)
     drum_b = np.sqrt(np.clip(drum_progress, 0.0, 1.0)).astype(np.float32)
+    if archetype == "Post-Drop Relay":
+        drum_a = np.sqrt(np.clip(1.0 - _ramp(phase, 0.30, 0.74), 0.0, 1.0)).astype(np.float32)
+        drum_b = np.sqrt(np.clip(_ramp(phase, 0.0, 0.44), 0.0, 1.0)).astype(np.float32)
+    elif archetype == "Breakdown Lift":
+        drum_a *= (1.0 - 0.34 * _ramp(phase, 0.55, 0.90)).astype(np.float32)
+        drum_b = np.sqrt(np.clip(_ramp(phase, drum_in_start, swap), 0.0, 1.0)).astype(np.float32)
+    elif archetype == "Double Drop":
+        drum_a = np.sqrt(np.clip(1.0 - _ramp(phase, swap - 0.025, swap + 0.012, smoother=False), 0.0, 1.0)).astype(np.float32)
+        drum_b = np.sqrt(np.clip(_ramp(phase, swap - 0.025, swap + 0.012, smoother=False), 0.0, 1.0)).astype(np.float32)
 
     harm_b_progress = _ramp(phase, harm_in_start, min(1.0, harm_in_start + 0.48))
     harm_a_progress = _ramp(phase, max(0.0, harm_out_end - 0.48), harm_out_end)
@@ -522,7 +598,7 @@ def evaluate_transition(
         second = np.diff(curve, n=2)
         control_penalties.append(float(np.mean(np.abs(second))))
     smooth_penalty = float(np.mean(control_penalties)) if control_penalties else 0.0
-    scale = 0.010 if archetype == "Drop Swap" else 0.0045
+    scale = 0.012 if archetype in {"Drop Swap", "Double Drop", "Breakdown Lift"} else 0.0045
     smoothness = float(np.exp(-smooth_penalty / scale))
 
     # 5. Stereo width should follow the weighted source image, not collapse or explode.

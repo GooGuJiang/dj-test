@@ -150,7 +150,14 @@ class BeatThisAnalyzer:
         cache_path: str | Path | None = None,
     ) -> None:
         self.checkpoint = checkpoint.strip() or "final0"
-        self.device = device.strip() or "cpu"
+        requested_device = device.strip() or "auto"
+        if requested_device == "auto":
+            try:
+                from .compute_device import resolve_torch_device
+                requested_device = resolve_torch_device("auto")
+            except Exception:
+                requested_device = "cpu"
+        self.device = requested_device
         self.float16 = bool(float16) if float16 is not None else self.device.startswith("cuda")
         self.cache_path = Path(
             cache_path or Path.home() / ".beat_this_auto_dj_cache_v2.json"

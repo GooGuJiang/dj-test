@@ -55,8 +55,8 @@ class FunctionalSegment:
 
 
 @dataclass
-class AllInOneProfile:
-    """All-In-One functional structure analysis, aligned to original audio time."""
+class SongFormerProfile:
+    """SongFormer functional structure profile cached by the DJ application."""
 
     bpm: float = 0.0
     beats: tuple[float, ...] = ()
@@ -64,8 +64,8 @@ class AllInOneProfile:
     beat_positions: tuple[int, ...] = ()
     segments: tuple[FunctionalSegment, ...] = ()
     backend: str = "disabled"
-    model_name: str = "harmonix-all"
-    natten_backend: str = "unknown"
+    model_name: str = "ASLP-lab/SongFormer"
+    runtime_backend: str = "songformer-worker"
 
     @property
     def available(self) -> bool:
@@ -109,11 +109,11 @@ class AllInOneProfile:
             "segments": [segment.to_json_dict() for segment in self.segments],
             "backend": self.backend,
             "model_name": self.model_name,
-            "natten_backend": self.natten_backend,
+            "runtime_backend": self.runtime_backend,
         }
 
     @classmethod
-    def from_json_dict(cls, data: dict[str, Any]) -> "AllInOneProfile":
+    def from_json_dict(cls, data: dict[str, Any]) -> "SongFormerProfile":
         return cls(
             bpm=float(data.get("bpm", 0.0)),
             beats=tuple(float(value) for value in data.get("beats", [])),
@@ -124,8 +124,8 @@ class AllInOneProfile:
                 for item in data.get("segments", [])
             ),
             backend=str(data.get("backend", "cache")),
-            model_name=str(data.get("model_name", "harmonix-all")),
-            natten_backend=str(data.get("natten_backend", "unknown")),
+            model_name=str(data.get("model_name", "ASLP-lab/SongFormer")),
+            runtime_backend=str(data.get("runtime_backend", data.get("natten_backend", "songformer-worker"))),
         )
 
 
@@ -158,13 +158,13 @@ class EDMStructure:
     salience: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     phrase_mask: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     labels: tuple[str, ...] = ()
-    # Exact functional labels predicted by All-In-One, sampled per Beat This! bar.
+    # Exact functional labels predicted by SongFormer, sampled per Beat This! bar.
     functional_labels: tuple[str, ...] = ()
-    allin1_boundary_score: np.ndarray = field(
+    songformer_boundary_score: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.float32)
     )
     structure_source: str = "local EDM heuristic"
-    allin1_backend: str = "disabled"
+    songformer_backend: str = "disabled"
     phase_offset: int = 0
     key_index: int = -1
     mode: str = "unknown"
@@ -270,7 +270,7 @@ class PreparedTrack:
     tempo_restore_bars: int = 0
     structure: EDMStructure = field(default_factory=EDMStructure)
     muq_profile: MuQProfile = field(default_factory=MuQProfile)
-    allin1_profile: AllInOneProfile = field(default_factory=AllInOneProfile)
+    songformer_profile: SongFormerProfile = field(default_factory=SongFormerProfile)
     stretch_backend: str = "librosa"
 
     @property
@@ -351,6 +351,14 @@ class TransitionPlan:
     human_archetype: str = ""
     human_quality_score: float = 0.0
     human_quality_metrics: dict[str, float] = field(default_factory=dict)
+    # Structure-aware DJ phrase policy selected before rendering.
+    dj_intent: str = "Safe Phrase Blend"
+    current_role: str = "SECTION"
+    current_landing_role: str = "SECTION"
+    next_role: str = "SECTION"
+    next_landing_role: str = "SECTION"
+    structure_policy_score: float = 0.0
+    recommended_archetypes: tuple[str, ...] = ()
 
     @property
     def current_end(self) -> int:

@@ -1,37 +1,29 @@
-# Primary Research and Model Sources
+# Sources
 
-本项目 0.6.1 的算法选择主要参考以下公开的一手来源：
+## Active models
 
-1. MuQ official model card — https://huggingface.co/OpenMuQ/MuQ-large-msd-iter
-2. MuQ official repository — https://github.com/tencent-ailab/MuQ
-3. MuQ paper — https://arxiv.org/abs/2501.01108
-4. Beat This! official implementation — https://github.com/CPJKU/beat_this
-5. Beat This! paper — https://arxiv.org/abs/2407.21658
-6. AutoMashup — https://arxiv.org/abs/2508.06516
-7. Efficient Feature Aggregation / MuQ-token — https://arxiv.org/abs/2604.20847
-8. SELEBI percussion-aware time stretching — https://arxiv.org/abs/2602.16421
-9. DJ-AI playlist alignment — https://doi.org/10.1145/3771594.3771640
+- Beat This!: https://github.com/CPJKU/beat_this
+- MuQ-large-msd-iter: https://huggingface.co/OpenMuQ/MuQ-large-msd-iter
+- SongFormer model: https://huggingface.co/ASLP-lab/SongFormer
+- SongFormer official implementation: https://github.com/ASLP-lab/SongFormer
 
-## 实现与论文的边界
+## Transition research used by the project
 
-- MuQ 使用官方公开推理接口和模型名。
-- MuQ-token 仅启发本项目的多层聚合；未复现其推荐训练框架。
-- SELEBI 尚未有成熟官方 Python 实现被集成；本项目的 HPSS+WSOLA 是工程替代方案，不是逐公式复现。
-- MuQ 权重为 CC-BY-NC 4.0，不适合未经授权的商业使用。
+- Automatic DJ cue-point detection: https://arxiv.org/abs/2007.08411
+- CUE-DETR: https://arxiv.org/abs/2407.06823
+- Graph-Cut Crossfading: https://arxiv.org/abs/2301.13380
+- DJtransGAN: https://arxiv.org/abs/2110.06525
+- Raveform dataset/taxonomy: https://mir-aidj.github.io/raveform/
 
-## All-In-One 0.9.0
+## Runtime notes
 
-10. All-In-One official repository — https://github.com/mir-aidj/all-in-one
-11. All-In-One paper — https://arxiv.org/abs/2307.16425
-12. All-In-One PyPI package — https://pypi.org/project/allin1/
-13. NATTEN official repository — https://github.com/SHI-Labs/NATTEN
-14. All-In-One NATTEN compatibility issue — https://github.com/mir-aidj/all-in-one/issues/33
+- SongFormer runs in an isolated Python environment.
+- Beat This! remains the beat/downbeat timing authority.
+- MuQ embeddings are used for directional playlist ranking.
+- No EDMFormer or All-In-One inference path is included in version 1.2.1.
 
-### All-In-One 实现边界
+## 1.2.3 CUDA runtime
 
-- 使用官方 `allin1.analyze()` 和 `harmonix-all` 权重。
-- Beat This! 的 beat/downbeat 不被 All-In-One 覆盖，避免两个节拍网格互相漂移。
-- All-In-One 的 Harmonix 功能段会映射成 DJ 角色，但 GUI 同时保留原始功能标签。
-- 没有宣称 All-In-One 能直接识别 Raveform 的 buildup/drop/cooldown；DROP 等 DJ 角色由 All-In-One 功能标签与局部能量/鼓组特征融合得到。
-- 纯 PyTorch NATTEN 是兼容回退，不是官方 CUDA 内核，速度较慢。
-
+- PyTorch official Start Locally / Previous Versions documentation: CUDA 12.8 wheels for Windows and Linux, including PyTorch 2.7.1.
+- NVIDIA GeForce RTX 5070 official product page: RTX 50 series / Blackwell GPU.
+- ASLP-lab SongFormer Hugging Face model card: official example moves the model to `cuda:0` before inference.

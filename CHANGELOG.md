@@ -1,23 +1,46 @@
 # Changelog
 
-## 1.0.0 — MuQ Smooth Ordering + Sliding Preload + Auto-Save
+## 1.2.3
 
-- MuQ 排序升级为平均兼容度与最差相邻边双目标
-- 排序新增 Outro→Intro、局部语义 DTW、BPM、能量、音色和 All-In-One 角色评分
-- 对单次大幅风格、BPM、能量跨度加入显式 jump penalty
-- Beam search 新增能量曲线加速度与上下锯齿惩罚
-- GUI 列表显示每首歌曲与下一首的相邻兼容分
-- 播放中只重排未播放后缀，已播放、当前轨和正在混入的轨道保持锁定
-- 新增当前轨 + 热下一轨 + 暖未来轨的滑动窗口预加载
-- 暖轨提前完成解码、模型特征读取和 BPM 同步时间拉伸
-- 新增预加载内存上限、窗口轨数和截止保护时间设置
-- 接近截止点仍未完成时自动使用短节拍淡化，避免错过切歌点
-- 所有 GUI 参数和窗口尺寸自动保存为原子 JSON，并在下次启动恢复
-- 新增 3 项排序、配置和滑动窗口测试；项目共 32 项测试通过
+- 修复 SongFormer worker 在 RTX 5070 上加载到 CPU 的问题。
+- GUI 默认计算设备由 `cpu` 改为 `auto`，并迁移 1.2.2 的旧默认设置。
+- SongFormer 独立环境改用 PyTorch 2.7.1 + CUDA 12.8 wheel。
+- 新增真实 CUDA 张量 smoke test、GPU 名称、compute capability、CUDA build 和驱动诊断。
+- 显式 `cuda` 与 NVIDIA 环境下的 `auto` 不再静默回退 CPU。
+- 新增 `repair_songformer_cuda.py` 原地修复脚本。
+- PyTorch 从 SongFormer 普通依赖文件中分离，避免后续 pip 安装覆盖 CUDA wheel。
+- 新增 RTX 50 系列设备选择与禁止 CPU 回退测试。
+
+## 1.2.2
+
+- GUI 底部新增歌曲分析进度条、阶段名称、当前歌曲、完成数量和百分比。
+- 模型下载/加载阶段使用动态进度条，避免长时间停在 0% 造成卡死误判。
+- MuQ 进度细化到语义窗口，缓存命中也会正确推进。
+- SongFormer worker 改为实时流式输出，不再使用 `capture_output` 等待整批结束。
+- 命令行日志新增时间、级别和线程名称，并透传 SongFormer 下载、加载、推理及错误日志。
+- 新增 worker 结构化进度消息解析回归测试。
+
+## 1.2.1
+
+- 修复启动时仍调用旧 `set_allin1_model()` 校验导致 `ASLP-lab/SongFormer` 被拒绝的问题。
+- 引擎配置和 GUI 全部改用 `songformer_*` 接口。
+- 删除残留的 All-In-One 模型校验、变量名和运行时分支。
+- SongFormer 官方模型名称现在进行明确校验，并兼容旧缓存字段读取。
+
+## 1.1.0 — Structure-Aware Drop/Phrase DJ Policy
+
+- 新增 `dj_phrase_policy.py`，把切歌决策从静态相似度改为结构意图规划
+- 新增 Post-Drop Relay、Breakdown Lift、Double Drop 三种渲染手法
+- 优先在 Drop 结束后的 cooldown/breakdown/outro 边界退出
+- 反向规划 B 的 intro/buildup，使混音终点精确落在 Drop/Chorus
+- Drop 中段长混音加入硬惩罚，仅保留短 Drop Swap 和高兼容 Double Drop
+- 匹配分新增角色路径、Drop 落点、Drop 后退出、能量弧线、边界和 guard
+- AutoMix 复杂过渡置信度纳入结构策略评分
+- GUI 显示 DJ 意图、角色路径和 DROP LAND 时间轴标记
+- 新增结构策略与三种新手法测试；项目共 35 项测试通过
 
 ## 0.9.0 — All-In-One Functional Structure Integration
 
-- 接入 `mir-aidj/all-in-one` 1.1.0 / `harmonix-all`
 - Beat This! 保持 beat/downbeat 时间权威，All-In-One 提供功能段标签
 - 新增 intro、verse、chorus、break、bridge、inst、solo、outro 融合
 - All-In-One 边界和角色兼容度进入 OUT/IN 候选评分
@@ -25,8 +48,7 @@
 - GUI 时间轴显示彩色功能段，队列表格显示结构摘要
 - 播放前批量分析并缓存，不在切歌时启动 Demucs
 - 新增原生 NATTEN 兼容检测和纯 PyTorch legacy-op 回退
-- 新增 `install_allinone.py` 与 `verify_allinone.py`
-- 新增 4 项 All-In-One/NATTEN 测试；项目共 29 项测试通过
+- 新增 `install_songformer.py` 与 `verify_songformer.py`
 
 ## 0.7.0 — Seek + Pair Preload + Live MuQ Reordering
 

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from autodj.audio_engine import AutoDJEngine, EngineConfig
-from autodj.models import AllInOneProfile, FunctionalSegment, MuQProfile, TrackAnalysis
+from autodj.models import SongFormerProfile, FunctionalSegment, MuQProfile, TrackAnalysis
 from autodj.playlist_ranker import rank_playlist, transition_compatibility
 from autodj.settings_store import SettingsStore
 
@@ -39,8 +39,8 @@ def _profile(vector: list[float], energy: float = -1.0) -> MuQProfile:
     )
 
 
-def _structure(first: str, last: str) -> AllInOneProfile:
-    return AllInOneProfile(
+def _structure(first: str, last: str) -> SongFormerProfile:
+    return SongFormerProfile(
         segments=(
             FunctionalSegment(0.0, 30.0, first),
             FunctionalSegment(30.0, 60.0, last),

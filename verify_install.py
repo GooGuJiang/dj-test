@@ -13,7 +13,7 @@ import torchaudio
 from beat_this.inference import File2Beats
 from beat_this.utils import infer_beat_numbers
 from autodj.time_stretch import rubberband_probe
-from autodj.allinone_analyzer import probe_allinone
+from autodj.songformer_analyzer import probe_songformer
 
 
 def main() -> None:
@@ -49,15 +49,15 @@ def main() -> None:
         print("MuQ: 未安装或导入失败：", exc)
         print("运行 python install_muq.py 后可启用风格排序；Beat This! 播放仍可使用。")
 
-    aio = probe_allinone()
-    if aio.get("ok"):
+    songformer = probe_songformer(conda_env="songformer-auto-dj")
+    if songformer.get("ok"):
         print(
-            "All-In-One:", aio.get("allin1_version"),
-            "· NATTEN", aio.get("natten_backend")
+            "SongFormer worker:", songformer.get("python"),
+            "· Torch", songformer.get("torch")
         )
     else:
-        print("All-In-One: 未安装；运行 python install_allinone.py")
-        print("All-In-One 诊断:", aio.get("message"))
+        print("SongFormer: 独立环境未安装；运行 python install_songformer.py")
+        print("SongFormer 诊断:", songformer.get("message"))
 
     rb = rubberband_probe()
     if rb.get("ok"):

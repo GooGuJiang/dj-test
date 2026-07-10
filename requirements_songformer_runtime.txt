@@ -1,0 +1,23 @@
+# Official SongFormer Hugging Face runtime (isolated Python 3.10 environment)
+# PyTorch is installed separately by install_songformer.py so NVIDIA/CPU builds
+# cannot be confused. RTX 50-series uses the CUDA 12.8 wheel.
+transformers==4.51.1
+accelerate==1.5.2
+huggingface-hub==0.30.1
+safetensors==0.5.3
+numpy==1.25.0
+scipy==1.15.2
+librosa==0.11.0
+soundfile==0.13.1
+omegaconf==2.3.0
+einops==0.8.1
+ema-pytorch==0.7.7
+muq==0.1.0
+loguru==0.7.3
+beartype==0.21.0
+x-transformers==2.4.14
+x-clip==0.14.4
+julius==0.2.7
+soxr==0.5.0.post1
+msaf==0.1.80
+vmo==0.30.5

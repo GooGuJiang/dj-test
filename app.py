@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import threading
@@ -8,14 +9,22 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from autodj.audio_engine import AutoDJEngine, EngineConfig
-from autodj.allinone_analyzer import AllInOneAnalyzer, probe_allinone
+from autodj.songformer_analyzer import SongFormerAnalyzer, probe_songformer
 from autodj.beat_this_analyzer import BeatThisAnalyzer
-from autodj.models import AllInOneProfile, MuQProfile, TrackAnalysis
+from autodj.models import SongFormerProfile, MuQProfile, TrackAnalysis
 from autodj.muq_analyzer import MuQAnalyzer
 from autodj.playlist_ranker import PairScore, rank_playlist, style_clusters, transition_compatibility
 from autodj.timeline import DJTimeline
 from autodj.time_stretch import rubberband_probe
 from autodj.settings_store import SettingsStore
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+LOGGER = logging.getLogger("autodj")
 
 
 AUDIO_FILETYPES = [
@@ -116,7 +125,7 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! + MuQ + All-In-One Auto DJ 1.0.0")
+        self.title("Beat This! + MuQ + SongFormer Auto DJ 1.2.3")
         self.settings_store = SettingsStore()
         self.saved_settings = self.settings_store.load()
         self._settings_after_id: str | None = None
@@ -154,8 +163,9 @@ class AutoDJApp(tk.Tk):
         self.muq_groups: dict[str, int] = {}
         self.muq_pair_scores: dict[str, PairScore] = {}
         self.muq_ranking_active = False
-        self.allin1_profiles: dict[str, AllInOneProfile] = {}
-        self.allin1_analysis_active = False
+        self.songformer_profiles: dict[str, SongFormerProfile] = {}
+        self.songformer_analysis_active = False
+        self.songformer_probe_result: dict[str, object] = {}
         self._preload_after_id: str | None = None
 
         self._build_style()
@@ -167,7 +177,8 @@ class AutoDJApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Configure>", lambda _event: self._schedule_settings_save(), add="+")
         self.after(150, self._detect_rubberband)
-        self.after(240, self._detect_allin1)
+        self.after(240, self._detect_songformer)
+        LOGGER.info("Auto DJ 1.2.3 GUI 启动，主环境 Python=%s", os.sys.executable)
         self.after(100, self._poll)
 
     _SETTING_VARIABLES = {
@@ -185,8 +196,8 @@ class AutoDJApp(tk.Tk):
         "stretch_backend": "stretch_backend_var",
         "rubberband_path": "rb_path_var",
         "max_stretch": "stretch_var",
-        "allin1_enabled": "allin1_enabled_var",
-        "allin1_model": "allin1_model_var",
+        "songformer_enabled": "songformer_enabled_var",
+        "songformer_model": "songformer_model_var",
         "muq_enabled": "muq_enabled_var",
         "auto_muq_sort": "auto_muq_sort_var",
         "preload_enabled": "preload_pair_var",
@@ -199,6 +210,12 @@ class AutoDJApp(tk.Tk):
     }
 
     def _restore_saved_settings(self) -> None:
+        # v1.2.2 defaulted the shared compute device to CPU. Treat that legacy
+        # default as automatic once; users can still explicitly choose CPU later.
+        legacy_device = str(self.saved_settings.get("compute_device", "")).lower()
+        if legacy_device == "cpu" and not self.saved_settings.get("device_default_migrated_v123"):
+            self.saved_settings["compute_device"] = "auto"
+            self.saved_settings["device_default_migrated_v123"] = True
         for key, attribute in self._SETTING_VARIABLES.items():
             variable = getattr(self, attribute, None)
             if variable is None or key not in self.saved_settings:
@@ -246,6 +263,8 @@ class AutoDJApp(tk.Tk):
             variable = getattr(self, attribute, None)
             if variable is not None:
                 values[key] = variable.get()
+        if self.saved_settings.get("device_default_migrated_v123"):
+            values["device_default_migrated_v123"] = True
         try:
             values["window_geometry"] = self.geometry()
         except tk.TclError:
@@ -346,7 +365,7 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! + MuQ + All-In-One Auto DJ 1.0.0", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + MuQ + SongFormer Auto DJ 1.2.3", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
@@ -515,8 +534,8 @@ class AutoDJApp(tk.Tk):
         ).pack(side=tk.LEFT, padx=(14, 0))
         ttk.Button(
             queue_toolbar,
-            text="All-In-One 结构",
-            command=lambda: self._analyze_allin1(force=True, automatic=False),
+            text="SongFormer 结构",
+            command=lambda: self._analyze_songformer(force=True, automatic=False),
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
             queue_toolbar,
@@ -543,7 +562,7 @@ class AutoDJApp(tk.Tk):
             "bpm": "BPM",
             "meter": "拍号",
             "duration": "时长",
-            "structure": "All-In-One结构",
+            "structure": "SongFormer结构",
             "muq": "MuQ风格组",
             "compat": "与下一首",
             "mix": "智能切歌点",
@@ -651,6 +670,9 @@ class AutoDJApp(tk.Tk):
                 "Drop Swap",
                 "Loop Out",
                 "Filter Ride",
+                "Post-Drop Relay",
+                "Breakdown Lift",
+                "Double Drop",
             ),
             state="readonly",
         )
@@ -660,7 +682,7 @@ class AutoDJApp(tk.Tk):
         )
         ttk.Label(
             settings_frame,
-            text="Adaptive Human 会生成多种候选手法，按响度、低频碰撞、频谱连续性、曲线平滑度、立体声和节拍一致性自动选择。",
+            text="Adaptive Human 会先判断 Drop 后接力、Breakdown→Drop、Double Drop、Outro→Intro 等结构意图，再生成并评分多种手法。",
             style="Muted.TLabel",
             wraplength=280,
         ).pack(anchor=tk.W, pady=(0, 8))
@@ -832,66 +854,56 @@ class AutoDJApp(tk.Tk):
         ).pack(fill=tk.X, pady=(0, 12))
 
         ttk.Separator(settings_frame).pack(fill=tk.X, pady=10)
-        ttk.Label(settings_frame, text="All-In-One 歌曲结构", style="Now.TLabel").pack(
+        ttk.Label(settings_frame, text="SongFormer 歌曲结构", style="Now.TLabel").pack(
             anchor=tk.W, pady=(0, 6)
         )
-        self.allin1_enabled_var = tk.BooleanVar(value=True)
+        self.songformer_enabled_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             settings_frame,
-            text="启用 All-In-One 功能段模型",
-            variable=self.allin1_enabled_var,
-            command=lambda: self.engine.set_allin1_enabled(self.allin1_enabled_var.get()),
+            text="启用 SongFormer 官方功能段模型",
+            variable=self.songformer_enabled_var,
+            command=lambda: self.engine.set_songformer_enabled(self.songformer_enabled_var.get()),
         ).pack(anchor=tk.W)
-        ttk.Label(settings_frame, text="All-In-One 模型", style="Muted.TLabel").pack(
+        ttk.Label(settings_frame, text="SongFormer 模型", style="Muted.TLabel").pack(
             anchor=tk.W, pady=(6, 0)
         )
-        self.allin1_model_var = tk.StringVar(value="harmonix-all")
-        allin1_box = ttk.Combobox(
+        self.songformer_model_var = tk.StringVar(value="ASLP-lab/SongFormer")
+        songformer_box = ttk.Combobox(
             settings_frame,
-            textvariable=self.allin1_model_var,
-            values=(
-                "harmonix-all",
-                "harmonix-fold0",
-                "harmonix-fold1",
-                "harmonix-fold2",
-                "harmonix-fold3",
-                "harmonix-fold4",
-                "harmonix-fold5",
-                "harmonix-fold6",
-                "harmonix-fold7",
-            ),
+            textvariable=self.songformer_model_var,
+            values=("ASLP-lab/SongFormer",),
             state="readonly",
         )
-        allin1_box.pack(fill=tk.X, pady=(4, 4))
-        allin1_box.bind(
+        songformer_box.pack(fill=tk.X, pady=(4, 4))
+        songformer_box.bind(
             "<<ComboboxSelected>>",
-            lambda _: self._apply_allin1_model(),
+            lambda _: self._apply_songformer_model(),
         )
-        self.allin1_status_label = ttk.Label(
+        self.songformer_status_label = ttk.Label(
             settings_frame,
-            text="尚未检测 All-In-One。添加歌曲后会在播放前批量分析。",
+            text="尚未检测 SongFormer 独立环境。添加歌曲后会在播放前批量分析。",
             style="Muted.TLabel",
             wraplength=280,
         )
-        self.allin1_status_label.pack(anchor=tk.W, fill=tk.X, pady=(2, 4))
-        allin1_actions = ttk.Frame(settings_frame, style="Card.TFrame")
-        allin1_actions.pack(fill=tk.X, pady=(0, 6))
+        self.songformer_status_label.pack(anchor=tk.W, fill=tk.X, pady=(2, 4))
+        songformer_actions = ttk.Frame(settings_frame, style="Card.TFrame")
+        songformer_actions.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(
-            allin1_actions,
+            songformer_actions,
             text="检测模型",
-            command=self._detect_allin1,
+            command=self._detect_songformer,
         ).pack(side=tk.LEFT)
         ttk.Button(
-            allin1_actions,
+            songformer_actions,
             text="分析全部结构",
-            command=lambda: self._analyze_allin1(force=False, automatic=False),
+            command=lambda: self._analyze_songformer(force=False, automatic=False),
         ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(
             settings_frame,
             text=(
-                "Beat This! 继续负责节拍网格；All-In-One 负责 intro、verse、"
-                "chorus、break、bridge、solo、outro 等功能段。分析会运行 Demucs，"
-                "首次处理较慢，结果会缓存。"
+                "Beat This! 继续负责节拍网格；SongFormer 官方模型负责 intro、"
+                "verse、pre-chorus、chorus、bridge、instrumental、outro 等功能段。"
+                "模型在独立环境运行，首次使用会下载权重，结果会缓存。"
             ),
             style="Muted.TLabel",
             wraplength=280,
@@ -962,7 +974,7 @@ class AutoDJApp(tk.Tk):
             settings_frame,
             text=(
                 "MuQ 排序会同时考虑全局风格、Outro→Intro、局部轨迹、BPM、"
-                "能量、音色和 All-In-One 段落方向；滑动窗口保留一首热下一轨，"
+                "能量、音色和 SongFormer 段落方向；滑动窗口保留一首热下一轨，"
                 "并提前预热后续轨道。内存上限单位为 MB，截止保护单位为秒。"
             ),
             style="Muted.TLabel",
@@ -993,13 +1005,24 @@ class AutoDJApp(tk.Tk):
         ttk.Label(settings_frame, text="计算设备", style="Muted.TLabel").pack(
             anchor=tk.W
         )
-        self.compute_var = tk.StringVar(value="cpu")
-        ttk.Combobox(
+        self.compute_var = tk.StringVar(value="auto")
+        self.compute_combo = ttk.Combobox(
             settings_frame,
             textvariable=self.compute_var,
-            values=("cpu", "cuda", "mps"),
+            values=("auto", "cuda", "cpu", "mps"),
             state="readonly",
-        ).pack(fill=tk.X, pady=(4, 12))
+        )
+        self.compute_combo.pack(fill=tk.X, pady=(4, 4))
+        self.compute_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._apply_compute_device(),
+        )
+        ttk.Label(
+            settings_frame,
+            text="RTX 5070 推荐 auto/cuda；SongFormer CUDA 在独立 worker 环境中检测。",
+            style="Muted.TLabel",
+            wraplength=280,
+        ).pack(anchor=tk.W, pady=(0, 12))
 
         ttk.Label(settings_frame, text="音频输出设备", style="Muted.TLabel").pack(
             anchor=tk.W
@@ -1065,11 +1088,40 @@ class AutoDJApp(tk.Tk):
             style="Muted.TLabel",
         )
         self.cpu_label.grid(row=0, column=1, sticky="e")
+
+        self.analysis_progress_text = ttk.Label(
+            status_card,
+            text="分析进度：空闲",
+            style="Muted.TLabel",
+            justify=tk.LEFT,
+        )
+        self.analysis_progress_text.grid(
+            row=1, column=0, sticky="ew", pady=(7, 3), padx=(0, 12)
+        )
+        self.analysis_progress_percent = ttk.Label(
+            status_card,
+            text="0%",
+            style="Metric.TLabel",
+        )
+        self.analysis_progress_percent.grid(row=1, column=1, sticky="e", pady=(7, 3))
+        self.analysis_progress_var = tk.DoubleVar(value=0.0)
+        self.analysis_progress_bar = ttk.Progressbar(
+            status_card,
+            orient=tk.HORIZONTAL,
+            mode="determinate",
+            maximum=100.0,
+            variable=self.analysis_progress_var,
+        )
+        self.analysis_progress_bar.grid(row=2, column=0, columnspan=2, sticky="ew")
+
         status_card.bind(
             "<Configure>",
-            lambda event: self.status_label.configure(
-                wraplength=max(220, event.width - 180)
-            ),
+            lambda event: [
+                self.status_label.configure(wraplength=max(220, event.width - 180)),
+                self.analysis_progress_text.configure(
+                    wraplength=max(220, event.width - 180)
+                ),
+            ],
         )
 
     def _checkpoint_name(self) -> str:
@@ -1166,73 +1218,110 @@ class AutoDJApp(tk.Tk):
                 foreground="#ffb86c",
             )
 
-    def _apply_allin1_model(self) -> None:
-        self.engine.set_allin1_model(self.allin1_model_var.get())
-        self.allin1_profiles.clear()
-        self.engine.set_preloaded_allin1_profiles({})
+    def _apply_songformer_model(self) -> None:
+        self.engine.set_songformer_model(self.songformer_model_var.get())
+        self.songformer_profiles.clear()
+        self.engine.set_preloaded_songformer_profiles({})
         self.engine.clear_preload()
         self._refresh_tree()
-        self._log("All-In-One 模型已更改，请点击‘分析全部结构’重新生成缓存。")
+        self._log("SongFormer 模型已更改，请点击‘分析全部结构’重新生成缓存。")
 
-    def _detect_allin1(self) -> None:
-        result = probe_allinone()
+    def _detect_songformer(self) -> None:
+        result = probe_songformer(conda_env="songformer-auto-dj")
+        self.songformer_probe_result = dict(result)
         if result.get("ok"):
-            self.allin1_status_label.configure(
+            if result.get("cuda_usable"):
+                detail = (
+                    f"CUDA 可用 · {result.get('device_name', 'NVIDIA GPU')} · "
+                    f"{result.get('capability', '')} · CUDA {result.get('cuda_build', '')}"
+                )
+                colour = "#7ee787"
+            elif result.get("cuda_available"):
+                detail = f"CUDA 检测异常：{result.get('cuda_error', '未知错误')}"
+                colour = "#ffb86c"
+            else:
+                detail = "CUDA 不可用；RTX 5070 请运行 python repair_songformer_cuda.py"
+                colour = "#ffb86c"
+            self.songformer_status_label.configure(
                 text=(
-                    f"All-In-One {result.get('allin1_version', '')} 已就绪 · "
-                    f"NATTEN {result.get('natten_backend', '')}: "
-                    f"{result.get('message', '')}"
+                    f"SongFormer worker 已就绪 · Python {result.get('python', '')} · "
+                    f"Torch {result.get('torch', '')} · {detail}"
                 ),
-                foreground="#7ee787",
+                foreground=colour,
             )
         else:
-            self.allin1_status_label.configure(
+            self.songformer_status_label.configure(
                 text=(
-                    "未安装 All-In-One。运行 python install_allinone.py；"
+                    "未检测到 SongFormer 独立环境。运行 python install_songformer.py；"
                     f"诊断：{result.get('message', '')}"
                 ),
                 foreground="#ffb86c",
             )
 
-    def _analyze_allin1(self, force: bool = False, automatic: bool = False) -> None:
-        if self.allin1_analysis_active:
+    def _analyze_songformer(self, force: bool = False, automatic: bool = False) -> None:
+        if self.songformer_analysis_active:
             if not automatic:
-                messagebox.showinfo("正在分析", "All-In-One 结构分析正在运行。")
+                messagebox.showinfo("正在分析", "SongFormer 结构分析正在运行。")
             return
-        if not self.allin1_enabled_var.get():
+        if not self.songformer_enabled_var.get():
             if automatic:
                 self._continue_after_structure_analysis()
             else:
-                messagebox.showinfo("未启用", "请先勾选启用 All-In-One 功能段模型。")
+                messagebox.showinfo("未启用", "请先勾选启用 SongFormer 官方功能段模型。")
             return
         if not self.tracks:
             if not automatic:
                 messagebox.showinfo("没有歌曲", "请先添加歌曲。")
             return
 
-        self.allin1_analysis_active = True
+        self.songformer_analysis_active = True
         tracks_snapshot = list(self.tracks)
         snapshot_paths = tuple(track.path for track in tracks_snapshot)
-        model = self.allin1_model_var.get()
+        model = self.songformer_model_var.get()
         device = self.compute_var.get()
-        self._log("All-In-One 正在批量分析歌曲结构；首次运行会执行 Demucs…")
+        gpu_required = (
+            device == "cuda"
+            or (
+                device == "auto"
+                and bool(self.songformer_probe_result.get("nvidia_driver_detected"))
+            )
+        )
+        if gpu_required and self.songformer_probe_result and not self.songformer_probe_result.get("cuda_usable"):
+            message = (
+                "系统检测到 NVIDIA 显卡，但 SongFormer worker 无法使用 CUDA。RTX 5070 请先运行 "
+                "python repair_songformer_cuda.py，然后重新启动程序；程序不会静默退回 CPU。"
+            )
+            self.songformer_analysis_active = False
+            self._log(message)
+            if not automatic:
+                messagebox.showerror("SongFormer CUDA 不可用", message)
+            else:
+                self.ui_events.put(("songformer_error", (message, automatic)))
+            return
+        self._log("SongFormer 正在批量分析歌曲结构；首次运行会下载官方权重…")
+        self.ui_events.put(
+            ("analysis_progress", ("SongFormer", 0, len(tracks_snapshot), "加载 worker 与模型"))
+        )
 
         def worker() -> None:
             try:
-                analyzer = AllInOneAnalyzer(model=model, device=device)
+                analyzer = SongFormerAnalyzer(model_name=model, device=device, conda_env="songformer-auto-dj")
                 profiles = analyzer.analyze_many(
                     [track.path for track in tracks_snapshot],
                     status=lambda text: self.ui_events.put(("status", text)),
+                    progress=lambda current, total, detail: self.ui_events.put(
+                        ("analysis_progress", ("SongFormer", current, total, detail))
+                    ),
                     force=force,
                 )
                 self.ui_events.put(
-                    ("allin1_done", (snapshot_paths, profiles, automatic))
+                    ("songformer_done", (snapshot_paths, profiles, automatic))
                 )
             except Exception as exc:
-                self.ui_events.put(("allin1_error", (str(exc), automatic)))
+                self.ui_events.put(("songformer_error", (str(exc), automatic)))
 
         threading.Thread(
-            target=worker, daemon=True, name="AllInOne-Structure"
+            target=worker, daemon=True, name="SongFormer-Structure"
         ).start()
 
     def _continue_after_structure_analysis(self) -> None:
@@ -1240,7 +1329,7 @@ class AutoDJApp(tk.Tk):
             self._log("歌曲结构分析完成，正在进行 MuQ 风格分析与排序…")
             self._rank_with_muq(automatic=True)
         else:
-            self._log("Beat This! 与 All-In-One 分析完成。")
+            self._log("Beat This! 与 SongFormer 分析完成。")
             self._schedule_preload()
 
     def _set_effect_strength(self, value: str) -> None:
@@ -1266,10 +1355,10 @@ class AutoDJApp(tk.Tk):
         self.engine.set_muq_enabled(self.muq_enabled_var.get())
         self.engine.set_muq_device(self.compute_var.get())
         self.engine.set_preloaded_muq_profiles(self.muq_profiles)
-        self.engine.set_allin1_enabled(self.allin1_enabled_var.get())
-        self.engine.set_allin1_device(self.compute_var.get())
-        self.engine.set_allin1_model(self.allin1_model_var.get())
-        self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
+        self.engine.set_songformer_enabled(self.songformer_enabled_var.get())
+        self.engine.set_songformer_device(self.compute_var.get())
+        self.engine.set_songformer_model(self.songformer_model_var.get())
+        self.engine.set_preloaded_songformer_profiles(self.songformer_profiles)
         self.engine.set_preload_window_tracks(int(self.preload_window_var.get()))
         self.engine.set_preload_memory_mb(int(self.preload_memory_var.get()))
         self.engine.set_preload_deadline_seconds(
@@ -1287,7 +1376,7 @@ class AutoDJApp(tk.Tk):
             not self.preload_pair_var.get()
             or not self.tracks
             or self.analysis_active
-            or self.allin1_analysis_active
+            or self.songformer_analysis_active
             or self.muq_ranking_active
             or self.engine.get_status().get("playing")
         ):
@@ -1300,7 +1389,7 @@ class AutoDJApp(tk.Tk):
             not self.preload_pair_var.get()
             or not self.tracks
             or self.analysis_active
-            or self.allin1_analysis_active
+            or self.songformer_analysis_active
             or self.muq_ranking_active
             or self.engine.get_status().get("playing")
         ):
@@ -1330,6 +1419,18 @@ class AutoDJApp(tk.Tk):
         except Exception as exc:
             self._log(f"跳转失败：{exc}")
 
+    def _apply_compute_device(self) -> None:
+        device = self.compute_var.get()
+        try:
+            self.engine.set_muq_device(device)
+            self.engine.set_songformer_device(device)
+            self.engine.clear_preload()
+            self._log(f"计算设备已切换为 {device}；后续分析与预加载将使用新设置")
+            if device in {"auto", "cuda"}:
+                self._detect_songformer()
+        except Exception as exc:
+            self._log(f"切换计算设备失败：{exc}")
+
     def _refresh_devices(self) -> None:
         try:
             entries = {"系统默认": None}
@@ -1352,6 +1453,9 @@ class AutoDJApp(tk.Tk):
             messagebox.showinfo("正在分析", "请等待当前 Beat This! 分析完成。")
             return
         self.analysis_active = True
+        total = len(paths)
+        self.ui_events.put(("analysis_progress", ("Beat This!", -1, total, "准备模型")))
+        LOGGER.info("Beat This! 批量分析开始，共 %d 首", total)
 
         def worker() -> None:
             try:
@@ -1359,17 +1463,30 @@ class AutoDJApp(tk.Tk):
                     checkpoint=self._checkpoint_name(),
                     device=self.compute_var.get(),
                 )
-                for path in paths:
+                for index, path in enumerate(paths):
+                    self.ui_events.put(
+                        ("analysis_progress", ("Beat This!", index, total, path.name))
+                    )
                     try:
                         result = analyzer.analyze(
                             path,
-                            status=lambda text: self.ui_events.put(("status", text)),
+                            status=lambda text, i=index, name=path.name: [
+                                self.ui_events.put(("status", text)),
+                                self.ui_events.put(
+                                    ("analysis_progress", ("Beat This!", i + 0.35, total, name))
+                                ),
+                            ],
                             force=force,
                         )
                         self.ui_events.put(("track", result))
                     except Exception as exc:
                         self.ui_events.put(("error", f"{path.name}：{exc}"))
+                    finally:
+                        self.ui_events.put(
+                            ("analysis_progress", ("Beat This!", index + 1, total, path.name))
+                        )
             finally:
+                LOGGER.info("Beat This! 批量分析阶段结束")
                 self.ui_events.put(("analysis_done", None))
 
         threading.Thread(target=worker, daemon=True, name="BeatThis-Analysis").start()
@@ -1433,12 +1550,12 @@ class AutoDJApp(tk.Tk):
                 state = "窗口预热"
             elif track.path in warm_ready:
                 state = "暖轨就绪"
-            structure_profile = self.allin1_profiles.get(track.path)
+            structure_profile = self.songformer_profiles.get(track.path)
             if structure_profile and structure_profile.available:
                 structure_text = "/".join(
                     label.upper() for label in structure_profile.unique_labels[:4]
                 )
-            elif self.allin1_analysis_active:
+            elif self.songformer_analysis_active:
                 structure_text = "分析中…"
             else:
                 structure_text = "—"
@@ -1477,7 +1594,7 @@ class AutoDJApp(tk.Tk):
         self.muq_ranking_active = True
         tracks_snapshot = list(self.tracks)
         snapshot_paths = tuple(track.path for track in tracks_snapshot)
-        structure_snapshot = dict(self.allin1_profiles)
+        structure_snapshot = dict(self.songformer_profiles)
         status = self.engine.get_status()
         playing = bool(status.get("playing"))
         current_path = str(status.get("current_path") or "")
@@ -1485,19 +1602,32 @@ class AutoDJApp(tk.Tk):
         transitioning = bool(status.get("transitioning"))
         selected_index = self._selected_index()
         self._log("MuQ 正在分析风格并优化播放顺序…")
+        self.ui_events.put(
+            ("analysis_progress", ("MuQ", 0, len(tracks_snapshot), "加载模型"))
+        )
 
         def worker() -> None:
             try:
                 analyzer = MuQAnalyzer(device=self.compute_var.get())
                 profile_map: dict[str, MuQProfile] = {}
                 profiles_in_snapshot: list[MuQProfile] = []
-                for track in tracks_snapshot:
+                total_tracks = len(tracks_snapshot)
+                for track_index, track in enumerate(tracks_snapshot):
+                    self.ui_events.put(
+                        ("analysis_progress", ("MuQ", track_index, total_tracks, track.title))
+                    )
                     profile = analyzer.analyze(
                         track.path,
                         status=lambda text: self.ui_events.put(("status", text)),
+                        progress=lambda fraction, detail, i=track_index, total=total_tracks: self.ui_events.put(
+                            ("analysis_progress", ("MuQ", i + fraction, total, detail))
+                        ),
                     )
                     profile_map[track.path] = profile
                     profiles_in_snapshot.append(profile)
+                    self.ui_events.put(
+                        ("analysis_progress", ("MuQ", track_index + 1, total_tracks, track.title))
+                    )
 
                 group_values = style_clusters(profiles_in_snapshot)
                 group_map = {
@@ -1521,7 +1651,7 @@ class AutoDJApp(tk.Tk):
 
                 segment_profiles = [profile_map[track.path] for track in segment]
                 segment_structures = [
-                    structure_snapshot.get(track.path, AllInOneProfile())
+                    structure_snapshot.get(track.path, SongFormerProfile())
                     for track in segment
                 ]
                 order, _scores = rank_playlist(
@@ -1578,7 +1708,7 @@ class AutoDJApp(tk.Tk):
             self.muq_profiles.pop(removed.path, None)
             self.muq_groups.pop(removed.path, None)
             self.muq_pair_scores.pop(removed.path, None)
-            self.allin1_profiles.pop(removed.path, None)
+            self.songformer_profiles.pop(removed.path, None)
             self.engine.clear_preload()
             self._refresh_tree()
             self._schedule_preload()
@@ -1589,7 +1719,7 @@ class AutoDJApp(tk.Tk):
         self.muq_profiles.clear()
         self.muq_groups.clear()
         self.muq_pair_scores.clear()
-        self.allin1_profiles.clear()
+        self.songformer_profiles.clear()
         self.engine.clear_preload()
         self._refresh_tree()
 
@@ -1652,7 +1782,48 @@ class AutoDJApp(tk.Tk):
         self.engine.set_max_stretch_percent(number)
 
     def _log(self, text: str) -> None:
-        self.status_label.configure(text=text)
+        message = str(text)
+        self.status_label.configure(text=message)
+        LOGGER.info(message)
+
+    def _set_analysis_progress(
+        self,
+        phase: str,
+        current: float,
+        total: float,
+        detail: str = "",
+    ) -> None:
+        total_value = max(float(total), 1.0)
+        text = f"分析进度 · {phase}"
+        if detail:
+            text += f" · {detail}"
+
+        if float(current) < 0.0:
+            self.analysis_progress_bar.configure(mode="indeterminate")
+            self.analysis_progress_bar.start(12)
+            self.analysis_progress_percent.configure(text="…")
+            self.analysis_progress_text.configure(text=text)
+            return
+
+        self.analysis_progress_bar.stop()
+        self.analysis_progress_bar.configure(mode="determinate", maximum=100.0)
+        current_value = min(max(float(current), 0.0), total_value)
+        percent = 100.0 * current_value / total_value
+        self.analysis_progress_var.set(percent)
+        self.analysis_progress_percent.configure(text=f"{percent:.0f}%")
+        count_text = (
+            f"{current_value:.1f}/{total_value:.0f}"
+            if current_value % 1
+            else f"{int(current_value)}/{int(total_value)}"
+        )
+        self.analysis_progress_text.configure(text=f"{text} · {count_text}")
+
+    def _finish_analysis_progress(self, text: str = "全部分析完成") -> None:
+        self.analysis_progress_bar.stop()
+        self.analysis_progress_bar.configure(mode="determinate", maximum=100.0)
+        self.analysis_progress_var.set(100.0)
+        self.analysis_progress_percent.configure(text="100%")
+        self.analysis_progress_text.configure(text=f"分析进度 · {text}")
 
     def _poll_ui_events(self) -> None:
         while True:
@@ -1662,6 +1833,11 @@ class AutoDJApp(tk.Tk):
                 break
             if kind == "status":
                 self._log(str(payload))
+            elif kind == "analysis_progress":
+                phase, current, total, detail = payload  # type: ignore[misc]
+                self._set_analysis_progress(
+                    str(phase), float(current), float(total), str(detail)
+                )
             elif kind == "track":
                 self._insert_or_replace_track(payload)  # type: ignore[arg-type]
             elif kind == "error":
@@ -1669,43 +1845,44 @@ class AutoDJApp(tk.Tk):
                 messagebox.showerror("Beat This! 分析失败", str(payload))
             elif kind == "analysis_done":
                 self.analysis_active = False
-                if self.allin1_enabled_var.get():
-                    self._log("Beat This! 完成，正在运行 All-In-One 功能段分析…")
-                    self._analyze_allin1(force=False, automatic=True)
+                if self.songformer_enabled_var.get():
+                    self._log("Beat This! 完成，正在运行 SongFormer 功能段分析…")
+                    self._analyze_songformer(force=False, automatic=True)
                 else:
                     self._continue_after_structure_analysis()
-            elif kind == "allin1_done":
+            elif kind == "songformer_done":
                 snapshot_paths, profiles, automatic = payload  # type: ignore[misc]
-                self.allin1_analysis_active = False
+                self.songformer_analysis_active = False
                 current_paths = tuple(track.path for track in self.tracks)
                 if set(snapshot_paths) != set(current_paths):
-                    self._log("队列在结构分析期间发生变化，重新分析 All-In-One…")
-                    self._analyze_allin1(force=False, automatic=True)
+                    self._log("队列在结构分析期间发生变化，重新分析 SongFormer…")
+                    self._analyze_songformer(force=False, automatic=True)
                     continue
-                self.allin1_profiles.update(dict(profiles))
-                self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
+                self.songformer_profiles.update(dict(profiles))
+                self.engine.set_preloaded_songformer_profiles(self.songformer_profiles)
                 self._refresh_tree()
                 available = sum(
-                    1 for profile in self.allin1_profiles.values() if profile.available
+                    1 for profile in self.songformer_profiles.values() if profile.available
                 )
-                self.allin1_status_label.configure(
-                    text=f"All-In-One 已完成 {available}/{len(self.tracks)} 首结构分析",
+                self.songformer_status_label.configure(
+                    text=f"SongFormer 已完成 {available}/{len(self.tracks)} 首结构分析",
                     foreground="#7ee787",
                 )
                 if automatic:
                     self._continue_after_structure_analysis()
                 else:
-                    self._log(f"All-In-One 结构分析完成：{available} 首")
+                    self._log(f"SongFormer 结构分析完成：{available} 首")
+                    self._finish_analysis_progress("SongFormer 分析完成")
                     self._schedule_preload(delay_ms=150)
-            elif kind == "allin1_error":
+            elif kind == "songformer_error":
                 message, automatic = payload  # type: ignore[misc]
-                self.allin1_analysis_active = False
-                self.allin1_status_label.configure(
-                    text=f"All-In-One 失败：{message}", foreground="#ffb86c"
+                self.songformer_analysis_active = False
+                self.songformer_status_label.configure(
+                    text=f"SongFormer 失败：{message}", foreground="#ffb86c"
                 )
-                self._log(f"All-In-One 失败，保留本地结构估计：{message}")
+                self._log(f"SongFormer 失败，保留本地结构估计：{message}")
                 if not automatic:
-                    messagebox.showerror("All-In-One 分析失败", str(message))
+                    messagebox.showerror("SongFormer 分析失败", str(message))
                 if automatic:
                     self._continue_after_structure_analysis()
                 else:
@@ -1737,7 +1914,7 @@ class AutoDJApp(tk.Tk):
                 self.muq_pair_scores = dict(pair_map)
                 self.tracks = list(ordered_tracks)
                 self.engine.set_preloaded_muq_profiles(self.muq_profiles)
-                self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
+                self.engine.set_preloaded_songformer_profiles(self.songformer_profiles)
                 if self.engine.get_status().get("playing"):
                     try:
                         self.engine.update_playlist_order(self.tracks)
@@ -1755,9 +1932,11 @@ class AutoDJApp(tk.Tk):
                     "MuQ 平滑排序完成："
                     f"平均 {average * 100:.0f}分 · 最弱相邻边 {worst * 100:.0f}分"
                 )
+                self._finish_analysis_progress("分析、排序与队列更新完成")
                 self._schedule_preload(delay_ms=150)
             elif kind == "muq_error":
                 self.muq_ranking_active = False
+                self.analysis_progress_text.configure(text=f"分析进度 · MuQ 失败 · {payload}")
                 self._log(f"MuQ 排序失败：{payload}")
                 messagebox.showerror("MuQ 排序失败", str(payload))
                 self._schedule_preload()
@@ -1792,6 +1971,8 @@ class AutoDJApp(tk.Tk):
         policy_mode = str(status.get("policy_mode", "AutoMix-like"))
         archetype = str(status.get("human_archetype", ""))
         archetype_text = f" · {archetype}" if archetype else ""
+        dj_intent = str(status.get("dj_intent", "") or "")
+        intent_text = f" · {dj_intent}" if dj_intent else ""
         current_function = str(status.get("current_function_label", "") or "")
         next_function = str(status.get("next_function_label", "") or "")
         function_text = (
@@ -1803,7 +1984,7 @@ class AutoDJApp(tk.Tk):
         self.plan_label.configure(
             text=(
                 f"真人化切歌：A OUT {format_time(float(start))}  →  "
-                f"B IN {format_time(float(entry))} · {bars_text}{archetype_text}"
+                f"B IN {format_time(float(entry))} · {bars_text}{intent_text}{archetype_text}"
                 f"{function_text} · {transition_mode} / {policy_mode}{tempo_text}"
             )
         )
@@ -1817,9 +1998,15 @@ class AutoDJApp(tk.Tk):
                 f"{str(status.get('current_key', '—'))}→{str(status.get('next_key', '—'))}\n"
                 f"Cue 对齐  {float(metrics.get('cue_alignment', 0.0)) * 100:5.0f}\n"
                 f"Phrase    {float(metrics.get('phrase_alignment', 0.0)) * 100:5.0f}\n"
-                f"AIO 边界  {float(metrics.get('allin1_boundary', 0.0)) * 100:5.0f}\n"
-                f"AIO 角色  {float(metrics.get('allin1_role_compatibility', 0.0)) * 100:5.0f}  "
+                f"SF 边界   {float(metrics.get('songformer_boundary', 0.0)) * 100:5.0f}\n"
+                f"SF 角色   {float(metrics.get('songformer_role_compatibility', 0.0)) * 100:5.0f}  "
                 f"{str(status.get('current_function_label', '—'))}→{str(status.get('next_function_label', '—'))}\n"
+                f"DJ 意图   {str(status.get('dj_intent', '—'))}\n"
+                f"角色路径  {str(status.get('current_role', '—'))}→{str(status.get('next_role', '—'))}→{str(status.get('next_landing_role', '—'))}\n"
+                f"结构策略  {float(metrics.get('dj_phrase_policy', 0.0)) * 100:5.0f}\n"
+                f"Drop落点  {float(metrics.get('dj_drop_landing', 0.0)) * 100:5.0f}\n"
+                f"Drop后出  {float(metrics.get('dj_post_drop', 0.0)) * 100:5.0f}\n"
+                f"能量轨迹  {float(metrics.get('dj_energy_arc', 0.0)) * 100:5.0f}\n"
                 f"节奏      {float(metrics.get('rhythm', 0.0)) * 100:5.0f}\n"
                 f"低频净度  {float(metrics.get('bass_clean', 0.0)) * 100:5.0f}\n"
                 f"人声避让  {float(metrics.get('vocal_clean', 0.0)) * 100:5.0f}\n"

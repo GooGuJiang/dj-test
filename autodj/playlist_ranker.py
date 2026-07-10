@@ -6,7 +6,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .models import AllInOneProfile, MuQProfile, TrackAnalysis
+from .models import SongFormerProfile, MuQProfile, TrackAnalysis
 from .muq_analyzer import cosine_similarity
 
 
@@ -73,7 +73,7 @@ def _acoustic_subscores(a: MuQProfile, b: MuQProfile) -> tuple[float, float]:
     return float(np.clip(acoustic, 0.0, 1.0)), float(np.clip(energy, 0.0, 1.0))
 
 
-def _edge_labels(profile: AllInOneProfile | None) -> tuple[str, str]:
+def _edge_labels(profile: SongFormerProfile | None) -> tuple[str, str]:
     if profile is None or not profile.available:
         return "unknown", "unknown"
     labels = [segment.label.lower() for segment in profile.segments]
@@ -84,8 +84,8 @@ def _edge_labels(profile: AllInOneProfile | None) -> tuple[str, str]:
 
 
 def _structure_score(
-    outgoing: AllInOneProfile | None,
-    incoming: AllInOneProfile | None,
+    outgoing: SongFormerProfile | None,
+    incoming: SongFormerProfile | None,
 ) -> float:
     in_a, out_a = _edge_labels(outgoing)
     in_b, out_b = _edge_labels(incoming)
@@ -126,8 +126,8 @@ def transition_compatibility(
     incoming: TrackAnalysis,
     profile_a: MuQProfile,
     profile_b: MuQProfile,
-    structure_a: AllInOneProfile | None = None,
-    structure_b: AllInOneProfile | None = None,
+    structure_a: SongFormerProfile | None = None,
+    structure_b: SongFormerProfile | None = None,
 ) -> PairScore:
     """Directional A→B compatibility for playlist ordering."""
     if profile_a.available and profile_b.available:
@@ -182,7 +182,7 @@ def rank_playlist(
     profiles: Sequence[MuQProfile],
     start_index: int = 0,
     beam_width: int = 192,
-    structures: Sequence[AllInOneProfile] | None = None,
+    structures: Sequence[SongFormerProfile] | None = None,
 ) -> tuple[list[int], dict[tuple[int, int], PairScore]]:
     """Beam-search ordering with weak-edge and energy-zigzag penalties."""
     count = len(tracks)

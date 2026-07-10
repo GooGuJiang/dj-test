@@ -16,14 +16,13 @@ except ImportError:  # 允许在无声卡/测试环境中导入匹配与 DSP 模
 from scipy import signal
 
 from .edm_structure import analyze_edm_structure
-from .allinone_analyzer import AllInOneAnalyzer
-from .allinone_structure import fuse_allinone_structure
+from .songformer_structure import fuse_songformer_structure
 from .human_transition import (
     HumanTransitionConfig,
     SUPPORTED_ARCHETYPES,
     render_human_transition,
 )
-from .models import AllInOneProfile, MuQProfile, PreparedTrack, TrackAnalysis, TransitionPlan
+from .models import SongFormerProfile, MuQProfile, PreparedTrack, TrackAnalysis, TransitionPlan
 from .muq_analyzer import MuQAnalyzer
 from .spectral_seam import spectral_seam_crossfade
 from .time_stretch import (
@@ -64,16 +63,16 @@ class EngineConfig:
     min_complex_score: float = 0.60
     # MuQ semantic/style embeddings are optional but enabled by default.
     muq_enabled: bool = True
-    muq_device: str = "cpu"
+    muq_device: str = "auto"
     muq_model_name: str = "OpenMuQ/MuQ-large-msd-iter"
-    # All-In-One provides functional structure boundaries/labels. Beat This!
+    # SongFormer provides functional structure boundaries/labels. Beat This!
     # remains the timing authority so both outputs share one stable beat grid.
-    allin1_enabled: bool = True
-    allin1_device: str = "cpu"
-    allin1_model_name: str = "harmonix-all"
+    songformer_enabled: bool = True
+    songformer_device: str = "auto"
+    songformer_model_name: str = "ASLP-lab/SongFormer"
     # GUI performs batch analysis before playback. Keeping runtime inference off
-    # prevents Demucs/All-In-One from unexpectedly blocking next-track preload.
-    allin1_runtime_inference: bool = False
+    # prevents SongFormer inference from unexpectedly blocking next-track preload.
+    songformer_runtime_inference: bool = False
     # Generate several context-aware DJ techniques and select the best with
     # reference-aware transition quality metrics.
     human_style_mode: str = "Adaptive Human"
@@ -264,7 +263,6 @@ class AutoDJEngine:
         self._loader_generation = 0
         self._last_callback_status = ""
         self._muq_analyzer: MuQAnalyzer | None = None
-        self._allin1_analyzer: AllInOneAnalyzer | None = None
         # Recent chosen techniques are used to avoid machine-like repetition.
         self._transition_history: list[str] = []
 
@@ -281,7 +279,7 @@ class AutoDJEngine:
         # 外部 MuQ 排序器已经分析过的 profile 可直接注入，避免音频引擎
         # 在准备下一首时再次运行大模型。
         self._preloaded_muq_profiles: dict[str, MuQProfile] = {}
-        self._preloaded_allin1_profiles: dict[str, AllInOneProfile] = {}
+        self._preloaded_songformer_profiles: dict[str, SongFormerProfile] = {}
 
         # Sliding-window preloader. The immediate next track is rendered hot in
         # self._next; later tracks are kept as synchronized warm PreparedTrack
@@ -338,25 +336,16 @@ class AutoDJEngine:
             self.emit(f"MuQ 回退到传统特征：{analysis.title} · {exc}")
             return MuQProfile(backend="fallback")
 
-    def _get_allin1_profile(self, analysis: TrackAnalysis) -> AllInOneProfile:
-        if not self.config.allin1_enabled:
-            return AllInOneProfile()
-        cached = self._preloaded_allin1_profiles.get(analysis.path)
+    def _get_songformer_profile(self, analysis: TrackAnalysis) -> SongFormerProfile:
+        if not self.config.songformer_enabled:
+            return SongFormerProfile()
+        cached = self._preloaded_songformer_profiles.get(analysis.path)
         if cached is not None and cached.available:
             return cached
-        if not self.config.allin1_runtime_inference:
-            self.emit(f"All-In-One 尚未预分析：{analysis.title}，使用本地结构估计")
-            return AllInOneProfile(backend="not-preloaded")
-        try:
-            if self._allin1_analyzer is None:
-                self._allin1_analyzer = AllInOneAnalyzer(
-                    model=self.config.allin1_model_name,
-                    device=self.config.allin1_device,
-                )
-            return self._allin1_analyzer.analyze(analysis.path, status=self.emit)
-        except Exception as exc:
-            self.emit(f"All-In-One 回退到本地结构估计：{analysis.title} · {exc}")
-            return AllInOneProfile(backend="fallback")
+        # SongFormer is deliberately batch-preloaded in its isolated worker.
+        # Never launch a 0.7B structure model from the real-time preload path.
+        self.emit(f"SongFormer 尚未预分析：{analysis.title}，使用本地结构估计")
+        return SongFormerProfile(backend="not-preloaded")
 
     def _finish_prepared_track(
         self,
@@ -378,7 +367,7 @@ class AutoDJEngine:
         tempo_restore_end: int = -1,
         tempo_restore_bars: int = 0,
         muq_profile: MuQProfile | None = None,
-        allin1_profile: AllInOneProfile | None = None,
+        songformer_profile: SongFormerProfile | None = None,
         stretch_backend: str = "librosa",
     ) -> PreparedTrack:
         low, mid, high = _split_three_bands(
@@ -401,11 +390,11 @@ class AutoDJEngine:
             features=features,
             beats_per_bar=max(2, analysis.beats_per_bar),
         )
-        allin1_profile = allin1_profile or AllInOneProfile()
-        if allin1_profile.available:
-            structure = fuse_allinone_structure(
+        songformer_profile = songformer_profile or SongFormerProfile()
+        if songformer_profile.available:
+            structure = fuse_songformer_structure(
                 base=structure,
-                profile=allin1_profile,
+                profile=songformer_profile,
                 features=features,
                 source_downbeat_samples=source_downbeat_samples,
                 sample_rate=self.config.sample_rate,
@@ -436,7 +425,7 @@ class AutoDJEngine:
             tempo_restore_bars=int(tempo_restore_bars),
             structure=structure,
             muq_profile=muq_profile or MuQProfile(),
-            allin1_profile=allin1_profile,
+            songformer_profile=songformer_profile,
             stretch_backend=stretch_backend,
         )
 
@@ -533,7 +522,7 @@ class AutoDJEngine:
                 cue_sample = int(candidates[0])
 
         muq_profile = self._get_muq_profile(analysis)
-        allin1_profile = self._get_allin1_profile(analysis)
+        songformer_profile = self._get_songformer_profile(analysis)
         return self._finish_prepared_track(
             analysis=analysis,
             audio=audio,
@@ -549,7 +538,7 @@ class AutoDJEngine:
             source_downbeat_samples=source_downbeats,
             cue_sample=cue_sample,
             muq_profile=muq_profile,
-            allin1_profile=allin1_profile,
+            songformer_profile=songformer_profile,
             stretch_backend=stretch_backend,
         )
 
@@ -712,7 +701,7 @@ class AutoDJEngine:
             tempo_restore_end=restore_end,
             tempo_restore_bars=bars,
             muq_profile=synced.muq_profile,
-            allin1_profile=synced.allin1_profile,
+            songformer_profile=synced.songformer_profile,
             stretch_backend=backend,
         )
         self.emit(
@@ -783,9 +772,9 @@ class AutoDJEngine:
             self.config.time_stretch_backend,
             self.config.muq_enabled,
             self.config.muq_device,
-            self.config.allin1_enabled,
-            self.config.allin1_device,
-            self.config.allin1_model_name,
+            self.config.songformer_enabled,
+            self.config.songformer_device,
+            self.config.songformer_model_name,
             self.config.preload_window_tracks,
             self.config.preload_memory_mb,
         )
@@ -930,12 +919,12 @@ class AutoDJEngine:
         with self._lock:
             self._preloaded_muq_profiles = dict(profiles)
 
-    def set_preloaded_allin1_profiles(
-        self, profiles: dict[str, AllInOneProfile]
+    def set_preloaded_songformer_profiles(
+        self, profiles: dict[str, SongFormerProfile]
     ) -> None:
-        """注入 GUI 已完成的 All-In-One 结构结果，避免播放时重复推理。"""
+        """注入 GUI 已完成的 SongFormer 结构结果，避免播放时重复推理。"""
         with self._lock:
-            self._preloaded_allin1_profiles = dict(profiles)
+            self._preloaded_songformer_profiles = dict(profiles)
 
     def clear_preload(self) -> None:
         with self._lock:
@@ -1208,6 +1197,13 @@ class AutoDJEngine:
             transition_mode=mode,
             policy_mode=policy,
             switch_position=0.50,
+            dj_intent=base_plan.dj_intent,
+            current_role=base_plan.current_role,
+            current_landing_role=base_plan.current_landing_role,
+            next_role=base_plan.next_role,
+            next_landing_role=base_plan.next_landing_role,
+            structure_policy_score=base_plan.structure_policy_score,
+            recommended_archetypes=base_plan.recommended_archetypes,
         )
 
     def _apply_automix_policy(
@@ -1232,10 +1228,31 @@ class AutoDJEngine:
         ))
         cue = float(plan.metrics.get("cue_alignment", 0.0))
         phrase = float(plan.metrics.get("phrase_alignment", 0.0))
-        complex_confidence = 0.58 * plan.score + 0.24 * edm_pair + 0.11 * cue + 0.07 * phrase
+        structure_policy = float(np.clip(plan.structure_policy_score, 0.0, 1.0))
+        complex_confidence = (
+            0.43 * plan.score
+            + 0.20 * edm_pair
+            + 0.10 * cue
+            + 0.07 * phrase
+            + 0.20 * structure_policy
+        )
         plan.metrics["automix_confidence"] = float(np.clip(complex_confidence, 0.0, 1.0))
-        if complex_confidence >= self.config.min_complex_score:
-            plan.policy_mode = "Complex DJ transition"
+        if (
+            complex_confidence >= self.config.min_complex_score
+            or (
+                structure_policy >= 0.72
+                and plan.dj_intent
+                in {
+                    "Post-Drop Relay",
+                    "Breakdown Lift",
+                    "Phrase-to-Drop",
+                    "Double Drop",
+                    "Outro-Intro Blend",
+                    "Vocal Echo Exit",
+                }
+            )
+        ):
+            plan.policy_mode = f"Structure-aware · {plan.dj_intent}"
             return plan
         if plan.score >= 0.43 or cue >= 0.46:
             return self._simple_transition_plan(
@@ -1316,12 +1333,12 @@ class AutoDJEngine:
         a_harm, a_perc = self._hpss_stereo(a_body)
         b_harm, b_perc = self._hpss_stereo(b_body)
 
-        current_label = (
+        current_label = plan.current_role or (
             current.structure.labels[plan.current_bar_index]
             if plan.current_bar_index < len(current.structure.labels)
             else "SECTION"
         )
-        next_label = (
+        next_label = plan.next_role or (
             next_track.structure.labels[plan.next_bar_index]
             if plan.next_bar_index < len(next_track.structure.labels)
             else "SECTION"
@@ -1530,7 +1547,7 @@ class AutoDJEngine:
                             "专业切歌已规划："
                             f"A {plan.current_start / self.config.sample_rate:.1f}s → "
                             f"B {plan.next_start / self.config.sample_rate:.1f}s | "
-                            f"{(str(plan.bars) + ' 小节') if plan.bars else '无缝裁切'} | {plan.transition_mode} | "
+                            f"{(str(plan.bars) + ' 小节') if plan.bars else '无缝裁切'} | {plan.dj_intent} | {plan.transition_mode} | "
                             f"匹配 {plan.score * 100:.0f}分"
                         )
 
@@ -2008,26 +2025,29 @@ class AutoDJEngine:
         self.rebuild_transition()
 
     def set_muq_device(self, device: str) -> None:
-        if device not in {"cpu", "cuda", "mps"}:
+        if device not in {"auto", "cpu", "cuda", "mps"}:
             raise ValueError(f"未知 MuQ 设备：{device}")
         self.config.muq_device = device
         self._muq_analyzer = None
 
-    def set_allin1_enabled(self, enabled: bool) -> None:
-        self.config.allin1_enabled = bool(enabled)
+    def set_songformer_enabled(self, enabled: bool) -> None:
+        self.config.songformer_enabled = bool(enabled)
         self.rebuild_transition()
 
-    def set_allin1_device(self, device: str) -> None:
-        if device not in {"cpu", "cuda", "mps"}:
-            raise ValueError(f"未知 All-In-One 设备：{device}")
-        self.config.allin1_device = device
-        self._allin1_analyzer = None
+    def set_songformer_device(self, device: str) -> None:
+        if device not in {"auto", "cpu", "cuda", "mps"}:
+            raise ValueError(f"未知 SongFormer 设备：{device}")
+        self.config.songformer_device = device
 
-    def set_allin1_model(self, model: str) -> None:
-        if not model.startswith("harmonix-"):
-            raise ValueError(f"未知 All-In-One 模型：{model}")
-        self.config.allin1_model_name = model
-        self._allin1_analyzer = None
+    def set_songformer_model(self, model: str) -> None:
+        model = str(model).strip()
+        if not model:
+            raise ValueError("SongFormer 模型名称不能为空。")
+        if model != "ASLP-lab/SongFormer":
+            raise ValueError(f"当前版本仅支持官方模型 ASLP-lab/SongFormer：{model}")
+        if self.config.songformer_model_name == model:
+            return
+        self.config.songformer_model_name = model
         self.rebuild_transition()
 
     def set_preload_window_tracks(self, value: int) -> None:
@@ -2044,7 +2064,7 @@ class AutoDJEngine:
 
     @staticmethod
     def _timeline_sections(track: PreparedTrack | None) -> tuple[tuple[float, float, str], ...]:
-        if track is None or not track.allin1_profile.available:
+        if track is None or not track.songformer_profile.available:
             return ()
         source_grid = np.asarray(track.source_downbeat_samples, dtype=np.float64)
         target_grid = np.asarray(track.downbeat_samples, dtype=np.float64)
@@ -2067,7 +2087,7 @@ class AutoDJEngine:
 
         return tuple(
             (mapped(segment.start), mapped(segment.end), segment.label.upper())
-            for segment in track.allin1_profile.segments
+            for segment in track.songformer_profile.segments
             if segment.end > segment.start
         )
 
@@ -2134,6 +2154,12 @@ class AutoDJEngine:
                     "human_quality_metrics": {},
                     "transition_mode": "",
                     "policy_mode": self.config.automix_policy,
+                    "dj_intent": "",
+                    "current_role": "",
+                    "current_landing_role": "",
+                    "next_role": "",
+                    "next_landing_role": "",
+                    "structure_policy_score": 0.0,
                     "stretch_backend": "",
                     "current_key": "—",
                     "next_key": "—",
@@ -2147,7 +2173,7 @@ class AutoDJEngine:
                     "next_structure_source": "",
                     "current_function_label": "",
                     "next_function_label": "",
-                    "allin1_enabled": self.config.allin1_enabled,
+                    "songformer_enabled": self.config.songformer_enabled,
                     "switch_time_a": None,
                     "switch_time_b": None,
                     "plan_signature": None,
@@ -2202,6 +2228,8 @@ class AutoDJEngine:
                 plan.transition_mode,
                 plan.policy_mode,
                 plan.human_archetype,
+                plan.dj_intent,
+                plan.next_landing_role,
                 round(plan.human_quality_score, 3),
             ) if plan else None
 
@@ -2284,6 +2312,12 @@ class AutoDJEngine:
                 "human_quality_metrics": dict(plan.human_quality_metrics) if plan else {},
                 "transition_mode": plan.transition_mode if plan else "",
                 "policy_mode": plan.policy_mode if plan else self.config.automix_policy,
+                "dj_intent": plan.dj_intent if plan else "",
+                "current_role": plan.current_role if plan else "",
+                "current_landing_role": plan.current_landing_role if plan else "",
+                "next_role": plan.next_role if plan else "",
+                "next_landing_role": plan.next_landing_role if plan else "",
+                "structure_policy_score": plan.structure_policy_score if plan else 0.0,
                 "stretch_backend": next_track.stretch_backend if next_track else current.stretch_backend,
                 "current_key": current.structure.camelot,
                 "next_key": next_track.structure.camelot if next_track else "—",
@@ -2313,7 +2347,7 @@ class AutoDJEngine:
                     if plan and next_track and plan.next_bar_index < len(next_track.structure.functional_labels)
                     else ""
                 ),
-                "allin1_enabled": self.config.allin1_enabled,
+                "songformer_enabled": self.config.songformer_enabled,
                 "switch_time_a": plan.switch_sample_a / self.config.sample_rate if plan else None,
                 "switch_time_b": plan.switch_sample_b / self.config.sample_rate if plan else None,
                 "plan_signature": signature,

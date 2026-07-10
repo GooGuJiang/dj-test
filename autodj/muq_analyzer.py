@@ -12,6 +12,7 @@ import numpy as np
 from .models import MuQProfile
 
 StatusCallback = Callable[[str], None]
+ProgressCallback = Callable[[float, str], None]
 
 
 def _l2_normalize(vector: np.ndarray) -> np.ndarray:
@@ -87,16 +88,11 @@ class MuQAnalyzer:
                     "MuQ 尚未安装。请运行 python install_muq.py，或在 GUI 中关闭 MuQ。"
                 ) from exc
 
-            requested = self.device.lower().strip()
-            if requested == "cuda" and not torch.cuda.is_available():
-                requested = "cpu"
-            if requested == "mps":
-                available = bool(
-                    getattr(torch.backends, "mps", None)
-                    and torch.backends.mps.is_available()
-                )
-                if not available:
-                    requested = "cpu"
+            requested = self.device.lower().strip() or "auto"
+            from .compute_device import resolve_torch_device
+            requested = resolve_torch_device(
+                requested, strict_cuda=requested.startswith("cuda")
+            )
             self.device = requested
             model = MuQ.from_pretrained(self.model_name)
             model = model.to(self.device).eval()
@@ -207,6 +203,7 @@ class MuQAnalyzer:
         self,
         path: str | Path,
         status: StatusCallback | None = None,
+        progress: ProgressCallback | None = None,
         force: bool = False,
     ) -> MuQProfile:
         path = Path(path).expanduser().resolve()
@@ -217,10 +214,14 @@ class MuQAnalyzer:
             if cached is not None:
                 if status:
                     status(f"MuQ 缓存：{path.name}")
+                if progress:
+                    progress(1.0, f"{path.name} · 缓存")
                 return cached
 
         if status:
             status(f"MuQ 正在分析风格与段落语义：{path.name}")
+        if progress:
+            progress(0.05, f"{path.name} · 解码音频")
         waveform, sample_rate = librosa.load(path, sr=24_000, mono=True, dtype=np.float32)
         if waveform.size < sample_rate:
             waveform = np.pad(waveform, (0, sample_rate - waveform.size))
@@ -254,6 +255,11 @@ class MuQAnalyzer:
                 )
             clip = waveform[int(start) : int(start) + segment_length]
             embeddings.append(self._embed_clip(clip))
+            if progress:
+                progress(
+                    0.10 + 0.78 * ((index + 1) / max(len(starts), 1)),
+                    f"{path.name} · 语义窗口 {index + 1}/{len(starts)}",
+                )
 
         timeline = np.stack(embeddings).astype(np.float32)
         global_embedding = _l2_normalize(np.mean(timeline, axis=0))
@@ -267,7 +273,11 @@ class MuQAnalyzer:
             backend=f"MuQ large / {self.device}",
             model_name=self.model_name,
         )
+        if progress:
+            progress(0.94, f"{path.name} · 写入缓存")
         self._write_cache(path, profile)
         if status:
             status(f"MuQ 分析完成：{path.name}")
+        if progress:
+            progress(1.0, f"{path.name} · 完成")
         return profile

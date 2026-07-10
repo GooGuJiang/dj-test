@@ -374,7 +374,9 @@ class DJTimeline(tk.Canvas):
             )
         if next_end is not None and next_duration > 0:
             x = self._x(float(next_end), next_duration, left, plot_width)
-            self._marker(x, top_b, bottom_b, "MIX END", "#ffd166", anchor="ne")
+            landing_role = str(status.get("next_landing_role", "") or "").upper()
+            end_label = "DROP LAND" if landing_role in {"DROP", "CHORUS"} else "MIX END"
+            self._marker(x, top_b, bottom_b, end_label, "#ffd166", anchor="ne")
 
         switch_a = status.get("switch_time_a")
         switch_b = status.get("switch_time_b")
