@@ -56,7 +56,7 @@ class FunctionalSegment:
 
 @dataclass
 class AllInOneProfile:
-    """All-In-One functional structure analysis, aligned to original audio time."""
+    """All-In-One functional structure profile cached by the DJ application."""
 
     bpm: float = 0.0
     beats: tuple[float, ...] = ()
@@ -125,7 +125,7 @@ class AllInOneProfile:
             ),
             backend=str(data.get("backend", "cache")),
             model_name=str(data.get("model_name", "harmonix-all")),
-            natten_backend=str(data.get("natten_backend", "unknown")),
+            natten_backend=str(data.get("natten_backend", data.get("runtime_backend", "unknown"))),
         )
 
 
@@ -351,6 +351,14 @@ class TransitionPlan:
     human_archetype: str = ""
     human_quality_score: float = 0.0
     human_quality_metrics: dict[str, float] = field(default_factory=dict)
+    # Structure-aware DJ phrase policy selected before rendering.
+    dj_intent: str = "Safe Phrase Blend"
+    current_role: str = "SECTION"
+    current_landing_role: str = "SECTION"
+    next_role: str = "SECTION"
+    next_landing_role: str = "SECTION"
+    structure_policy_score: float = 0.0
+    recommended_archetypes: tuple[str, ...] = ()
 
     @property
     def current_end(self) -> int:

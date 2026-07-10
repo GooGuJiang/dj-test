@@ -49,15 +49,15 @@ def main() -> None:
         print("MuQ: 未安装或导入失败：", exc)
         print("运行 python install_muq.py 后可启用风格排序；Beat This! 播放仍可使用。")
 
-    aio = probe_allinone()
-    if aio.get("ok"):
+    allin1 = probe_allinone()
+    if allin1.get("ok"):
         print(
-            "All-In-One:", aio.get("allin1_version"),
-            "· NATTEN", aio.get("natten_backend")
+            "All-In-One:", allin1.get("allin1_version"),
+            "· 主进程后台线程 · NATTEN", allin1.get("natten_backend")
         )
     else:
-        print("All-In-One: 未安装；运行 python install_allinone.py")
-        print("All-In-One 诊断:", aio.get("message"))
+        print("All-In-One: 当前主环境未安装；运行 python install_allinone.py")
+        print("All-In-One 诊断:", allin1.get("message"))
 
     rb = rubberband_probe()
     if rb.get("ok"):

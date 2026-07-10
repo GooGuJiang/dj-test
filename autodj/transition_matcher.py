@@ -9,6 +9,7 @@ import numpy as np
 from scipy import signal
 
 from .edm_structure import camelot_compatibility
+from .dj_phrase_policy import evaluate_phrase_policy, structural_candidate_prior
 from .models import BarFeatures, PreparedTrack, TransitionPlan
 from .muq_analyzer import cosine_similarity
 
@@ -520,6 +521,15 @@ def _score_candidate(
         else 0.50
     )
     allin1_boundary = float(np.sqrt(max(boundary_a, 0.0) * max(boundary_b, 0.0)))
+    phrase_policy = evaluate_phrase_policy(
+        current,
+        next_track,
+        current_index,
+        next_index,
+        bars,
+        harmonic=harmonic,
+        bass_clean=bass_clean,
+    )
 
     # MuQ is used as a bounded semantic/style term, not as the sole compatibility
     # judge: recent mashup work shows general-purpose embeddings are insufficient
@@ -527,25 +537,30 @@ def _score_candidate(
     # arbitrary position priors. Parametric EQ/fader terms follow the
     # differentiable-DSP transition literature.
     score = (
-        0.14 * continuity
-        + 0.10 * harmonic
-        + 0.06 * key_score
-        + 0.06 * rhythm
-        + 0.02 * brightness
-        + 0.09 * bass_clean
-        + 0.09 * vocal_clean
-        + 0.03 * structure
+        0.11 * continuity
+        + 0.08 * harmonic
+        + 0.05 * key_score
+        + 0.05 * rhythm
+        + 0.01 * brightness
+        + 0.08 * bass_clean
+        + 0.08 * vocal_clean
+        + 0.02 * structure
         + 0.03 * dynamics
         + 0.02 * length_fit
-        + 0.08 * cue_alignment
-        + 0.04 * phrase_alignment
+        + 0.07 * cue_alignment
+        + 0.05 * phrase_alignment
         + 0.01 * edm_confidence
-        + 0.05 * muq_style
-        + 0.06 * muq_segment
+        + 0.04 * muq_style
+        + 0.05 * muq_segment
         + 0.02 * muq_trajectory
-        + 0.05 * allin1_boundary
-        + 0.05 * role_compatibility
+        + 0.04 * allin1_boundary
+        + 0.04 * role_compatibility
+        + 0.15 * phrase_policy.score
     )
+    # Starting a long blend in the middle of a drop should lose even when its
+    # low-level similarity metrics happen to look good.  A deliberate double
+    # drop or final one/two-bar swap remains available through the policy guard.
+    score *= 0.74 + 0.26 * phrase_policy.drop_guard_score
     metrics = {
         "continuity": continuity,
         "harmonic": harmonic,
@@ -565,6 +580,14 @@ def _score_candidate(
         "muq_trajectory": muq_trajectory,
         "allin1_boundary": allin1_boundary,
         "allin1_role_compatibility": role_compatibility,
+        "dj_phrase_policy": phrase_policy.score,
+        "dj_post_drop": phrase_policy.post_drop_score,
+        "dj_drop_landing": phrase_policy.drop_landing_score,
+        "dj_role_path": phrase_policy.role_path_score,
+        "dj_energy_arc": phrase_policy.energy_arc_score,
+        "dj_boundary": phrase_policy.boundary_score,
+        "dj_drop_guard": phrase_policy.drop_guard_score,
+        "dj_intent_code": float(phrase_policy.intent_code),
         "current_functional_role": float(
             {"INTRO": 0, "VERSE": 1, "CHORUS": 2, "BREAK": 3, "BRIDGE": 4, "INST": 5, "SOLO": 6, "OUTRO": 7, "START": 8, "END": 9}.get(current_function, -1)
         ),
@@ -714,15 +737,27 @@ def find_best_transition(
         is_exit=False,
         config=config,
     )
+    exit_prior = structural_candidate_prior(current, is_exit=True)
+    entry_prior = structural_candidate_prior(next_track, is_exit=False)
+    exit_scores = np.asarray(current.structure.mix_out_score, dtype=np.float32)
+    entry_scores = np.asarray(next_track.structure.mix_in_score, dtype=np.float32)
+    if exit_scores.size == exit_prior.size:
+        exit_scores = 0.58 * exit_scores + 0.42 * exit_prior
+    else:
+        exit_scores = exit_prior
+    if entry_scores.size == entry_prior.size:
+        entry_scores = 0.58 * entry_scores + 0.42 * entry_prior
+    else:
+        entry_scores = entry_prior
     if force_current_start is None:
         exit_indices = _rank_by_cue_scores(
             exit_indices,
-            current.structure.mix_out_score,
+            exit_scores,
             config.max_exit_candidates,
         )
     entry_indices = _rank_by_cue_scores(
         entry_indices,
-        next_track.structure.mix_in_score,
+        entry_scores,
         config.max_entry_candidates,
     )
     if exit_indices.size == 0 or entry_indices.size == 0:
@@ -789,6 +824,15 @@ def find_best_transition(
         metrics.get("local_gain", 1.0),
         fx_config,
     )
+    phrase_policy = evaluate_phrase_policy(
+        current,
+        next_track,
+        current_index,
+        next_index,
+        bars,
+        harmonic=float(metrics.get("harmonic", 0.5)),
+        bass_clean=float(metrics.get("bass_clean", 0.5)),
+    )
     return TransitionPlan(
         current_start=current_start,
         next_start=next_start,
@@ -817,4 +861,11 @@ def find_best_transition(
         ),
         next_resume_sample=int(next_end),
         micro_offset_samples=int(micro_offset),
+        dj_intent=phrase_policy.intent,
+        current_role=phrase_policy.current_role,
+        current_landing_role=phrase_policy.current_landing_role,
+        next_role=phrase_policy.next_role,
+        next_landing_role=phrase_policy.next_landing_role,
+        structure_policy_score=phrase_policy.score,
+        recommended_archetypes=phrase_policy.recommended_archetypes,
     )
