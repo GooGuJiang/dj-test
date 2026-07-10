@@ -88,7 +88,7 @@ def test_post_drop_relay_is_preferred_over_mid_drop_blend() -> None:
     post = evaluate_phrase_policy(a, b, current_index=32, next_index=0, bars=16, harmonic=0.9, bass_clean=0.9)
     mid = evaluate_phrase_policy(a, b, current_index=24, next_index=0, bars=16, harmonic=0.9, bass_clean=0.9)
 
-    assert post.intent == "Post-Drop Relay"
+    assert post.intent == "Energy Relay Blend"
     assert post.next_landing_role == "DROP"
     assert post.score > mid.score
     assert post.drop_guard_score > mid.drop_guard_score
@@ -101,12 +101,12 @@ def test_matcher_lands_incoming_phrase_on_drop() -> None:
     b = make_structured_track("B", b_roles, np.asarray([0.25] * 8 + list(np.linspace(0.3, 0.8, 8)) + [0.9] * 16 + [0.5] * 16))
 
     plan = find_best_transition(a, b, requested_bars=0)
-    assert plan.dj_intent in {"Post-Drop Relay", "Phrase-to-Drop", "Outro-Intro Blend"}
+    assert plan.dj_intent in {"Energy Relay Blend", "Phrase Landing Blend", "Outro-Intro Blend"}
     assert plan.structure_policy_score >= 0.55
     assert plan.next_landing_role in {"DROP", "CHORUS", "COOLDOWN"}
 
 
-def test_new_phrase_archetype_renders() -> None:
+def test_energy_relay_renders_as_natural_bass_swap() -> None:
     sample_rate = 8000
     length = sample_rate * 4
     t = np.arange(length, dtype=np.float32) / sample_rate
@@ -146,12 +146,12 @@ def test_new_phrase_archetype_renders() -> None:
         current_label="COOLDOWN",
         next_label="INTRO",
         config=HumanTransitionConfig(
-            mode="Post-Drop Relay",
+            mode="Bass Swap",
             max_candidates=1,
             evaluation_sample_rate=8000,
         ),
     )
-    assert result.archetype == "Post-Drop Relay"
+    assert result.archetype == "Bass Swap"
     assert result.audio.shape == low_a.shape
     assert np.isfinite(result.audio).all()
     assert float(np.max(np.abs(result.audio))) <= 0.90

@@ -88,7 +88,7 @@ def test_auto_transition_returns_professional_curves() -> None:
         fx_config=TransitionFXConfig(style="Club", strength=0.8),
     )
 
-    assert plan.bars in (4, 8, 16, 32)
+    assert plan.bars in (8, 16, 32)
     assert plan.current_start >= int(a.total_samples * 0.35)
     assert plan.next_start <= int(b.total_samples * 0.5)
     assert 0.0 <= plan.score <= 1.0

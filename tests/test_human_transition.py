@@ -54,7 +54,6 @@ def test_human_transition_renders_and_limits_peak() -> None:
         },
         current_label="OUTRO",
         next_label="DROP",
-        history=(),
         config=HumanTransitionConfig(max_candidates=4, evaluation_sample_rate=8_000),
     )
     assert result.audio.shape == roles[0].shape
@@ -65,7 +64,7 @@ def test_human_transition_renders_and_limits_peak() -> None:
     assert result.quality["human_candidate_count"] >= 1
 
 
-def test_recent_transition_receives_repetition_penalty() -> None:
+def test_natural_transition_selection_is_deterministic() -> None:
     roles = _roles(seconds=2.0)
     kwargs = dict(
         a_low=roles[0],
@@ -84,19 +83,21 @@ def test_recent_transition_receives_repetition_penalty() -> None:
             "vocal_clean": 0.8,
             "edm_confidence": 0.8,
             "harmonic": 0.75,
+            "bass_clean": 0.7,
             "cue_alignment": 0.8,
             "phrase_alignment": 0.8,
         },
         current_label="OUTRO",
-        next_label="DROP",
+        next_label="INTRO",
         config=HumanTransitionConfig(
-            mode="Bass Swap", max_candidates=1, evaluation_sample_rate=8_000
+            mode="Natural Auto", max_candidates=3, evaluation_sample_rate=8_000
         ),
     )
-    fresh = render_human_transition(history=(), **kwargs)
-    repeated = render_human_transition(history=("Bass Swap",), **kwargs)
-    assert repeated.quality["quality_repetition"] < fresh.quality["quality_repetition"]
-    assert repeated.score < fresh.score
+    first = render_human_transition(**kwargs)
+    second = render_human_transition(**kwargs)
+    assert first.archetype == second.archetype
+    assert first.score == second.score
+    assert np.array_equal(first.audio, second.audio)
 
 
 def test_collision_metric_penalizes_two_full_low_bands() -> None:
@@ -119,7 +120,6 @@ def test_collision_metric_penalizes_two_full_low_bands() -> None:
         controls=controls,
         archetype="Bass Swap",
         context_fit=0.8,
-        recent_history=(),
         vocal_risk=0.0,
         evaluation_sample_rate=8_000,
     )
@@ -131,7 +131,6 @@ def test_collision_metric_penalizes_two_full_low_bands() -> None:
         controls=controls,
         archetype="Bass Swap",
         context_fit=0.8,
-        recent_history=(),
         vocal_risk=0.0,
         evaluation_sample_rate=8_000,
     )

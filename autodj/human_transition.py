@@ -4,8 +4,8 @@ from __future__ import annotations
 Human-style automatic DJ transition generation and reference-aware scoring.
 
 The module deliberately separates two concerns:
-1. Generate several phrase-quantized transition archetypes that resemble common
-   DJ techniques (blend, bass swap, echo out, drop swap, loop out, filter ride).
+1. Generate conservative phrase-quantized DJ transitions: a long blend, a
+   controlled bass handover, or a short vocal echo exit when blending is unsafe.
 2. Rank the rendered candidates with interpretable engineering/perceptual
    metrics: loudness/headroom, spectral collision, spectral continuity, gain
    smoothness, stereo stability, beat consistency, and context/style fit.
@@ -16,7 +16,7 @@ system or a trained human-DJ policy model.
 """
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import librosa
 import numpy as np
@@ -27,21 +27,13 @@ SUPPORTED_ARCHETYPES = (
     "Long Blend",
     "Bass Swap",
     "Echo Out",
-    "Drop Swap",
-    "Loop Out",
-    "Filter Ride",
-    "Post-Drop Relay",
-    "Breakdown Lift",
-    "Double Drop",
 )
 
 
 @dataclass(frozen=True)
 class HumanTransitionConfig:
-    mode: str = "Adaptive Human"
-    variation: float = 0.58
-    max_candidates: int = 5
-    avoid_recent: int = 2
+    mode: str = "Natural Auto"
+    max_candidates: int = 3
     evaluation_sample_rate: int = 16_000
 
 
@@ -589,48 +581,21 @@ def _delay_echo(
     return result
 
 
-def _loop_percussion(
-    percussive: np.ndarray,
-    sample_rate: int,
-    bpm: float,
-    beats_per_bar: int,
-    phase: np.ndarray,
-    start: float,
-    end: float,
-) -> np.ndarray:
-    output = np.zeros_like(percussive, dtype=np.float32)
-    bar = max(1, int(round(60.0 / max(float(bpm), 1.0) * beats_per_bar * sample_rate)))
-    region_start = int(np.clip(start, 0.0, 1.0) * len(percussive))
-    region_end = int(np.clip(end, 0.0, 1.0) * len(percussive))
-    if region_end <= region_start or region_start < bar:
-        return output
-    source = percussive[max(0, region_start - bar) : region_start]
-    if len(source) < max(32, bar // 2):
-        return output
-    cursor = region_start
-    while cursor < region_end:
-        count = min(len(source), region_end - cursor)
-        output[cursor : cursor + count] += source[:count]
-        cursor += count
-    decay = 1.0 - 0.68 * _smootherstep((phase - start) / max(end - start, 1e-4))
-    gate = (_ramp(phase, start, start + 0.02) * (1.0 - _ramp(phase, end - 0.02, end))).astype(np.float32)
-    return output * (decay * gate)[:, None]
-
-
 def _intent_bonus(archetype: str, metrics: dict[str, float]) -> float:
+    """Small deterministic preference; never selects an impact transition."""
     code = int(round(float(metrics.get("dj_intent_code", 0.0))))
     preferred = {
-        1: ("Long Blend", "Bass Swap", "Filter Ride"),
-        2: ("Post-Drop Relay", "Bass Swap", "Long Blend"),
-        3: ("Breakdown Lift", "Filter Ride", "Drop Swap"),
-        4: ("Breakdown Lift", "Drop Swap", "Filter Ride"),
-        5: ("Double Drop", "Drop Swap", "Bass Swap"),
-        6: ("Echo Out", "Loop Out", "Filter Ride"),
+        1: ("Long Blend", "Bass Swap", "Echo Out"),
+        2: ("Bass Swap", "Long Blend", "Echo Out"),
+        3: ("Long Blend", "Bass Swap", "Echo Out"),
+        4: ("Long Blend", "Bass Swap", "Echo Out"),
+        5: ("Bass Swap", "Long Blend", "Echo Out"),
+        6: ("Echo Out", "Long Blend", "Bass Swap"),
     }.get(code, ("Long Blend", "Bass Swap", "Echo Out"))
     if archetype == preferred[0]:
-        return 0.36 if archetype == "Double Drop" else 0.24
-    if archetype in preferred[1:]:
-        return 0.12
+        return 0.16
+    if archetype == preferred[1]:
+        return 0.08
     return 0.0
 
 
@@ -643,35 +608,34 @@ def _context_style_fit(
     edm = float(np.clip(metrics.get("edm_confidence", 0.5), 0.0, 1.0))
     vocal_risk = float(np.clip(1.0 - metrics.get("vocal_clean", 0.5), 0.0, 1.0))
     harmonic = float(np.clip(metrics.get("harmonic", 0.5), 0.0, 1.0))
+    bass_clean = float(np.clip(metrics.get("bass_clean", 0.5), 0.0, 1.0))
     cue = float(np.clip(metrics.get("cue_alignment", 0.5), 0.0, 1.0))
     phrase = float(np.clip(metrics.get("phrase_alignment", 0.5), 0.0, 1.0))
     current_role = current_label.upper()
     next_role = next_label.upper()
-    next_drop = next_role in {"DROP", "CHORUS"}
-    current_break = current_role in {"BREAK", "BREAKDOWN", "BRIDGE", "OUTRO"}
-    current_vocal = current_role in {"VOCAL", "VERSE", "CHORUS", "SOLO"}
-    clean_intro = next_role in {"INTRO", "PHRASE", "SECTION"}
-
+    clean_entry = next_role in {"INTRO", "PHRASE", "SECTION", "BUILDUP", "BREAKDOWN"}
+    vocal_exit = current_role in {"VOCAL", "VERSE", "CHORUS", "SOLO"}
     intent = _intent_bonus(archetype, metrics)
+
     if archetype == "Long Blend":
-        return float(np.clip(0.25 + 0.28 * harmonic + 0.18 * phrase + 0.16 * (1.0 - vocal_risk) + 0.13 * float(clean_intro) + intent, 0.0, 1.0))
+        return float(np.clip(
+            0.26 + 0.24 * harmonic + 0.20 * phrase + 0.14 * bass_clean
+            + 0.10 * float(clean_entry) + 0.06 * (1.0 - vocal_risk) + intent,
+            0.0, 1.0,
+        ))
     if archetype == "Bass Swap":
-        return float(np.clip(0.16 + 0.42 * edm + 0.16 * cue + 0.14 * phrase + 0.12 * float(clean_intro) + intent, 0.0, 1.0))
+        return float(np.clip(
+            0.24 + 0.22 * edm + 0.18 * cue + 0.16 * phrase
+            + 0.14 * (1.0 - bass_clean) + 0.06 * float(clean_entry) + intent,
+            0.0, 1.0,
+        ))
     if archetype == "Echo Out":
-        return float(np.clip(0.22 + 0.25 * vocal_risk + 0.18 * cue + 0.16 * (1.0 - harmonic) + 0.19 * float(current_vocal) + intent, 0.0, 1.0))
-    if archetype == "Drop Swap":
-        return float(np.clip(0.10 + 0.46 * float(next_drop) + 0.20 * edm + 0.15 * phrase + 0.09 * float(current_break) + intent, 0.0, 1.0))
-    if archetype == "Loop Out":
-        return float(np.clip(0.17 + 0.28 * edm + 0.21 * cue + 0.25 * float(current_break) + 0.09 * float(clean_intro) + intent, 0.0, 1.0))
-    if archetype == "Filter Ride":
-        return float(np.clip(0.20 + 0.24 * edm + 0.22 * harmonic + 0.20 * cue + 0.14 * float(current_vocal) + intent, 0.0, 1.0))
-    if archetype == "Post-Drop Relay":
-        return float(np.clip(0.28 + 0.28 * metrics.get("dj_post_drop", 0.0) + 0.24 * metrics.get("dj_drop_landing", 0.0) + 0.12 * phrase + 0.08 * edm + intent, 0.0, 1.0))
-    if archetype == "Breakdown Lift":
-        return float(np.clip(0.24 + 0.30 * metrics.get("dj_drop_landing", 0.0) + 0.20 * metrics.get("dj_energy_arc", 0.0) + 0.14 * phrase + 0.12 * edm + intent, 0.0, 1.0))
-    if archetype == "Double Drop":
-        return float(np.clip(0.12 + 0.28 * metrics.get("dj_drop_landing", 0.0) + 0.22 * harmonic + 0.18 * metrics.get("bass_clean", 0.0) + 0.12 * phrase + 0.08 * edm + intent, 0.0, 1.0))
-    return 0.5
+        return float(np.clip(
+            0.08 + 0.28 * vocal_risk + 0.22 * (1.0 - harmonic)
+            + 0.18 * float(vocal_exit) + 0.14 * cue + 0.10 * phrase + intent,
+            0.0, 1.0,
+        ))
+    raise ValueError(f"unsupported natural transition: {archetype}")
 
 
 def _candidate_order(
@@ -679,24 +643,22 @@ def _candidate_order(
     current_label: str,
     next_label: str,
     metrics: dict[str, float],
-    history: Sequence[str],
     maximum: int,
 ) -> list[str]:
     if mode in SUPPORTED_ARCHETYPES:
         return [mode]
 
-    scored = []
-    for archetype in SUPPORTED_ARCHETYPES:
+    vocal_risk = float(np.clip(1.0 - metrics.get("vocal_clean", 0.5), 0.0, 1.0))
+    harmonic = float(np.clip(metrics.get("harmonic", 0.5), 0.0, 1.0))
+    candidates = ["Long Blend", "Bass Swap"]
+    # Echo is a safety fallback, not a decorative default.
+    if vocal_risk >= 0.45 or harmonic <= 0.42:
+        candidates.append("Echo Out")
+
+    scored: list[tuple[float, str]] = []
+    for archetype in candidates:
         fit = _context_style_fit(archetype, current_label, next_label, metrics)
-        # Recent repetition is not forbidden, but receives a clear penalty. This
-        # addresses the recognisability problem of repeatedly applying one rule.
-        recent_penalty = 0.0
-        if archetype in tuple(history)[-2:]:
-            recent_penalty = 0.16 if history and archetype == history[-1] else 0.08
-        if int(round(float(metrics.get("dj_intent_code", 0.0)))) == 5 and archetype == "Double Drop":
-            fit += 0.16
-            recent_penalty *= 0.35
-        scored.append((fit - recent_penalty, archetype))
+        scored.append((fit, archetype))
     scored.sort(reverse=True)
     return [name for _, name in scored[: max(1, int(maximum))]]
 
@@ -719,149 +681,61 @@ def _render_archetype(
     vocal_risk: float,
     drop_landing_phase: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Render the practical DJ formula: drums in, bass swap, old deck out.
+
+    ``drop_landing_phase`` remains in the signature for project compatibility
+    but is deliberately ignored; automatic impact/drop swaps were removed.
+    """
+    del drop_landing_phase
+    if archetype not in SUPPORTED_ARCHETYPES:
+        raise ValueError(f"unsupported natural transition: {archetype}")
+
     length = min(len(a_low), len(b_low), len(a_harm), len(b_harm), len(a_perc), len(b_perc))
     phase = np.linspace(0.0, 1.0, length, endpoint=True, dtype=np.float32)
     strength = float(np.clip(effect_strength, 0.0, 1.0))
+    vocal_risk = float(np.clip(vocal_risk, 0.0, 1.0))
     bars = max(1, int(bars))
-
-    swap = _bar_quantized(0.54, bars, subdivision=2)
-    bass_width = max(0.5 / bars, 0.025)
-    drum_in_start = _bar_quantized(0.02, bars, subdivision=4)
-    harm_in_start = _bar_quantized(0.18 + 0.22 * vocal_risk, bars, subdivision=2)
-    harm_out_end = _bar_quantized(0.78 - 0.12 * vocal_risk, bars, subdivision=2)
-    echo_send = np.zeros(length, dtype=np.float32)
-    loop_audio = np.zeros_like(a_perc, dtype=np.float32)
-    impact_duck = np.ones(length, dtype=np.float32)
 
     if archetype == "Long Blend":
         swap = _bar_quantized(0.58, bars, subdivision=2)
-        bass_width = max(2.0 / bars, 0.08)
-        drum_in_start = 0.0
-        harm_in_start = _bar_quantized(0.10 + 0.16 * vocal_risk, bars, 2)
-        harm_out_end = _bar_quantized(0.92 - 0.10 * vocal_risk, bars, 2)
+        bass_width = max(2.0 / bars, 0.10)
+        incoming_drum_full = _bar_quantized(0.34, bars, subdivision=2)
+        incoming_harm_start = _bar_quantized(0.08 + 0.20 * vocal_risk, bars, 2)
+        outgoing_harm_end = _bar_quantized(0.94 - 0.12 * vocal_risk, bars, 2)
     elif archetype == "Bass Swap":
         swap = _bar_quantized(0.50, bars, subdivision=2)
-        bass_width = max(0.55 / bars, 0.025)
-        drum_in_start = 0.0
-        harm_in_start = _bar_quantized(0.28 + 0.16 * vocal_risk, bars, 2)
-        harm_out_end = _bar_quantized(0.78, bars, 2)
-    elif archetype == "Echo Out":
+        bass_width = max(0.55 / bars, 0.03)
+        incoming_drum_full = _bar_quantized(0.30, bars, subdivision=2)
+        incoming_harm_start = _bar_quantized(0.18 + 0.24 * vocal_risk, bars, 2)
+        outgoing_harm_end = _bar_quantized(0.82 - 0.08 * vocal_risk, bars, 2)
+    else:  # Echo Out
         swap = _bar_quantized(0.56, bars, subdivision=2)
-        bass_width = max(1.0 / bars, 0.05)
-        drum_in_start = _bar_quantized(0.08, bars, 2)
-        harm_in_start = _bar_quantized(0.55 + 0.12 * vocal_risk, bars, 2)
-        harm_out_end = _bar_quantized(0.70, bars, 2)
-        echo_start = _bar_quantized(0.48, bars, 2)
-        echo_send = _ramp(phase, echo_start, min(0.92, echo_start + 0.30))
-    elif archetype == "Drop Swap":
-        swap = _bar_quantized(0.72, bars, subdivision=2)
-        bass_width = max(0.22 / bars, 0.012)
-        drum_in_start = _bar_quantized(0.42, bars, 2)
-        harm_in_start = max(0.0, swap - max(0.15 / bars, 0.008))
-        harm_out_end = swap
-        beat_fraction = 1.0 / max(bars * beats_per_bar, 1)
-        gap_start = max(0.0, swap - 0.45 * beat_fraction)
-        gap_end = min(1.0, swap + 0.12 * beat_fraction)
-        impact_duck = 1.0 - (0.56 + 0.18 * strength) * (
-            _ramp(phase, gap_start, swap, smoother=False)
-            * (1.0 - _ramp(phase, swap, gap_end, smoother=False))
-        )
-    elif archetype == "Loop Out":
-        swap = _bar_quantized(0.58, bars, subdivision=2)
-        bass_width = max(0.75 / bars, 0.035)
-        drum_in_start = 0.0
-        harm_in_start = _bar_quantized(0.42 + 0.10 * vocal_risk, bars, 2)
-        harm_out_end = _bar_quantized(0.56, bars, 2)
-        loop_start = _bar_quantized(0.50, bars, 2)
-        loop_end = _bar_quantized(0.88, bars, 2)
-        loop_audio = _loop_percussion(
-            a_perc, sample_rate, bpm, beats_per_bar, phase, loop_start, loop_end
-        )
-    elif archetype == "Filter Ride":
-        swap = _bar_quantized(0.62, bars, subdivision=2)
-        bass_width = max(1.0 / bars, 0.045)
-        drum_in_start = 0.0
-        harm_in_start = _bar_quantized(0.30 + 0.12 * vocal_risk, bars, 2)
-        harm_out_end = _bar_quantized(0.80, bars, 2)
-    elif archetype == "Post-Drop Relay":
-        # The outgoing drop has finished: keep its groove briefly, introduce the
-        # incoming drums early, then hand bass ownership over around the final
-        # third so the incoming drop/chorus can arrive cleanly.
-        swap = _bar_quantized(0.66, bars, subdivision=2)
-        bass_width = max(0.65 / bars, 0.025)
-        drum_in_start = 0.0
-        harm_in_start = _bar_quantized(0.46 + 0.10 * vocal_risk, bars, 2)
-        harm_out_end = _bar_quantized(0.64, bars, 2)
-    elif archetype == "Breakdown Lift":
-        # Preserve the breakdown atmosphere while the incoming buildup rises.
-        # A short pre-drop hole creates a perceptual arrival instead of a mushy
-        # full-level overlap.
-        swap = _bar_quantized(0.84, bars, subdivision=4)
-        bass_width = max(0.30 / bars, 0.012)
-        drum_in_start = _bar_quantized(0.26, bars, 2)
-        harm_in_start = _bar_quantized(0.20, bars, 2)
-        harm_out_end = _bar_quantized(0.84, bars, 2)
-        beat_fraction = 1.0 / max(bars * beats_per_bar, 1)
-        hole_start = max(0.0, swap - 0.72 * beat_fraction)
-        hole_end = min(1.0, swap + 0.10 * beat_fraction)
-        impact_duck = 1.0 - (0.46 + 0.22 * strength) * (
-            _ramp(phase, hole_start, swap, smoother=False)
-            * (1.0 - _ramp(phase, swap, hole_end, smoother=False))
-        )
-    elif archetype == "Double Drop":
-        # Land both drops on the same downbeat. Incoming drums become audible
-        # first; the outgoing drums stay present for roughly three quarters of
-        # a beat, then release over the following beat like a human deck handoff.
-        beat_fraction = float(np.clip((60.0 / max(bpm, 1.0) * sample_rate) / max(length, 1), 1e-4, 0.25))
-        swap = float(np.clip(drop_landing_phase, 0.50, 0.94))
-        bass_width = max(0.24 * beat_fraction, 0.006)
-        drum_in_start = max(0.0, swap - 0.55 * beat_fraction)
-        harm_in_start = max(0.0, swap - 0.30 * beat_fraction)
-        harm_out_end = min(1.0, swap + 1.55 * beat_fraction)
-        gap_start = max(0.0, swap - 0.28 * beat_fraction)
-        gap_end = min(1.0, swap + 0.06 * beat_fraction)
-        # Only a small pre-impact pocket; do not erase the intended double hit.
-        impact_duck = 1.0 - (0.10 + 0.08 * strength) * (
-            _ramp(phase, gap_start, swap, smoother=False)
-            * (1.0 - _ramp(phase, swap, gap_end, smoother=False))
-        )
+        bass_width = max(0.75 / bars, 0.05)
+        incoming_drum_full = _bar_quantized(0.34, bars, subdivision=2)
+        incoming_harm_start = _bar_quantized(0.48 + 0.12 * vocal_risk, bars, 2)
+        outgoing_harm_end = _bar_quantized(0.72, bars, 2)
 
+    # Low-frequency ownership uses complementary gains rather than equal-power
+    # summing. This avoids a +3 dB double-bass hump and phasey kick overlap.
     bass_progress = _ramp(phase, swap - bass_width / 2.0, swap + bass_width / 2.0)
-    bass_a, bass_b = _equal_power(bass_progress)
+    bass_a = (1.0 - bass_progress).astype(np.float32)
+    bass_b = bass_progress.astype(np.float32)
 
-    drum_progress = _ramp(phase, drum_in_start, min(0.82, drum_in_start + 0.42))
-    # Let deck B establish a groove before reducing deck A.
-    drum_a_fade_start = max(0.30, drum_in_start + 0.22, swap - 0.10)
-    drum_a_progress = _ramp(phase, drum_a_fade_start, min(1.0, drum_a_fade_start + 0.34))
-    drum_a = np.sqrt(np.clip(1.0 - drum_a_progress, 0.0, 1.0)).astype(np.float32)
-    drum_b = np.sqrt(np.clip(drum_progress, 0.0, 1.0)).astype(np.float32)
-    if archetype == "Post-Drop Relay":
-        drum_a = np.sqrt(np.clip(1.0 - _ramp(phase, 0.30, 0.74), 0.0, 1.0)).astype(np.float32)
-        drum_b = np.sqrt(np.clip(_ramp(phase, 0.0, 0.44), 0.0, 1.0)).astype(np.float32)
-    elif archetype == "Breakdown Lift":
-        drum_a *= (1.0 - 0.34 * _ramp(phase, 0.55, 0.90)).astype(np.float32)
-        drum_b = np.sqrt(np.clip(_ramp(phase, drum_in_start, swap), 0.0, 1.0)).astype(np.float32)
-    elif archetype == "Double Drop":
-        beat_fraction = float(np.clip((60.0 / max(bpm, 1.0) * sample_rate) / max(length, 1), 1e-4, 0.25))
-        b_entry = _ramp(phase, swap - 0.55 * beat_fraction, swap, smoother=False)
-        b_full = _ramp(phase, swap + 0.45 * beat_fraction, swap + 1.05 * beat_fraction)
-        drum_b = (0.78 * b_entry + 0.22 * b_full).astype(np.float32)
-        a_pretrim = 1.0 - 0.12 * _ramp(phase, swap - 0.55 * beat_fraction, swap, smoother=False)
-        a_release = _ramp(phase, swap + 0.72 * beat_fraction, swap + 1.72 * beat_fraction)
-        drum_a = (a_pretrim * np.sqrt(np.clip(1.0 - a_release, 0.0, 1.0))).astype(np.float32)
+    # Incoming percussion establishes the groove first; outgoing percussion is
+    # released only after the new beat is clearly audible.
+    drum_b = np.sqrt(np.clip(_ramp(phase, 0.0, max(incoming_drum_full, 0.12)), 0.0, 1.0)).astype(np.float32)
+    drum_release_start = max(0.34, swap - 0.10)
+    drum_a = np.sqrt(np.clip(1.0 - _ramp(phase, drum_release_start, 0.94), 0.0, 1.0)).astype(np.float32)
 
-    harm_b_progress = _ramp(phase, harm_in_start, min(1.0, harm_in_start + 0.48))
-    harm_a_progress = _ramp(phase, max(0.0, harm_out_end - 0.48), harm_out_end)
-    harm_a, _ = _equal_power(harm_a_progress)
-    _, harm_b = _equal_power(harm_b_progress)
-
-    if archetype == "Filter Ride":
-        # Approximate a long filter ride by progressively transferring harmonic
-        # energy while keeping percussion stable. The offline renderer already
-        # works on role-separated signals, so this avoids time-varying IIR state.
-        ride = _smootherstep((phase - 0.10) / 0.78)
-        harm_a *= 1.0 - (0.48 + 0.32 * strength) * ride
-        harm_b *= 0.24 + 0.76 * _smootherstep((phase - 0.12) / 0.58)
+    # Harmonic/vocal layers cross more conservatively than drums. Higher vocal
+    # risk shortens the overlap and creates a small center gap.
+    harm_b_end = min(0.94, incoming_harm_start + 0.44 - 0.10 * vocal_risk)
+    harm_a_start = max(0.18, outgoing_harm_end - (0.48 - 0.14 * vocal_risk))
+    _, harm_b = _equal_power(_ramp(phase, incoming_harm_start, harm_b_end))
+    harm_a, _ = _equal_power(_ramp(phase, harm_a_start, outgoing_harm_end))
+    vocal_gap = 1.0 - 0.18 * vocal_risk * np.sin(np.pi * phase) ** 2
+    harm_a = (harm_a * vocal_gap).astype(np.float32)
+    harm_b = (harm_b * vocal_gap).astype(np.float32)
 
     gain_release = float(local_gain) + (1.0 - float(local_gain)) * _smootherstep(phase)
     b_gain = gain_release.astype(np.float32)
@@ -877,28 +751,23 @@ def _render_archetype(
         + b_perc[:length] * drum_b[:, None]
     ) * b_gain[:, None]
 
-    if archetype == "Loop Out":
-        # Replace, rather than simply stack, some outgoing percussion with the
-        # loop to keep the groove controlled.
-        loop_presence = np.max(np.abs(loop_audio), axis=1) > 1e-8
-        a_contribution[loop_presence] *= np.float32(0.45)
-        a_contribution += loop_audio * np.float32(0.72 + 0.18 * strength)
-
     echo = np.zeros_like(a_contribution, dtype=np.float32)
+    echo_send = np.zeros(length, dtype=np.float32)
     if archetype == "Echo Out":
+        echo_start = _bar_quantized(0.56, bars, 2)
+        echo_send = _ramp(phase, echo_start, min(0.90, echo_start + 0.22))
         echo = _delay_echo(
             a_harm[:length],
             sample_rate=sample_rate,
             bpm=bpm,
             send_curve=echo_send,
-            feedback=0.34 + 0.18 * strength,
+            feedback=0.24 + 0.12 * strength,
         )
 
-    # Deliberate center space. Humans usually lower one deck before introducing
-    # the other, rather than summing two full-level sources at equal power.
-    center_space = 1.0 - (0.055 + 0.095 * strength) * np.sin(np.pi * phase) ** 2
-    mixed = (a_contribution + b_contribution) * center_space[:, None]
-    mixed = mixed * impact_duck[:, None] + echo
+    # Reserve headroom in the overlap instead of relying on the limiter to fix
+    # a two-deck level build-up after the fact.
+    center_space = 1.0 - (0.08 + 0.08 * strength) * np.sin(np.pi * phase) ** 2
+    mixed = (a_contribution + b_contribution) * center_space[:, None] + echo
     mixed = _soft_limit(mixed)
 
     controls = {
@@ -909,7 +778,7 @@ def _render_archetype(
         "drum_overlap": np.minimum(drum_a, drum_b).astype(np.float32),
         "harm_a": harm_a,
         "harm_b": harm_b,
-        "impact_duck": impact_duck,
+        "echo_send": echo_send,
     }
     return (
         mixed,
@@ -928,7 +797,6 @@ def evaluate_transition(
     controls: dict[str, np.ndarray],
     archetype: str,
     context_fit: float,
-    recent_history: Sequence[str],
     vocal_risk: float,
     evaluation_sample_rate: int = 16_000,
 ) -> dict[str, float]:
@@ -991,7 +859,7 @@ def evaluate_transition(
         second = np.diff(curve, n=2)
         control_penalties.append(float(np.mean(np.abs(second))))
     smooth_penalty = float(np.mean(control_penalties)) if control_penalties else 0.0
-    scale = 0.012 if archetype in {"Drop Swap", "Double Drop", "Breakdown Lift"} else 0.0045
+    scale = 0.0045
     smoothness = float(np.exp(-smooth_penalty / scale))
 
     # 5. Stereo width should follow the weighted source image, not collapse or explode.
@@ -1024,14 +892,8 @@ def evaluate_transition(
     harm_b = np.asarray(controls.get("harm_b", np.zeros(1)), dtype=np.float64)
     overlap = float(np.mean(np.minimum(harm_a, harm_b))) if harm_a.size == harm_b.size else 0.5
     vocal_score = float(np.clip(1.0 - vocal_risk * overlap * 1.45, 0.0, 1.0))
-    repetition = 1.0
-    if recent_history and archetype == recent_history[-1]:
-        repetition = 0.72
-    elif archetype in tuple(recent_history)[-2:]:
-        repetition = 0.86
-
     # Suggested engineering weights from the public transition-evaluation
-    # framework, plus a small context/human-variation term.
+    # framework. Selection is deterministic and depends only on the audio pair.
     engineering = (
         0.25 * loudness
         + 0.25 * collision
@@ -1040,7 +902,7 @@ def evaluate_transition(
         + 0.10 * stereo
         + 0.05 * beat
     )
-    total = (0.72 * engineering + 0.14 * context_fit + 0.10 * vocal_score + 0.04 * drum_handover) * repetition
+    total = 0.72 * engineering + 0.14 * context_fit + 0.10 * vocal_score + 0.04 * drum_handover
     return {
         "human_quality": float(np.clip(total, 0.0, 1.0)),
         "quality_loudness": loudness,
@@ -1053,7 +915,6 @@ def evaluate_transition(
         "drum_overlap_ratio": overlap_ratio,
         "quality_vocal": vocal_score,
         "quality_context": float(np.clip(context_fit, 0.0, 1.0)),
-        "quality_repetition": repetition,
         "peak_dbfs": peak_db,
     }
 
@@ -1075,17 +936,18 @@ def render_human_transition(
     plan_metrics: dict[str, float],
     current_label: str,
     next_label: str,
-    history: Sequence[str] = (),
     config: HumanTransitionConfig | None = None,
 ) -> HumanTransitionResult:
     config = config or HumanTransitionConfig()
+    mode = "Natural Auto" if config.mode == "Adaptive Human" else config.mode
+    if mode not in {"Natural Auto", *SUPPORTED_ARCHETYPES}:
+        raise ValueError(f"unsupported natural transition mode: {config.mode}")
     vocal_risk = float(np.clip(1.0 - plan_metrics.get("vocal_clean", 0.5), 0.0, 1.0))
     candidates = _candidate_order(
-        config.mode,
+        mode,
         current_label,
         next_label,
         plan_metrics,
-        history,
         maximum=config.max_candidates,
     )
 
@@ -1117,17 +979,10 @@ def render_human_transition(
             controls=controls,
             archetype=archetype,
             context_fit=context_fit,
-            recent_history=history,
             vocal_risk=vocal_risk,
             evaluation_sample_rate=config.evaluation_sample_rate,
         )
-        # Variation is deterministic: it relaxes the best-score gap and rewards a
-        # contextually valid alternative, without randomising reproducibility.
-        diversity_bonus = 0.0
-        if archetype not in tuple(history)[-max(1, config.avoid_recent) :]:
-            diversity_bonus = 0.025 * float(np.clip(config.variation, 0.0, 1.0))
-        score = float(np.clip(quality["human_quality"] + diversity_bonus, 0.0, 1.0))
-        quality["human_diversity_bonus"] = diversity_bonus
+        score = float(np.clip(quality["human_quality"], 0.0, 1.0))
         results.append(
             HumanTransitionResult(
                 audio=mixed,
@@ -1143,11 +998,6 @@ def render_human_transition(
         raise RuntimeError("没有生成可用的真人 DJ 过渡候选。")
     results.sort(key=lambda item: item.score, reverse=True)
     best = results[0]
-    if int(round(float(plan_metrics.get("dj_intent_code", 0.0)))) == 5:
-        double_drop = next((item for item in results if item.archetype == "Double Drop"), None)
-        if double_drop is not None and double_drop.score >= best.score - 0.10:
-            best = double_drop
-            best.quality["double_drop_preference_applied"] = 1.0
     best.quality["human_candidate_count"] = float(len(results))
     # Persist compact candidate scores for diagnostics without storing audio.
     for index, item in enumerate(results[:6]):

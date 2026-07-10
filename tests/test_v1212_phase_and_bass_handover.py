@@ -58,15 +58,13 @@ def test_percussive_grid_alignment_corrects_multiple_beats() -> None:
     assert np.isfinite(aligned).all()
 
 
-def test_double_drop_overlaps_drums_before_releasing_deck_a() -> None:
+def test_bass_swap_has_single_low_frequency_owner() -> None:
     sr = 8_000
-    bpm = 120.0
     length = sr * 8
     zeros = np.zeros((length, 2), dtype=np.float32)
     percussion = _pulse_track(length, list(range(0, length, sr // 2)), sr)
-    landing = 0.72
     _, _, _, controls = _render_archetype(
-        "Double Drop",
+        "Bass Swap",
         a_low=zeros,
         b_low=zeros,
         a_harm=zeros,
@@ -74,30 +72,26 @@ def test_double_drop_overlaps_drums_before_releasing_deck_a() -> None:
         a_perc=percussion,
         b_perc=percussion,
         sample_rate=sr,
-        bpm=bpm,
+        bpm=120.0,
         beats_per_bar=4,
-        bars=4,
+        bars=8,
         local_gain=1.0,
         effect_strength=0.7,
         vocal_risk=0.0,
-        drop_landing_phase=landing,
     )
-    beat_phase = (60.0 / bpm * sr) / length
-    at_landing = int(landing * (length - 1))
-    after_release = int(min(0.99, landing + 1.65 * beat_phase) * (length - 1))
-    assert controls["drum_a"][at_landing] > 0.78
-    assert controls["drum_b"][at_landing] > 0.70
-    assert controls["drum_overlap"][at_landing] > 0.70
-    assert controls["drum_a"][after_release] < 0.35
-    assert controls["drum_b"][after_release] > 0.92
+    assert np.allclose(controls["bass_a"] + controls["bass_b"], 1.0, atol=1e-6)
+    assert controls["bass_b"][int(0.35 * length)] < 0.02
+    assert controls["bass_a"][int(0.65 * length)] < 0.02
+    assert controls["drum_b"][int(0.20 * length)] > 0.55
+    assert controls["drum_a"][int(0.20 * length)] > 0.95
 
 
-def test_double_drop_policy_uses_moderate_compatibility_thresholds() -> None:
+def test_drop_landing_policy_maps_to_safe_bass_handover() -> None:
     roles_a = ["BUILDUP"] * 4 + ["DROP"] * 8
     roles_b = ["BUILDUP"] * 4 + ["DROP"] * 8
     energy = np.asarray([0.4] * 4 + [0.9] * 8, dtype=np.float32)
-    a = make_structured_track("A-double", roles_a, energy)
-    b = make_structured_track("B-double", roles_b, energy)
+    a = make_structured_track("A-handover", roles_a, energy)
+    b = make_structured_track("B-handover", roles_b, energy)
     result = evaluate_phrase_policy(
         a,
         b,
@@ -107,5 +101,6 @@ def test_double_drop_policy_uses_moderate_compatibility_thresholds() -> None:
         harmonic=0.62,
         bass_clean=0.55,
     )
-    assert result.intent == "Double Drop"
-    assert result.recommended_archetypes[0] == "Double Drop"
+    assert result.intent == "Bass Handover"
+    assert result.recommended_archetypes[0] == "Bass Swap"
+

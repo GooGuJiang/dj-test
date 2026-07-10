@@ -126,7 +126,7 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.10")
+        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.12")
         self.settings_store = SettingsStore()
         self.saved_settings = self.settings_store.load()
         self._settings_after_id: str | None = None
@@ -183,7 +183,7 @@ class AutoDJApp(tk.Tk):
         self.after(150, self._detect_rubberband)
         self.after(240, self._detect_allin1)
         self.after(320, self._detect_cuedetr)
-        LOGGER.info("Auto DJ 1.2.10 GUI 启动，主环境 Python=%s", os.sys.executable)
+        LOGGER.info("Auto DJ 1.2.12 GUI 启动，主环境 Python=%s", os.sys.executable)
         self.after(100, self._poll)
 
     _SETTING_VARIABLES = {
@@ -193,7 +193,6 @@ class AutoDJApp(tk.Tk):
         "mix_style": "style_var",
         "effect_strength": "effect_var",
         "human_style": "human_style_var",
-        "human_variation": "human_variation_var",
         "human_candidates": "human_candidates_var",
         "tempo_restore": "restore_var",
         "automix_policy": "policy_var",
@@ -235,10 +234,9 @@ class AutoDJApp(tk.Tk):
             except (tk.TclError, TypeError, ValueError):
                 continue
         # Refresh text next to scales immediately.
+        if self.human_style_var.get() == "Adaptive Human":
+            self.human_style_var.set("Natural Auto")
         self.effect_label.configure(text=f"{float(self.effect_var.get()):.0f}%")
-        self.human_variation_label.configure(
-            text=f"{float(self.human_variation_var.get()):.0f}%"
-        )
         self.stretch_label.configure(text=f"±{float(self.stretch_var.get()):.1f}%")
 
     def _attach_settings_autosave(self) -> None:
@@ -375,12 +373,12 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.10", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.12", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
             header,
-            text="MuQ 平滑排序 · 滑动窗口预加载 · 配置自动保存 · 智能 OUT/IN",
+            text="MuQ 平滑排序 · 自由 OUT/IN 乐句配对 · 分级滑动预渲染 · 配置自动保存",
             justify=tk.LEFT,
         )
         self.header_subtitle.grid(
@@ -668,21 +666,15 @@ class AutoDJApp(tk.Tk):
         ttk.Label(settings_frame, text="真人 DJ 过渡策略", style="Muted.TLabel").pack(
             anchor=tk.W
         )
-        self.human_style_var = tk.StringVar(value="Adaptive Human")
+        self.human_style_var = tk.StringVar(value="Natural Auto")
         human_style_box = ttk.Combobox(
             settings_frame,
             textvariable=self.human_style_var,
             values=(
-                "Adaptive Human",
+                "Natural Auto",
                 "Long Blend",
                 "Bass Swap",
                 "Echo Out",
-                "Drop Swap",
-                "Loop Out",
-                "Filter Ride",
-                "Post-Drop Relay",
-                "Breakdown Lift",
-                "Double Drop",
             ),
             state="readonly",
         )
@@ -692,37 +684,21 @@ class AutoDJApp(tk.Tk):
         )
         ttk.Label(
             settings_frame,
-            text="Adaptive Human 会先判断 Drop 后接力、Breakdown→Drop、Double Drop、Outro→Intro 等结构意图，再生成并评分多种手法。",
+            text="Natural Auto 只使用乐句长混、低频交接和必要的人声 Echo 退出；不再自动触发 Drop Swap、Double Drop、Loop 或冲击式效果。",
             style="Muted.TLabel",
             wraplength=280,
         ).pack(anchor=tk.W, pady=(0, 8))
-
-        ttk.Label(settings_frame, text="真人变化度", style="Muted.TLabel").pack(
-            anchor=tk.W
-        )
-        self.human_variation_var = tk.DoubleVar(value=58)
-        self.human_variation_label = ttk.Label(
-            settings_frame, text="58%", style="Muted.TLabel"
-        )
-        self.human_variation_label.pack(anchor=tk.E)
-        ttk.Scale(
-            settings_frame,
-            from_=0,
-            to=100,
-            variable=self.human_variation_var,
-            command=self._set_human_variation,
-        ).pack(fill=tk.X, pady=(0, 6))
 
         candidate_row = ttk.Frame(settings_frame, style="Card.TFrame")
         candidate_row.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(
             candidate_row, text="候选手法数", style="Muted.TLabel"
         ).pack(side=tk.LEFT)
-        self.human_candidates_var = tk.StringVar(value="5")
+        self.human_candidates_var = tk.StringVar(value="3")
         human_candidates_box = ttk.Combobox(
             candidate_row,
             textvariable=self.human_candidates_var,
-            values=("2", "3", "4", "5", "6"),
+            values=("1", "2", "3"),
             state="readonly",
             width=5,
         )
@@ -1059,7 +1035,7 @@ class AutoDJApp(tk.Tk):
         ttk.Label(preload_grid, text="截止保护", style="Muted.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 8), pady=2
         )
-        self.preload_deadline_var = tk.StringVar(value="60")
+        self.preload_deadline_var = tk.StringVar(value="90")
         ttk.Combobox(
             preload_grid,
             textvariable=self.preload_deadline_var,
@@ -1071,8 +1047,9 @@ class AutoDJApp(tk.Tk):
             settings_frame,
             text=(
                 "MuQ 排序会同时考虑全局风格、Outro→Intro、局部轨迹、BPM、"
-                "能量、音色和 All-In-One 段落方向；滑动窗口保留一首热下一轨，"
-                "并提前预热后续轨道。内存上限单位为 MB，截止保护单位为秒。"
+                "能量、音色和 All-In-One 段落方向；滑动窗口完整渲染一首热下一轨，"
+                "并只对最近未来 pair 做轻量同步与最佳 OUT/IN cue 规划。"
+                "内存上限单位为 MB，截止保护单位为秒。"
             ),
             style="Muted.TLabel",
             wraplength=280,
@@ -1247,11 +1224,6 @@ class AutoDJApp(tk.Tk):
 
     def _apply_human_style(self) -> None:
         self.engine.set_human_style_mode(self.human_style_var.get())
-
-    def _set_human_variation(self, value: str) -> None:
-        number = float(value)
-        self.human_variation_label.configure(text=f"{number:.0f}%")
-        self.engine.set_human_variation(number / 100.0)
 
     def _apply_human_candidates(self) -> None:
         self.engine.set_human_candidate_count(int(self.human_candidates_var.get()))
@@ -1490,7 +1462,6 @@ class AutoDJApp(tk.Tk):
         self.engine.set_mix_style(self.style_var.get())
         self.engine.set_effect_strength(self.effect_var.get() / 100.0)
         self.engine.set_human_style_mode(self.human_style_var.get())
-        self.engine.set_human_variation(self.human_variation_var.get() / 100.0)
         self.engine.set_human_candidate_count(int(self.human_candidates_var.get()))
         self.engine.set_automix_policy(self.policy_var.get())
         self.engine.set_transition_engine(self.transition_engine_var.get())

@@ -1,13 +1,34 @@
 # Changelog
 
+## 1.2.12
+
+- 删除上一首后 42%/最后 48 小节、下一首先 35%/前 32 小节的自动切点硬约束。
+- 删除 `tail_to_head` 位置加分；歌曲位置仅保留为诊断指标。
+- 所有有效 CUE-DETR cue 统一按乐句、边界、低频、人声、能量和相位质量评分。
+- 自动渲染只保留 Long Blend、Bass Swap 和必要的 Echo Out。
+- 删除 Drop Swap、Double Drop、Loop Out、Filter Ride、Post-Drop Relay、Breakdown Lift 渲染代码和 GUI 选项。
+- 删除 Double Drop 的额外两拍尾部、落点偏好和特殊恢复点逻辑。
+- 低频交接改为互补所有权，`bass_A + bass_B = 1`，避免双 bass 增益和相位碰撞。
+- 下一首鼓组先进入，上一首鼓组后释放；和声/人声按 vocal risk 缩短重叠。
+- Echo 只在高人声风险或低调性兼容时进入自动候选，并降低 feedback。
+- 删除真人变化度、最近手法惩罚和候选多样性奖励，结果完全确定性。
+- 新增 `check_natural_transition.py` 独立检查脚本。
+- 新增取消位置门槛、低频所有权、控制曲线、Echo 门控和移除旧手法等测试；共 71 项测试通过。
+
+## 1.2.11
+
+- 将 CUE-DETR 切点方向改为硬约束：上一首后 42%/最后 48 小节 OUT，下一首前 35%/前 32 小节 IN。
+- 禁止下一首后半段高分 cue 成为入口，避免“后段接后段”。
+- 自动过渡最短改为 8 小节，手动 4 小节设置仍可使用。
+- Drop Swap 和 Double Drop 在过渡前段加入低音量 incoming 鼓组/和声床。
+- 滑动窗口改为分级调度：热 A→B 完整渲染，未来 B→C 只做解码、同步和 cue 规划。
+- 未来窗口只规划最近一个 pair，不再完整渲染整个队列。
+- 点击播放等待并接管正在运行的热 pair，消除重复 BPM 恢复和相位锁定。
+- 新增播放启动互斥状态，阻止 GUI 定时器在启动期间再次创建预加载任务。
+- 窗口跨代时保留已完成的同步音轨，避免在歌曲切换边界丢弃昂贵结果。
+- 新增尾部→头部、早期 incoming、分级窗口和启动互斥测试；共 61 项测试通过。
+
 ## 1.2.10
-
-- 修复 All-In-One 纯 PyTorch NATTEN 兼容模块缺少 `__spec__`，导致 Transformers 报 `natten.__spec__ is None`。
-- CUE-DETR 检测现在区分“缺少依赖”和“依赖导入冲突”。
-- 检测时直接验证 `DetrImageProcessor` 与 `DetrForObjectDetection`。
-
-
-## 1.2.9
 
 - 接入官方 `disco-eth/cue-detr`，并将其设为唯一 IN/OUT cue 来源。
 - 移除旧 checkerboard novelty、周期、salience 和静音尾部规则切点。

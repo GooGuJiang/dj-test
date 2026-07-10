@@ -167,3 +167,23 @@ def test_matcher_and_simple_fallback_preserve_cuedetr_pair() -> None:
     assert fallback.current_start == plan.current_start
     assert fallback.next_start == plan.next_start
     assert fallback.policy_mode == "CUE-DETR short gapless"
+
+
+def test_matcher_does_not_enforce_tail_to_head_position_windows() -> None:
+    current = _track("free-A", 100, (18, 44, 60, 76, 92))
+    incoming = _track("free-B", 100, (4, 20, 36, 68, 88))
+    # Deliberately make an early OUT and late IN the strongest neural pair.
+    # The matcher must keep both eligible instead of restoring the old windows.
+    current.structure.mix_out_score[:] = 0.05
+    current.structure.mix_out_score[[18, 44]] = 1.0
+    incoming.structure.mix_in_score[:] = 0.05
+    incoming.structure.mix_in_score[[68, 88]] = 1.0
+
+    plan = find_best_transition(current, incoming, requested_bars=8)
+
+    assert plan.current_bar_index in {18, 44}
+    assert plan.next_bar_index in {68, 88}
+    assert plan.metrics["out_position"] < 0.58
+    assert plan.metrics["in_position"] > 0.35
+    assert plan.metrics["position_bias_applied"] == 0.0
+    assert "tail_to_head" not in plan.metrics

@@ -1,147 +1,158 @@
-# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.10
+# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.12
 
-这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.9 将切歌候选改为只来自官方 CUE-DETR；1.2.10 修复 CUE-DETR 与 All-In-One 的 NATTEN 兼容层在同一进程中的导入冲突。
+这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.12 重点解决“切点被尾部→头部硬规则锁死”和“自动效果过多导致衔接突兀”两个问题。
 
 ## 模型分工
 
 - **CUE-DETR (`disco-eth/cue-detr`)**：唯一的 IN/OUT cue 候选来源。
-- **Beat This!**：beat/downbeat 网格，并将 CUE-DETR 的时间预测量化到最近 downbeat。
-- **All-In-One**：`intro / verse / chorus / break / bridge / outro` 等结构角色，只给 neural cue 排序，不新增 cue。
-- **MuQ**：歌曲风格、Outro→Intro 语义关系、播放顺序和 cue 配对兼容度。
-- **本地 DSP 特征**：调性、能量、低频、人声和鼓组冲突评分，只影响候选分数和渲染方式。
+- **Beat This!**：beat/downbeat 网格，并把 CUE-DETR 预测吸附到真实 downbeat。
+- **All-In-One**：intro、verse、chorus、break、outro 等结构角色，只参与排序。
+- **MuQ**：播放顺序、风格连续性和 cue 对兼容度。
+- **本地 DSP**：BPM 同步、逐拍相位锁定、低频所有权、HPSS 和最终转场渲染。
 
-## 1.2.10 的主要变化
+## 1.2.12 的核心变化
 
-### CUE-DETR 与 All-In-One 共存修复
+### 1. 取消“尾部接头部”硬约束
 
-- 为纯 PyTorch `natten` 和 `natten.functional` 兼容模块补充合法 `ModuleSpec`。
-- Transformers 的可选依赖检查不再报 `natten.__spec__ is None`。
-- CUE-DETR 检测会直接导入 `DetrImageProcessor` 与 `DetrForObjectDetection`。
-- GUI 会区分缺少依赖与导入冲突。
-- 安装器和验证器会模拟真实的 All-In-One → CUE-DETR 导入顺序。
-
-### CUE-DETR-only 切点（1.2.9 起）
-
-旧版的以下切点来源已经停用：
-
-- checkerboard novelty 自动边界
-- 固定 4/8/16 小节周期候选
-- 能量阈值自动造点
-- 静音尾部重新选择切点
-- 截止保护临时移动到任意位置
-
-新的流程：
+1.2.11 曾强制：
 
 ```text
-整曲音频
-  ↓
-22.05 kHz Mel 频谱
-  ↓
-CUE-DETR 75% 重叠滑窗预测
-  ↓
-合并重叠窗口候选并做峰值筛选
-  ↓
-吸附到 Beat This! downbeat
-  ↓
-All-In-One / MuQ / BPM / 调性只做排序
+A OUT：后 42% / 最后 48 小节
+B IN ：前 35% / 前 32 小节
 ```
 
-即使 AutoMix 降级为短淡化，也只能缩短已经选中的 CUE-DETR cue 对，不能移动到新的规则位置。
+1.2.12 已完全移除这些位置门槛和 `tail_to_head` 加分。现在所有有效 CUE-DETR cue 都可以参加配对，候选只根据以下因素排序：
 
-### Mixxx 风格的三级预读
+- downbeat 与乐句边界；
+- CUE-DETR IN/OUT 置信度；
+- BPM/鼓组相位稳定性；
+- 低频碰撞和双人声风险；
+- 音量、能量弧线和频谱连续性；
+- 调性、All-In-One 结构与 MuQ 局部兼容度。
 
-本项目没有复制 Mixxx 源码，而是采用其 `CachingReader / ReadAheadManager / worker scheduler` 所体现的实时播放原则：耗时工作不能等到音频回调或 OUT 点附近才开始。
+歌曲中的位置仍会写入诊断指标，但权重为 0，不会淘汰中段或后段的优秀 cue。
 
-滑动窗口现在分为：
+### 2. 自动转场收敛为三种保守手法
 
-1. **分析窗口**：提前完成 Beat This!、All-In-One、CUE-DETR 和 MuQ 缓存。
-2. **计划窗口**：提前解码、BPM 同步并搜索相邻歌曲的 CUE-DETR cue 对。
-3. **渲染窗口**：提前生成 Phrase-Lock、Deck Phase Lock、BPM 恢复桥和最终过渡音频。
+保留：
 
-播放启动前，当前歌曲与紧邻下一首的完整过渡必须已经就绪。窗口后方的相邻歌曲对继续后台渲染，并受内存上限控制。
+- **Long Blend**：适合调性、人声和能量兼容的长乐句融合。
+- **Bass Swap**：下一首鼓组先建立，在乐句中点附近交换低频所有权。
+- **Echo Out**：只在双人声风险高或调性兼容较低时作为安全退出候选。
 
-日志示例：
+删除自动渲染分支：
+
+- Drop Swap
+- Double Drop
+- Loop Out
+- Filter Ride
+- Post-Drop Relay
+- Breakdown Lift
+
+旧设置中的 `Adaptive Human` 会自动迁移为 `Natural Auto`。被删除的手法无法再直接渲染。
+
+### 3. 按真实接歌公式渲染
+
+自动转场统一执行：
 
 ```text
-CUE-DETR 完成：Track B.flac · 7 个 cue
-滑动窗口提前渲染 2/8：Track A → Track B
-滑动窗口完整过渡就绪：Track A → Track B · CUE-DETR 184.0s
-开始播放：Track A
-滑动窗口命中完整过渡：Track A → Track B
+1. 两首歌按 BPM、beat 和 downbeat 对齐
+2. 在乐句边界开始重叠
+3. B 的鼓组先平滑进入，B 的低频保持关闭
+4. A 的鼓组继续维持 groove，避免提前出现能量洞
+5. 乐句中段交换 bass 所有权
+6. A 的和声/人声与鼓组平滑退出
+7. B 在过渡终点完全接管
 ```
 
-## 安装
+低频使用互补增益：
 
-建议解压到新目录：
+```text
+bass_A + bass_B = 1
+```
+
+不再使用会在交接中点造成双低频增益的 equal-power bass 叠加。Echo 仅处理旧歌的和声层，低频不会送入 delay，反馈也限制在保守范围。
+
+### 4. 去除“为了变化而变化”
+
+删除真人变化度、最近手法惩罚和随机化式候选奖励。相同音频、相同分析和相同设置会得到完全相同的转场结果，便于试听、复现和调试。
+
+## 安装与升级
+
+已有 1.2.11 环境不需要重新安装模型或 CUDA：
 
 ```powershell
 conda activate beatthis-auto-dj
-cd beatthis_muq_cuedetr_auto_dj_gui_v1210
-
-python install_cuedetr.py
+cd beatthis_muq_cuedetr_auto_dj_gui_v1212
 python verify_cuedetr.py
 python app.py
 ```
 
-`install_cuedetr.py` 不会重装 PyTorch，避免覆盖已有 CUDA 构建。首次分析会下载：
+首次安装：
 
-- `disco-eth/cue-detr`
-- `facebook/detr-resnet-50` 图像处理配置
+```powershell
+python install_cuedetr.py
+python verify_cuedetr.py --download --device cuda
+python app.py
+```
 
 ## 推荐设置
 
 ```text
+过渡长度：自动（8 / 16 / 32 小节）
+自然接歌策略：Natural Auto
+候选手法数：3
+效果强度：45%–70%
+AutoMix 策略：AutoMix-like
+时间拉伸：Rubber Band R3
 CUE-DETR 设备：cuda 或 auto
-灵敏度：0.88–0.93
+CUE-DETR 灵敏度：0.88–0.93
 最小 cue 间隔：8 或 16 小节
-滑动窗口：3–4 轨
-预加载内存：1024–2048 MB
-截止保护：60–90 秒
-Beat This! / MuQ：auto 或 cuda
-All-In-One：cpu
-Rubber Band：R3
 ```
 
-灵敏度过高会减少候选，过低会产生过多候选。电子音乐建议先从 `0.90 / 8 小节` 开始。
+人声密集的流行音乐建议把效果强度控制在 45%–60%；纯器乐 House/Techno 可使用 60%–70%。
 
 ## 使用流程
 
-1. 添加歌曲。
-2. 等待 Beat This!、All-In-One、CUE-DETR 和 MuQ 完成。
-3. MuQ 完成后自动调整尚未播放的顺序。
-4. 等待状态显示“热下一轨预加载完成”。
-5. 点击播放。
+1. 添加歌曲并等待 Beat This!、All-In-One、CUE-DETR 和 MuQ 分析完成。
+2. 等待当前歌曲与下一首的热预加载完成。
+3. 点击播放；播放线程会复用预渲染结果。
+4. 时间轴显示 OUT、IN、乐句长度、结构角色和最终自然接歌手法。
+5. 如果自动分析的 BeatGrid 或 phrase 明显错误，应先修正分析数据，而不是增加效果强度掩盖错拍。
 
-如果任何待播放歌曲没有 CUE-DETR profile，程序会阻止播放并启动 cue 分析，不会静默使用旧算法。
+## 测试
 
-## 缓存
+完整测试：
 
-CUE-DETR 缓存目录：
+```bash
+pytest -q
+```
+
+自然转场独立检查：
+
+```bash
+python check_natural_transition.py
+```
+
+当前结果：
 
 ```text
-~/.cache/beatthis_auto_dj/cue_detr
+71 passed
+PASS: natural transition renderer invariants satisfied
 ```
 
-缓存键包含文件大小、修改时间、模型、灵敏度、最小间隔和 Beat This! BPM 网格信息。
+专项覆盖：
 
-## 验证
+- 所有 CUE-DETR cue 均可参与，不存在 42%/48 小节与 35%/32 小节门槛；
+- 歌曲位置不参与评分；
+- 下一首鼓组先建立，再释放上一首；
+- bass 所有权之和恒为 1；
+- 控制曲线连续，首尾所有权正确；
+- 干净的歌曲配对不会滥用 Echo；
+- 高人声/低调性兼容时才加入 Echo 候选；
+- 已删除的冲击式手法会明确拒绝；
+- 完整预加载、Seek、BPM 恢复、相位锁定和 CUE-DETR-only 回归测试继续通过。
 
-- 56 项自动测试通过
-- CUE-DETR downbeat 吸附测试通过
-- 最小小节距离测试通过
-- 旧 cue 数组清零测试通过
-- 匹配器只使用 CUE-DETR cue 测试通过
-- Gapless/截止降级不移动 neural cue 测试通过
-- 完整相邻歌曲过渡滑动缓存测试通过
-- GUI 无头启动测试通过
+## 研究与实现依据
 
-## CUE-DETR 显示 `natten.__spec__ is None`
-
-这是 1.2.9 中 All-In-One 的 NATTEN 兼容模块与 Transformers 的导入检测冲突，
-不是 CUE-DETR 依赖没有安装。1.2.10 已修复，已有环境无需重装：
-
-```powershell
-python verify_cuedetr.py
-python app.py
-```
-
+参见 `SOURCES.md` 与 `RESEARCH_NOTES.md`。核心原则是：准确 BeatGrid 是 Sync、循环和节拍效果的前提；phrase/downbeat 决定接歌结构；平滑 crossfade 与明确低频所有权优先于堆叠效果。

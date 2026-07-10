@@ -93,11 +93,13 @@ def test_settings_store_roundtrip(tmp_path) -> None:
     assert not path.with_suffix(".json.tmp").exists()
 
 
-def test_sliding_window_warms_tracks_after_hot_next(monkeypatch) -> None:
+def test_sliding_window_light_plans_only_nearest_future_pair(monkeypatch) -> None:
     engine = AutoDJEngine(
         EngineConfig(preload_window_tracks=4, preload_memory_mb=256)
     )
     tracks = [_track("A", 120), _track("B", 122), _track("C", 124), _track("D", 126)]
+    restore_calls: list[str] = []
+    render_calls: list[str] = []
 
     def fake_prepare(item, target_bpm=None):
         return SimpleNamespace(
@@ -106,11 +108,21 @@ def test_sliding_window_warms_tracks_after_hot_next(monkeypatch) -> None:
             analysis=item,
         )
 
-    plan = SimpleNamespace(next_end=64)
+    plan = SimpleNamespace(
+        next_end=64, current_start=32, next_start=0, current_end=96,
+        bars=4, dj_intent="Outro to Intro", transition_mode="test",
+        score=0.8, metrics={},
+    )
     monkeypatch.setattr(engine, "prepare_track", fake_prepare)
     monkeypatch.setattr(engine, "_calculate_plan", lambda *args, **kwargs: plan)
-    monkeypatch.setattr(engine, "_apply_tempo_restore", lambda track, end: track)
-    monkeypatch.setattr(engine, "_render_advanced_transition", lambda p, a, b: p)
+    monkeypatch.setattr(
+        engine, "_apply_tempo_restore",
+        lambda track, end: restore_calls.append(track.analysis.path) or track,
+    )
+    monkeypatch.setattr(
+        engine, "_render_advanced_transition",
+        lambda p, a, b: render_calls.append(b.analysis.path) or p,
+    )
 
     assert engine.preload_pair(tracks, 0)
     deadline = time.time() + 2.0
@@ -119,5 +131,22 @@ def test_sliding_window_warms_tracks_after_hot_next(monkeypatch) -> None:
 
     assert engine._prime_current.analysis.path == "A.wav"
     assert engine._prime_next.analysis.path == "B.wav"
-    rendered_paths = {key[2] for key in engine._rendered_pair_cache.keys()}
-    assert rendered_paths == {"C.wav", "D.wav"}
+    # Before playback, only the hot A->B pair is heavy-rendered. Future planning
+    # cannot delay the Play button.
+    assert restore_calls == ["B.wav"]
+    assert render_calls == ["B.wav"]
+    assert not engine._planned_pair_cache
+    assert not engine._rendered_pair_cache
+
+    # Once playback starts, the sliding window light-plans only the nearest B->C
+    # pair; D remains untouched and no additional restore/render is performed.
+    engine._playing = True
+    engine._loader_generation = 7
+    engine._warm_following_tracks(
+        tracks, first_target_index=2, outgoing_track=engine._prime_next,
+        generation=7, token_kind="loader",
+    )
+    planned_paths = {key[2] for key in engine._planned_pair_cache.keys()}
+    assert planned_paths == {"C.wav"}
+    assert restore_calls == ["B.wav"]
+    assert render_calls == ["B.wav"]

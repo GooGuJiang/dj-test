@@ -4,14 +4,9 @@ from __future__ import annotations
 
 The matcher in this project already estimates local audio compatibility.  This
 module adds a second layer that models *when a human DJ would actually make the
-move*.  It favours transitions such as:
-
-- finishing a drop, then handing over to the next track's intro/buildup;
-- letting the incoming buildup land exactly on its drop;
-- breakdown-to-drop lifts;
-- conservative outro-to-intro blends;
-- vocal exits into instrumental material;
-- double drops only when both phrase endings land on drop boundaries.
+move*. It scores phrase boundaries, energy arcs, vocal overlap and bass safety,
+then maps every structural situation onto one of three conservative renderers:
+long blend, bass handover, or vocal echo exit.
 
 The implementation is deterministic and bar-synchronous.  It is inspired by
 public cue-point, phrasing, Raveform and real-DJ-mix analysis research, but does
@@ -28,10 +23,10 @@ from .models import PreparedTrack
 INTENT_CODES = {
     "Safe Phrase Blend": 0,
     "Outro-Intro Blend": 1,
-    "Post-Drop Relay": 2,
-    "Breakdown Lift": 3,
-    "Phrase-to-Drop": 4,
-    "Double Drop": 5,
+    "Energy Relay Blend": 2,
+    "Breakdown Blend": 3,
+    "Phrase Landing Blend": 4,
+    "Bass Handover": 5,
     "Vocal Echo Exit": 6,
 }
 
@@ -197,12 +192,12 @@ def _role_path_score(
 
 def _recommended(intent: str) -> tuple[str, ...]:
     mapping = {
-        "Post-Drop Relay": ("Post-Drop Relay", "Bass Swap", "Long Blend"),
-        "Breakdown Lift": ("Breakdown Lift", "Filter Ride", "Drop Swap"),
-        "Phrase-to-Drop": ("Breakdown Lift", "Drop Swap", "Filter Ride"),
-        "Double Drop": ("Double Drop", "Drop Swap", "Bass Swap"),
-        "Outro-Intro Blend": ("Long Blend", "Bass Swap", "Filter Ride"),
-        "Vocal Echo Exit": ("Echo Out", "Loop Out", "Filter Ride"),
+        "Energy Relay Blend": ("Bass Swap", "Long Blend", "Echo Out"),
+        "Breakdown Blend": ("Long Blend", "Bass Swap", "Echo Out"),
+        "Phrase Landing Blend": ("Long Blend", "Bass Swap", "Echo Out"),
+        "Bass Handover": ("Bass Swap", "Long Blend", "Echo Out"),
+        "Outro-Intro Blend": ("Long Blend", "Bass Swap", "Echo Out"),
+        "Vocal Echo Exit": ("Echo Out", "Long Blend", "Bass Swap"),
         "Safe Phrase Blend": ("Long Blend", "Bass Swap", "Echo Out"),
     }
     return mapping.get(intent, mapping["Safe Phrase Blend"])
@@ -223,19 +218,19 @@ def _choose_intent(
         and harmonic >= 0.58
         and bass_clean >= 0.50
     ):
-        return "Double Drop"
+        return "Bass Handover"
     if (
         post_drop >= 0.65
         and next_role in {"INTRO", "BUILDUP", "PHRASE", "BREAKDOWN"}
         and next_landing in {"DROP", "CHORUS"}
     ):
-        return "Post-Drop Relay"
+        return "Energy Relay Blend"
     if (
         current_role in {"BREAKDOWN", "BREAK", "BRIDGE"}
         and next_role in {"INTRO", "BUILDUP", "BREAKDOWN", "PHRASE"}
         and next_landing in {"DROP", "CHORUS"}
     ):
-        return "Breakdown Lift"
+        return "Breakdown Blend"
     if current_role == "OUTRO" and next_role in {"INTRO", "PHRASE", "SECTION"}:
         return "Outro-Intro Blend"
     if (
@@ -244,7 +239,7 @@ def _choose_intent(
     ):
         return "Vocal Echo Exit"
     if next_landing in {"DROP", "CHORUS"}:
-        return "Phrase-to-Drop"
+        return "Phrase Landing Blend"
     return "Safe Phrase Blend"
 
 
@@ -293,7 +288,7 @@ def evaluate_phrase_policy(
     if current_role == "DROP":
         bars_until_change = _bars_until_role_change(current, current_index)
         # Starting a long blend halfway through a drop is strongly discouraged.
-        # A final one/two-bar drop swap remains possible.
+        # A short, phrase-aligned bass handover remains possible.
         drop_guard = 0.78 if bars_until_change <= 2 or bars <= 4 else 0.16
     else:
         drop_guard = 1.0
@@ -324,9 +319,9 @@ def evaluate_phrase_policy(
         + 0.10 * drop_guard
     )
     # Intent-specific safeguards.
-    if intent == "Double Drop":
+    if intent == "Bass Handover":
         score *= float(np.clip(0.60 + 0.22 * harmonic + 0.18 * bass_clean, 0.0, 1.0))
-    if current_role == "DROP" and intent != "Double Drop":
+    if current_role == "DROP" and intent != "Bass Handover":
         score *= drop_guard
 
     return PhrasePolicyEvaluation(

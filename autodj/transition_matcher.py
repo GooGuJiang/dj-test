@@ -16,11 +16,15 @@ from .muq_analyzer import cosine_similarity
 
 @dataclass(frozen=True)
 class MatcherConfig:
-    allowed_bars: tuple[int, ...] = (4, 8, 16, 32)
-    max_exit_candidates: int = 48
-    max_entry_candidates: int = 40
-    min_auto_exit_position: float = 0.42
-    max_auto_entry_position: float = 0.45
+    # Automatic intro/outro blends use at least 8 bars so deck B becomes
+    # perceptible before deck A reaches its final few bars. A user-requested
+    # fixed 4-bar transition is still honored through ``requested_bars``.
+    allowed_bars: tuple[int, ...] = (8, 16, 32)
+    max_exit_candidates: int = 32
+    max_entry_candidates: int = 24
+    # CUE-DETR remains the only cue source. Positional tail/head windows are
+    # intentionally not used: every neural cue may compete on phrase, beat,
+    # vocal, bass and energy compatibility.
     feature_sample_rate: int = 22_050
     waveform_bins: int = 640
 
@@ -472,11 +476,11 @@ def _score_candidate(
     bass_clean = float(np.clip(1.0 - 1.55 * bass_collision, 0.0, 1.0))
     vocal_clean = float(np.clip(1.0 - 1.70 * vocal_overlap, 0.0, 1.0))
 
+    # Positions are retained only for diagnostics. They do not influence the
+    # score, so a musically valid middle-section cue can beat a weak tail/head
+    # pair.
     a_position = current_index / max(a.count - 1, 1)
     b_position = next_index / max(b.count - 1, 1)
-    exit_structure = float(np.exp(-((a_position - 0.76) / 0.27) ** 2))
-    entry_structure = float(np.exp(-((b_position - 0.11) / 0.20) ** 2))
-    structure = 0.58 * exit_structure + 0.42 * entry_structure
 
     third = max(1, bars // 3)
     a_decay = float(np.mean(a.rms[a_slice][:third]) - np.mean(a.rms[a_slice][-third:]))
@@ -583,34 +587,29 @@ def _score_candidate(
     # arbitrary position priors. Parametric EQ/fader terms follow the
     # differentiable-DSP transition literature.
     score = (
-        0.11 * continuity
+        0.12 * continuity
         + 0.08 * harmonic
-        + 0.05 * key_score
+        + 0.04 * key_score
         + 0.05 * rhythm
         + 0.01 * brightness
-        + 0.08 * bass_clean
-        + 0.08 * vocal_clean
-        + 0.02 * structure
-        + 0.03 * dynamics
+        + 0.10 * bass_clean
+        + 0.10 * vocal_clean
+        + 0.04 * dynamics
         + 0.02 * length_fit
-        + 0.07 * cue_alignment
-        + 0.05 * phrase_alignment
+        + 0.08 * cue_alignment
+        + 0.07 * phrase_alignment
         + 0.01 * edm_confidence
         + 0.04 * muq_style
-        + 0.05 * muq_segment
+        + 0.04 * muq_segment
         + 0.02 * muq_trajectory
         + 0.04 * allin1_boundary
         + 0.04 * role_compatibility
-        + 0.15 * phrase_policy.score
+        + 0.10 * phrase_policy.score
     )
     # Starting a long blend in the middle of a drop should lose even when its
-    # low-level similarity metrics happen to look good.  A deliberate double
-    # drop or final one/two-bar swap remains available through the policy guard.
+    # low-level similarity metrics happen to look good. The phrase guard steers
+    # unsafe drop material toward a conservative bass handover instead.
     score *= 0.74 + 0.26 * phrase_policy.drop_guard_score
-    if phrase_policy.intent == "Double Drop":
-        # Prefer structurally valid dual-drop candidates, while the renderer still
-        # rejects them when low-frequency or perceptual quality is clearly worse.
-        score += 0.045 * phrase_policy.drop_landing_score
     metrics = {
         "continuity": continuity,
         "harmonic": harmonic,
@@ -619,7 +618,9 @@ def _score_candidate(
         "brightness": brightness,
         "bass_clean": bass_clean,
         "vocal_clean": vocal_clean,
-        "structure": structure,
+        "out_position": float(a_position),
+        "in_position": float(b_position),
+        "position_bias_applied": 0.0,
         "dynamics": dynamics,
         "length_fit": length_fit,
         "cue_alignment": cue_alignment,
@@ -652,31 +653,20 @@ def _score_candidate(
 def _candidate_indices(
     track: PreparedTrack,
     earliest_sample: int,
-    is_exit: bool,
-    config: MatcherConfig,
 ) -> np.ndarray:
-    """Return CUE-DETR candidates only.
+    """Return every valid CUE-DETR candidate after the time floor.
 
-    v1.2.9 intentionally removes the legacy all-bar/novelty candidate search.
-    Structure and MuQ may rank a neural cue, but cannot add another bar.
+    v1.2.11 forced exits into the final 42%/48 bars and entries into the first
+    35%/32 bars. That produced predictable tail-to-head mixes but rejected
+    stronger phrase boundaries elsewhere. Candidate direction is now expressed
+    by CUE-DETR's IN/OUT scores and the pair scorer, not by song-position gates.
     """
     features = track.bar_features
     indices = np.asarray(track.structure.cue_indices, dtype=np.int64)
     indices = indices[(indices >= 0) & (indices < features.count)]
-    indices = indices[features.start_samples[indices] >= earliest_sample]
     if indices.size == 0:
         return indices
-    positions = indices / max(features.count - 1, 1)
-    if is_exit:
-        preferred = indices[positions >= config.min_auto_exit_position]
-        if preferred.size:
-            indices = preferred
-        indices = indices[-config.max_exit_candidates :]
-    else:
-        preferred = indices[positions <= config.max_auto_entry_position]
-        if preferred.size:
-            indices = preferred
-        indices = indices[: config.max_entry_candidates]
+    indices = indices[features.start_samples[indices] >= earliest_sample]
     return np.unique(indices)
 
 
@@ -777,8 +767,6 @@ def find_best_transition(
         exit_indices = _candidate_indices(
             current,
             earliest_sample=earliest_start,
-            is_exit=True,
-            config=config,
         )
     else:
         neural = np.asarray(current.structure.cue_indices, dtype=np.int64)
@@ -792,8 +780,6 @@ def find_best_transition(
     entry_indices = _candidate_indices(
         next_track,
         earliest_sample=0,
-        is_exit=False,
-        config=config,
     )
     exit_scores = np.asarray(current.structure.mix_out_score, dtype=np.float32)
     entry_scores = np.asarray(next_track.structure.mix_in_score, dtype=np.float32)
