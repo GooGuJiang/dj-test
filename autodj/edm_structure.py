@@ -153,14 +153,13 @@ def analyze_edm_structure(
     features: BarFeatures,
     beats_per_bar: int = 4,
 ) -> EDMStructure:
-    """
-    Implements the reproducible parts of Zehren et al. (2020):
+    """Extract supporting EDM roles, key and energy features only.
 
-    1. novelty in rhythm/loudness/timbre/harmony,
-    2. four-bar period-phase selection,
-    3. four-bar post-boundary salience filtering.
-
-    It also adds the 8/16-bar phrase prior reported by CUE-DETR for EDM.
+    Since v1.2.9 this function is deliberately *not* a cue detector.  The
+    previous checkerboard/period/salience cue proposal has been removed from
+    the playback decision path.  Every transition candidate is supplied by
+    CUE-DETR and later quantized by Beat This!.  These local descriptors remain
+    useful for role naming, Camelot compatibility and transition rendering.
     """
     count = features.count
     if count == 0:
@@ -172,79 +171,27 @@ def analyze_edm_structure(
     brightness = _unit(features.brightness)
     vocal = _unit(features.vocal_proxy)
 
-    # Paper's seven categories approximated from the available mix signal.
-    kick = (onset * low)[:, None]
-    snare = (onset * (1.0 - low) * (1.0 - 0.35 * brightness))[:, None]
-    hihat = (onset * brightness)[:, None]
-    harmonic_rms = (rms * (1.0 - 0.28 * onset))[:, None]
-    percussive_rms = (rms * (0.25 + 0.75 * onset))[:, None]
-    cqt_proxy = np.column_stack((rms, low, brightness, vocal))
-    pcp = features.chroma
-
-    novelty_components = np.stack(
-        [
-            checkerboard_novelty(kick),
-            checkerboard_novelty(snare),
-            checkerboard_novelty(hihat),
-            checkerboard_novelty(harmonic_rms),
-            checkerboard_novelty(percussive_rms),
-            checkerboard_novelty(cqt_proxy),
-            checkerboard_novelty(pcp),
-        ],
-        axis=0,
-    )
-    # Union of feature-specific novelty peaks, as in Algorithm 1.
-    peak_votes = np.stack([_peak_mask(row) for row in novelty_components], axis=0)
-    combined = 0.55 * np.max(novelty_components, axis=0) + 0.45 * np.mean(
-        novelty_components, axis=0
-    )
-    combined = _unit(combined)
-    candidates = np.any(peak_votes, axis=0)
-
-    phase = _period_phase(combined, period_bars=4)
-    phrase = _phrase_mask(count, phase)
-    period_select = phrase >= 0.60
+    # A lightweight diagnostic boundary curve is retained solely for role
+    # labelling.  It cannot become a cue because all cue/mix arrays returned
+    # below are zero and are replaced only by apply_cuedetr_cues().
+    descriptor = np.column_stack((rms, onset, low, brightness, vocal))
+    delta = np.zeros(count, dtype=np.float32)
+    if count > 1:
+        delta[1:] = np.linalg.norm(np.diff(descriptor, axis=0), axis=1).astype(np.float32)
+    combined = _unit(ndimage.gaussian_filter1d(delta.astype(np.float64), sigma=0.7))
 
     harmonic_energy = _unit(features.rms * (1.0 - 0.25 * onset))
     percussive_energy = _unit(features.rms * (0.15 + 0.85 * onset))
     salience = np.zeros(count, dtype=np.float32)
     for index in range(count):
         end = min(count, index + 4)
-        if end <= index:
-            continue
         harmonic_future = float(np.mean(harmonic_energy[index:end]))
         percussive_future = float(np.mean(percussive_energy[index:end]))
-        # Harmonic threshold follows the paper; percussion keeps drum-only EDM intros usable.
         salience[index] = max(harmonic_future, 0.86 * percussive_future)
     salience = _unit(salience)
-    salience_select = salience >= 0.40
-
-    raw = combined * (0.62 + 0.38 * phrase)
-    raw *= np.where(candidates, 1.0, 0.35)
-    raw *= np.where(period_select, 1.0, 0.18)
-    raw *= np.where(salience_select, 1.0, 0.22)
-    cue_score = _unit(raw)
-
-    position = np.linspace(0.0, 1.0, count, dtype=np.float32)
-    low_vocal = 1.0 - vocal
-    four_floor = np.clip(onset * low * 1.45, 0.0, 1.0)
-    mix_in = cue_score * (
-        0.48 * salience + 0.25 * low_vocal + 0.17 * four_floor + 0.10 * (1.0 - position)
-    )
-    mix_out = cue_score * (
-        0.34 * (0.35 + 0.65 * position)
-        + 0.28 * low_vocal
-        + 0.22 * (1.0 - salience)
-        + 0.16 * phrase
-    )
-    mix_in = _unit(mix_in)
-    mix_out = _unit(mix_out)
 
     labels: list[str] = []
     energy = _unit(features.rms)
-    # Raveform-compatible functional vocabulary. The public Raveform dataset
-    # annotates intro, buildup, breakdown, drop, cooldown and outro; here we
-    # infer the same roles from bar-synchronous energy, percussion and novelty.
     for index in range(count):
         before_slice = energy[max(0, index - 4) : index]
         after_slice = energy[index : min(count, index + 4)]
@@ -262,59 +209,48 @@ def analyze_edm_structure(
             label = "INTRO"
         elif index >= int(0.86 * count):
             label = "OUTRO"
-        elif (
-            rise > 0.16
-            and after > 0.55
-            and (boundary > 0.30 or salience[index] > 0.55)
-        ):
+        elif rise > 0.16 and after > 0.55 and (boundary > 0.30 or salience[index] > 0.55):
             label = "BUILDUP"
-        elif (
-            fall > 0.17
-            and after < 0.55
-            and (boundary > 0.25 or percussion_here < 0.45)
-        ):
+        elif fall > 0.17 and after < 0.55 and (boundary > 0.25 or percussion_here < 0.45):
             label = "BREAKDOWN"
-        elif (
-            after > 0.62
-            and percussion_here > 0.48
-            and low_here > 0.38
-            and (rise > 0.10 or boundary > 0.42)
-        ):
+        elif after > 0.62 and percussion_here > 0.48 and low_here > 0.38 and (rise > 0.10 or boundary > 0.42):
             label = "DROP"
-        elif (
-            local > after + 0.10
-            and before > 0.55
-            and after > 0.34
-        ):
+        elif local > after + 0.10 and before > 0.55 and after > 0.34:
             label = "COOLDOWN"
         elif vocal_here > 0.64:
             label = "VOCAL"
-        elif phrase[index] >= 0.85:
-            label = "PHRASE"
         else:
             label = "SECTION"
         labels.append(label)
 
     key_index, mode, camelot, key_confidence = _estimate_key(features)
     silence_start, silence_end = _silence_bounds(audio, sample_rate)
-
-    regularity = float(np.mean(combined[period_select])) if np.any(period_select) else 0.0
+    four_floor = np.clip(onset * low * 1.45, 0.0, 1.0)
     meter_score = 1.0 if beats_per_bar == 4 else 0.20
     drum_score = float(np.clip(np.mean(four_floor) * 1.45, 0.0, 1.0))
-    phrase_score = float(np.clip(0.45 * regularity + 0.55 * np.mean(phrase[candidates]) if np.any(candidates) else regularity, 0.0, 1.0))
+    dynamics_score = float(np.clip(np.std(energy) * 2.2 + np.mean(combined) * 0.8, 0.0, 1.0))
     edm_confidence = float(
-        np.clip(0.38 * meter_score + 0.30 * drum_score + 0.24 * phrase_score + 0.08 * key_confidence, 0.0, 1.0)
+        np.clip(
+            0.48 * meter_score
+            + 0.34 * drum_score
+            + 0.10 * dynamics_score
+            + 0.08 * key_confidence,
+            0.0,
+            1.0,
+        )
     )
 
+    zeros = np.zeros(count, dtype=np.float32)
     return EDMStructure(
         novelty=np.ascontiguousarray(combined, dtype=np.float32),
-        cue_score=np.ascontiguousarray(cue_score, dtype=np.float32),
-        mix_in_score=np.ascontiguousarray(mix_in, dtype=np.float32),
-        mix_out_score=np.ascontiguousarray(mix_out, dtype=np.float32),
+        cue_score=zeros.copy(),
+        mix_in_score=zeros.copy(),
+        mix_out_score=zeros.copy(),
         salience=np.ascontiguousarray(salience, dtype=np.float32),
-        phrase_mask=np.ascontiguousarray(phrase, dtype=np.float32),
+        phrase_mask=zeros.copy(),
         labels=tuple(labels),
-        phase_offset=phase,
+        structure_source="local roles only; CUE-DETR supplies all cue points",
+        phase_offset=0,
         key_index=key_index,
         mode=mode,
         camelot=camelot,

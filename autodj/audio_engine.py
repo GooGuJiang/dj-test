@@ -17,13 +17,14 @@ from scipy import signal
 
 from .edm_structure import analyze_edm_structure
 from .allinone_structure import fuse_allinone_structure
+from .cuedetr_structure import apply_cuedetr_cues
 from .human_transition import (
     HumanTransitionConfig,
     SUPPORTED_ARCHETYPES,
-    align_percussive_beat_grid,
+    lock_incoming_deck_phase,
     render_human_transition,
 )
-from .models import AllInOneProfile, MuQProfile, PreparedTrack, TrackAnalysis, TransitionPlan
+from .models import AllInOneProfile, CueDETRProfile, MuQProfile, PreparedTrack, TrackAnalysis, TransitionPlan
 from .muq_analyzer import MuQAnalyzer
 from .spectral_seam import spectral_seam_crossfade
 from .time_stretch import (
@@ -47,6 +48,13 @@ class _PrepareJob:
     users: int = 0
     result: PreparedTrack | None = None
     error: BaseException | None = None
+
+
+@dataclass
+class _RenderedPair:
+    synced_base: PreparedTrack
+    prepared: PreparedTrack
+    plan: TransitionPlan
 
 
 @dataclass
@@ -84,6 +92,14 @@ class EngineConfig:
     # GUI performs batch analysis before playback. Keeping runtime inference off
     # prevents All-In-One inference from unexpectedly blocking next-track preload.
     allin1_runtime_inference: bool = False
+    # CUE-DETR is the only source of transition cue candidates. Beat This! only
+    # quantizes its predictions to downbeats; All-In-One/local features provide
+    # labels and pair ranking but cannot create additional cue points.
+    cuedetr_enabled: bool = True
+    cuedetr_device: str = "auto"
+    cuedetr_model_name: str = "disco-eth/cue-detr"
+    cuedetr_sensitivity: float = 0.90
+    cuedetr_min_bars: int = 8
     # Generate several context-aware DJ techniques and select the best with
     # reference-aware transition quality metrics.
     human_style_mode: str = "Adaptive Human"
@@ -294,6 +310,7 @@ class AutoDJEngine:
         # 在准备下一首时再次运行大模型。
         self._preloaded_muq_profiles: dict[str, MuQProfile] = {}
         self._preloaded_allin1_profiles: dict[str, AllInOneProfile] = {}
+        self._preloaded_cuedetr_profiles: dict[str, CueDETRProfile] = {}
 
         # Sliding-window preloader. The immediate next track is rendered hot in
         # self._next; later tracks are kept as synchronized warm PreparedTrack
@@ -302,6 +319,11 @@ class AutoDJEngine:
         self._warm_cache: OrderedDict[tuple[Any, ...], PreparedTrack] = OrderedDict()
         self._warm_cache_bytes = 0
         self._warm_loading_paths: set[str] = set()
+        # Future adjacent pairs are fully planned and rendered in the sliding
+        # window, following Mixxx-style read-ahead rather than waiting until the
+        # current song is near its end.
+        self._rendered_pair_cache: OrderedDict[tuple[Any, ...], _RenderedPair] = OrderedDict()
+        self._rendered_pair_cache_bytes = 0
         self._preload_urgent = False
         self._urgent_notice_index = -1
 
@@ -364,6 +386,18 @@ class AutoDJEngine:
         self.emit(f"All-In-One 尚未预分析：{analysis.title}，使用本地结构估计")
         return AllInOneProfile(backend="not-preloaded")
 
+    def _get_cuedetr_profile(self, analysis: TrackAnalysis) -> CueDETRProfile:
+        if not self.config.cuedetr_enabled:
+            raise RuntimeError("CUE-DETR 是唯一切点来源，不能关闭。")
+        cached = self._preloaded_cuedetr_profiles.get(analysis.path)
+        if cached is not None and cached.available:
+            return cached
+        # Neural cue inference is deliberately completed before playback.  Do
+        # not fabricate a real-time heuristic cue or silently fall back.
+        raise RuntimeError(
+            f"{analysis.title} 尚未完成 CUE-DETR cue 分析；请先在 GUI 中分析全部 cue。"
+        )
+
     def _finish_prepared_track(
         self,
         *,
@@ -385,6 +419,7 @@ class AutoDJEngine:
         tempo_restore_bars: int = 0,
         muq_profile: MuQProfile | None = None,
         allin1_profile: AllInOneProfile | None = None,
+        cuedetr_profile: CueDETRProfile | None = None,
         stretch_backend: str = "librosa",
     ) -> PreparedTrack:
         low, mid, high = _split_three_bands(
@@ -416,6 +451,14 @@ class AutoDJEngine:
                 source_downbeat_samples=source_downbeat_samples,
                 sample_rate=self.config.sample_rate,
             )
+        cuedetr_profile = cuedetr_profile or CueDETRProfile(backend="missing")
+        structure = apply_cuedetr_cues(
+            base=structure,
+            profile=cuedetr_profile,
+            features=features,
+            source_downbeat_samples=source_downbeat_samples,
+            sample_rate=self.config.sample_rate,
+        )
         envelope = waveform_envelope(audio, bins=self.matcher_config.waveform_bins)
         return PreparedTrack(
             analysis=analysis,
@@ -443,6 +486,7 @@ class AutoDJEngine:
             structure=structure,
             muq_profile=muq_profile or MuQProfile(),
             allin1_profile=allin1_profile,
+            cuedetr_profile=cuedetr_profile,
             stretch_backend=stretch_backend,
         )
 
@@ -461,6 +505,10 @@ class AutoDJEngine:
             self.config.muq_device,
             self.config.allin1_enabled,
             self.config.allin1_model_name,
+            self.config.cuedetr_enabled,
+            self.config.cuedetr_model_name,
+            round(self.config.cuedetr_sensitivity, 4),
+            self.config.cuedetr_min_bars,
         )
 
     def prepare_track(
@@ -612,6 +660,7 @@ class AutoDJEngine:
 
         muq_profile = self._get_muq_profile(analysis)
         allin1_profile = self._get_allin1_profile(analysis)
+        cuedetr_profile = self._get_cuedetr_profile(analysis)
         return self._finish_prepared_track(
             analysis=analysis,
             audio=audio,
@@ -628,6 +677,7 @@ class AutoDJEngine:
             cue_sample=cue_sample,
             muq_profile=muq_profile,
             allin1_profile=allin1_profile,
+            cuedetr_profile=cuedetr_profile,
             stretch_backend=stretch_backend,
         )
 
@@ -791,6 +841,7 @@ class AutoDJEngine:
             tempo_restore_bars=bars,
             muq_profile=synced.muq_profile,
             allin1_profile=synced.allin1_profile,
+            cuedetr_profile=synced.cuedetr_profile,
             stretch_backend=backend,
         )
         self.emit(
@@ -864,6 +915,11 @@ class AutoDJEngine:
             self.config.allin1_enabled,
             self.config.allin1_device,
             self.config.allin1_model_name,
+            self.config.cuedetr_enabled,
+            self.config.cuedetr_device,
+            self.config.cuedetr_model_name,
+            round(self.config.cuedetr_sensitivity, 4),
+            self.config.cuedetr_min_bars,
             self.config.preload_window_tracks,
             self.config.preload_memory_mb,
         )
@@ -952,6 +1008,81 @@ class AutoDJEngine:
                 self._warm_cache[key] = track
                 self._warm_cache_bytes += size
 
+    def _rendered_pair_key(
+        self,
+        outgoing: TrackAnalysis,
+        incoming: TrackAnalysis,
+        target_bpm: float,
+    ) -> tuple[Any, ...]:
+        return (
+            "rendered-pair",
+            outgoing.path,
+            incoming.path,
+            round(float(target_bpm), 3),
+            self._preload_config_signature(),
+        )
+
+    @staticmethod
+    def _rendered_pair_bytes(pair: _RenderedPair) -> int:
+        total = 0
+        seen: set[int] = set()
+        for track in (pair.synced_base, pair.prepared):
+            for value in vars(track).values():
+                if isinstance(value, np.ndarray):
+                    pointer = int(value.__array_interface__["data"][0]) if value.size else id(value)
+                    if pointer not in seen:
+                        seen.add(pointer)
+                        total += int(value.nbytes)
+        for value in vars(pair.plan).values():
+            if isinstance(value, np.ndarray):
+                pointer = int(value.__array_interface__["data"][0]) if value.size else id(value)
+                if pointer not in seen:
+                    seen.add(pointer)
+                    total += int(value.nbytes)
+        return total
+
+    def _store_rendered_pair(
+        self,
+        outgoing: TrackAnalysis,
+        incoming: TrackAnalysis,
+        target_bpm: float,
+        pair: _RenderedPair,
+    ) -> None:
+        key = self._rendered_pair_key(outgoing, incoming, target_bpm)
+        size = self._rendered_pair_bytes(pair)
+        budget = max(256, int(self.config.preload_memory_mb)) * 1024 * 1024
+        with self._lock:
+            old = self._rendered_pair_cache.pop(key, None)
+            if old is not None:
+                self._rendered_pair_cache_bytes = max(
+                    0, self._rendered_pair_cache_bytes - self._rendered_pair_bytes(old)
+                )
+            while self._rendered_pair_cache and self._rendered_pair_cache_bytes + size > budget:
+                _, evicted = self._rendered_pair_cache.popitem(last=False)
+                self._rendered_pair_cache_bytes = max(
+                    0, self._rendered_pair_cache_bytes - self._rendered_pair_bytes(evicted)
+                )
+            if size <= budget:
+                self._rendered_pair_cache[key] = pair
+                self._rendered_pair_cache_bytes += size
+
+    def _take_rendered_pair(
+        self,
+        outgoing: TrackAnalysis,
+        incoming: TrackAnalysis,
+        target_bpm: float,
+    ) -> _RenderedPair | None:
+        key = self._rendered_pair_key(outgoing, incoming, target_bpm)
+        with self._lock:
+            pair = self._rendered_pair_cache.pop(key, None)
+            if pair is not None:
+                self._rendered_pair_cache_bytes = max(
+                    0, self._rendered_pair_cache_bytes - self._rendered_pair_bytes(pair)
+                )
+        if pair is not None:
+            self.emit(f"滑动窗口命中完整过渡：{outgoing.title} → {incoming.title}")
+        return pair
+
     def _window_token_valid(self, kind: str, generation: int) -> bool:
         with self._lock:
             if kind == "prime":
@@ -962,40 +1093,55 @@ class AutoDJEngine:
         self,
         snapshot: Sequence[TrackAnalysis],
         first_target_index: int,
-        source_bpm: float,
+        outgoing_track: PreparedTrack,
         generation: int,
         token_kind: str,
     ) -> None:
-        """Prepare the warm portion of the sliding window in priority order."""
-        # Window count includes current and immediate hot next; the remaining
-        # slots are warm synchronized bases.
+        """Fully plan and render future adjacent pairs in the sliding window.
+
+        This mirrors Mixxx's read-ahead principle: expensive decode, stretch, cue
+        search and transition rendering happen before the real-time deck reaches
+        the OUT point.
+        """
         warm_count = max(0, int(self.config.preload_window_tracks) - 2)
         stop = min(len(snapshot), first_target_index + warm_count)
-        previous_bpm = float(source_bpm)
+        previous = outgoing_track
         for target_index in range(first_target_index, stop):
             if not self._window_token_valid(token_kind, generation):
                 return
             outgoing = snapshot[target_index - 1]
             incoming = snapshot[target_index]
-            key = self._warm_key(outgoing, incoming, previous_bpm)
+            target_bpm = previous.original_bpm
+            existing_key = self._rendered_pair_key(outgoing, incoming, target_bpm)
             with self._lock:
-                cached = self._warm_cache.get(key)
-                if cached is not None:
-                    self._warm_cache.move_to_end(key)
-                    previous_bpm = cached.original_bpm
+                if existing_key in self._rendered_pair_cache:
+                    pair = self._rendered_pair_cache[existing_key]
+                    self._rendered_pair_cache.move_to_end(existing_key)
+                    previous = pair.prepared
                     continue
                 self._warm_loading_paths.add(incoming.path)
             try:
                 self.emit(
-                    f"滑动窗口预热 {target_index + 1}/{len(snapshot)}：{incoming.title}"
+                    f"滑动窗口提前渲染 {target_index + 1}/{len(snapshot)}："
+                    f"{outgoing.title} → {incoming.title}"
                 )
-                warmed = self.prepare_track(incoming, target_bpm=previous_bpm)
+                synced = self.prepare_track(incoming, target_bpm=target_bpm)
                 if not self._window_token_valid(token_kind, generation):
                     return
-                self._store_warm_track(outgoing, incoming, previous_bpm, warmed)
-                previous_bpm = warmed.original_bpm
+                plan = self._calculate_plan(
+                    previous, synced, earliest_start=int(0.25 * self.config.sample_rate)
+                )
+                prepared = self._apply_tempo_restore(synced, plan.next_end)
+                plan = self._render_advanced_transition(plan, previous, prepared)
+                pair = _RenderedPair(synced_base=synced, prepared=prepared, plan=plan)
+                self._store_rendered_pair(outgoing, incoming, target_bpm, pair)
+                previous = prepared
+                self.emit(
+                    f"滑动窗口完整过渡就绪：{outgoing.title} → {incoming.title} · "
+                    f"CUE-DETR {float(getattr(plan, 'current_start', 0)) / self.config.sample_rate:.1f}s"
+                )
             except Exception as exc:
-                self.emit(f"暖轨预加载失败：{incoming.title} · {exc}")
+                self.emit(f"未来过渡提前渲染失败：{incoming.title} · {exc}")
                 return
             finally:
                 with self._lock:
@@ -1015,6 +1161,13 @@ class AutoDJEngine:
         with self._lock:
             self._preloaded_allin1_profiles = dict(profiles)
 
+    def set_preloaded_cuedetr_profiles(
+        self, profiles: dict[str, CueDETRProfile]
+    ) -> None:
+        """Inject official neural cue points; legacy cue rules stay disabled."""
+        with self._lock:
+            self._preloaded_cuedetr_profiles = dict(profiles)
+
     def clear_preload(self) -> None:
         with self._lock:
             self._prime_generation += 1
@@ -1027,6 +1180,8 @@ class AutoDJEngine:
             self._warm_cache.clear()
             self._warm_cache_bytes = 0
             self._warm_loading_paths.clear()
+            self._rendered_pair_cache.clear()
+            self._rendered_pair_cache_bytes = 0
             self._preload_urgent = False
 
     def preload_pair(
@@ -1112,7 +1267,7 @@ class AutoDJEngine:
                     self._warm_following_tracks(
                         snapshot=snapshot,
                         first_target_index=start_index + 2,
-                        source_bpm=prepared.original_bpm,
+                        outgoing_track=prepared,
                         generation=generation,
                         token_kind="prime",
                     )
@@ -1176,6 +1331,23 @@ class AutoDJEngine:
         else:
             self.emit("使用后台预加载结果启动播放")
 
+        # Never start the real-time stream without a fully rendered hot next pair.
+        # Waiting here happens on the GUI's playback-start worker thread and avoids
+        # the old failure mode where B only became audible near A's physical end.
+        if start_index + 1 < len(playlist) and (primed_next is None or primed_plan is None):
+            incoming = playlist[start_index + 1]
+            self.emit(f"播放前提前渲染下一首：{incoming.title}")
+            primed_synced = self.prepare_track(incoming, target_bpm=current.original_bpm)
+            primed_plan = self._calculate_plan(
+                current, primed_synced, earliest_start=int(0.25 * self.config.sample_rate)
+            )
+            primed_next = self._apply_tempo_restore(primed_synced, primed_plan.next_end)
+            primed_plan = self._render_advanced_transition(primed_plan, current, primed_next)
+            self.emit(
+                f"播放前完整过渡已就绪：A {primed_plan.current_start / self.config.sample_rate:.1f}s → "
+                f"B {primed_plan.next_start / self.config.sample_rate:.1f}s"
+            )
+
         with self._lock:
             self._playlist = list(playlist)
             self._index = start_index
@@ -1235,34 +1407,24 @@ class AutoDJEngine:
     ) -> TransitionPlan:
         """Build a short silence-trim or beat-aligned equal-power transition."""
         sr = self.config.sample_rate
+        # Even the conservative fallbacks must preserve the neural cue pair.
+        # CUE-DETR is the sole source of transition points; silence trimming and
+        # deadline protection may shorten the overlap, but they may not move the
+        # mix to a newly invented location.
+        current_start = int(base_plan.current_start)
+        next_start = int(base_plan.next_start)
         if mode == "Gapless Trim":
             duration_seconds = 0.38
-            next_start = int(max(0, next_track.structure.silence_start_sample))
-            active_end = int(current.structure.silence_end_sample)
-            if active_end <= 0:
-                active_end = current.total_samples
+            requested = max(256, int(round(duration_seconds * sr)))
             length = min(
-                max(256, int(round(duration_seconds * sr))),
-                max(1, current.total_samples - earliest_start),
+                requested,
+                max(1, current.total_samples - current_start),
                 max(1, next_track.total_samples - next_start),
-            )
-            current_start = max(earliest_start, active_end - length)
-            current_start = min(current_start, max(0, current.total_samples - length))
-            radius = int(0.020 * sr)
-            current_start = _nearest_zero_crossing(current.audio, current_start, radius)
-            next_start = _nearest_zero_crossing(next_track.audio, next_start, radius)
-            length = min(
-                length,
-                current.total_samples - current_start,
-                next_track.total_samples - next_start,
             )
             length = max(1, int(length))
             bars = 0
-            policy = "Silence-trim gapless"
+            policy = "CUE-DETR short gapless"
         else:
-            # Keep phrase-aligned paper cue points but use a conservative fader.
-            current_start = max(earliest_start, base_plan.current_start)
-            next_start = base_plan.next_start
             max_length = int(round(8 * max(2, current.analysis.beats_per_bar) * 60.0 /
                                    max(current.bpm_at_sample(current_start), 1.0) * sr))
             length = min(
@@ -1273,7 +1435,7 @@ class AutoDJEngine:
             )
             length = max(1, int(length))
             bars = min(base_plan.bars, 8)
-            policy = "Simple beat crossfade"
+            policy = "CUE-DETR simple beat crossfade"
 
         gain = float(base_plan.metrics.get("local_gain", 1.0))
         fade_out, fade_in, bass_out, bass_in, high_out, high_in = self._neutral_curves(length, gain)
@@ -1465,22 +1627,73 @@ class AutoDJEngine:
         b_body = np.ascontiguousarray(b - b_low, dtype=np.float32)
         a_harm, a_perc = self._hpss_stereo(a_body)
         b_harm, b_perc = self._hpss_stereo(b_body)
-        b_low, b_perc, grid_metrics = align_percussive_beat_grid(
+
+        def _local_grid(grid: np.ndarray, start: int, end: int) -> np.ndarray:
+            values = np.asarray(grid, dtype=np.int64)
+            mask = (values >= int(start)) & (values < int(end))
+            return np.asarray(values[mask] - int(start), dtype=np.float64)
+
+        a_beat_positions = _local_grid(
+            current.beat_samples,
+            plan.current_start,
+            plan.current_start + total_length,
+        )
+        a_downbeat_positions = _local_grid(
+            current.downbeat_samples,
+            plan.current_start,
+            plan.current_start + total_length,
+        )
+        phrase_source_length = max(1, len(b_raw))
+        phrase_scale = phrase_length / float(phrase_source_length)
+        b_phrase_beats = _local_grid(next_track.beat_samples, plan.next_start, b_end) * phrase_scale
+        b_phrase_downbeats = _local_grid(next_track.downbeat_samples, plan.next_start, b_end) * phrase_scale
+        if tail > 0:
+            b_tail_beats = _local_grid(next_track.beat_samples, b_end, b_end + tail) + phrase_length
+            b_tail_downbeats = _local_grid(next_track.downbeat_samples, b_end, b_end + tail) + phrase_length
+            b_beat_positions = np.concatenate([b_phrase_beats, b_tail_beats])
+            b_downbeat_positions = np.concatenate([b_phrase_downbeats, b_tail_downbeats])
+        else:
+            b_beat_positions = b_phrase_beats
+            b_downbeat_positions = b_phrase_downbeats
+
+        b_low, b_harm, b_perc, grid_metrics = lock_incoming_deck_phase(
             a_low=a_low,
             b_low=b_low,
+            a_harm=a_harm,
+            b_harm=b_harm,
             a_perc=a_perc,
             b_perc=b_perc,
             sample_rate=self.config.sample_rate,
             bpm=current.playback_bpm,
             beats_per_bar=max(2, current.analysis.beats_per_bar),
             bars=max(1, plan.bars),
+            a_beat_positions=a_beat_positions,
+            b_beat_positions=b_beat_positions,
+            a_downbeat_positions=a_downbeat_positions,
+            b_downbeat_positions=b_downbeat_positions,
+            initial_offset_samples=float(plan.micro_offset_samples),
         )
+        terminal_shift = float(grid_metrics.get("beat_lock_terminal_shift_samples", 0.0))
+        if abs(terminal_shift) >= 0.5 and plan.next_resume_sample >= 0:
+            if tail > 0:
+                resume_shift = int(round(terminal_shift))
+            else:
+                resume_shift = int(round(terminal_shift / max(phrase_scale, 1e-9)))
+            old_resume = int(plan.next_resume_sample)
+            plan.next_resume_sample = int(
+                np.clip(old_resume + resume_shift, plan.next_start + 1, next_track.total_samples - 1)
+            )
+            grid_metrics["beat_lock_resume_shift_samples"] = float(plan.next_resume_sample - old_resume)
+        else:
+            grid_metrics["beat_lock_resume_shift_samples"] = 0.0
         plan.metrics.update(grid_metrics)
         if grid_metrics.get("beat_grid_aligned_beats", 0.0) >= 2:
             self.emit(
-                f"鼓拍微对齐：{next_track.analysis.title} · "
+                f"DJ 相位锁定：{next_track.analysis.title} · "
                 f"{grid_metrics.get('beat_grid_aligned_beats', 0.0):.0f} 拍 · "
-                f"平均校正 {grid_metrics.get('beat_grid_align_ms', 0.0):.1f} ms"
+                f"误差 {grid_metrics.get('beat_lock_pre_error_ms', 0.0):.1f}→"
+                f"{grid_metrics.get('beat_lock_post_error_ms', 0.0):.1f} ms · "
+                f"{grid_metrics.get('beat_lock_bar_nudges', 0.0):.0f} 次小节 nudge"
             )
 
         current_label = plan.current_role or (
@@ -1626,12 +1839,22 @@ class AutoDJEngine:
             with self._lock:
                 snapshot = list(self._playlist)
                 outgoing_analysis = snapshot[source_index]
-            synced_base = self._take_warm_track(
+            cached_pair = self._take_rendered_pair(
                 outgoing_analysis, analysis, target_bpm
             )
-            if synced_base is None:
-                self.emit(f"正在分析下一首匹配片段：{analysis.title}")
-                synced_base = self.prepare_track(analysis, target_bpm=target_bpm)
+            if cached_pair is not None:
+                synced_base = cached_pair.synced_base
+                prepared = cached_pair.prepared
+                plan = cached_pair.plan
+            else:
+                synced_base = self._take_warm_track(
+                    outgoing_analysis, analysis, target_bpm
+                )
+                if synced_base is None:
+                    self.emit(f"正在分析下一首匹配片段：{analysis.title}")
+                    synced_base = self.prepare_track(analysis, target_bpm=target_bpm)
+                prepared = synced_base
+                plan = None
 
             with self._lock:
                 still_valid = (
@@ -1648,10 +1871,8 @@ class AutoDJEngine:
                     if current is not None else 0.0
                 )
 
-            plan: TransitionPlan | None = None
-            prepared = synced_base
-            if still_valid and current is not None:
-                self.emit(f"下一首基础准备完成：{analysis.title}，正在搜索结构切点")
+            if still_valid and current is not None and plan is None:
+                self.emit(f"下一首基础准备完成：{analysis.title}，正在使用 CUE-DETR 搜索切点")
                 plan = self._calculate_plan(current, synced_base, earliest)
                 with self._lock:
                     latest = self._current_pos
@@ -1716,7 +1937,7 @@ class AutoDJEngine:
                 self._warm_following_tracks(
                     snapshot=snapshot,
                     first_target_index=source_index + 2,
-                    source_bpm=prepared.original_bpm,
+                    outgoing_track=prepared,
                     generation=generation,
                     token_kind="loader",
                 )
@@ -2203,6 +2424,41 @@ class AutoDJEngine:
         self.config.allin1_model_name = model
         self.rebuild_transition()
 
+    def set_cuedetr_enabled(self, enabled: bool) -> None:
+        value = bool(enabled)
+        if self.config.cuedetr_enabled == value:
+            return
+        self.config.cuedetr_enabled = value
+        self.clear_preload()
+
+    def set_cuedetr_device(self, device: str) -> None:
+        if device not in {"auto", "cpu", "cuda", "mps"}:
+            raise ValueError(f"未知 CUE-DETR 设备：{device}")
+        self.config.cuedetr_device = device
+
+    def set_cuedetr_model(self, model: str) -> None:
+        value = str(model).strip()
+        if not value:
+            raise ValueError("CUE-DETR 模型名称不能为空。")
+        if self.config.cuedetr_model_name == value:
+            return
+        self.config.cuedetr_model_name = value
+        self.clear_preload()
+
+    def set_cuedetr_sensitivity(self, value: float) -> None:
+        number = float(np.clip(value, 0.20, 0.995))
+        if math.isclose(self.config.cuedetr_sensitivity, number, abs_tol=1e-6):
+            return
+        self.config.cuedetr_sensitivity = number
+        self.clear_preload()
+
+    def set_cuedetr_min_bars(self, value: int) -> None:
+        number = int(np.clip(value, 1, 64))
+        if self.config.cuedetr_min_bars == number:
+            return
+        self.config.cuedetr_min_bars = number
+        self.clear_preload()
+
     def set_preload_window_tracks(self, value: int) -> None:
         self.config.preload_window_tracks = int(np.clip(value, 2, 6))
 
@@ -2276,9 +2532,9 @@ class AutoDJEngine:
                     "preload_current_path": self._prime_key[0] if self._prime_key else "",
                     "preload_next_path": self._prime_key[1] if self._prime_key else "",
                     "preload_window_tracks": self.config.preload_window_tracks,
-                    "warm_ready_paths": tuple(key[1] for key in self._warm_cache.keys()),
+                    "warm_ready_paths": tuple(sorted({*(key[1] for key in self._warm_cache.keys()), *(key[2] for key in self._rendered_pair_cache.keys())})),
                     "warm_loading_paths": tuple(sorted(self._warm_loading_paths)),
-                    "warm_cache_mb": self._warm_cache_bytes / (1024.0 * 1024.0),
+                    "warm_cache_mb": (self._warm_cache_bytes + self._rendered_pair_cache_bytes) / (1024.0 * 1024.0),
                     "preload_urgent": self._preload_urgent,
                     "seconds_to_transition": None,
                     "cpu_load": 0.0,
@@ -2413,9 +2669,9 @@ class AutoDJEngine:
                 "preload_current_path": self._prime_key[0] if self._prime_key else "",
                 "preload_next_path": self._prime_key[1] if self._prime_key else "",
                 "preload_window_tracks": self.config.preload_window_tracks,
-                "warm_ready_paths": tuple(key[1] for key in self._warm_cache.keys()),
+                "warm_ready_paths": tuple(sorted({*(key[1] for key in self._warm_cache.keys()), *(key[2] for key in self._rendered_pair_cache.keys())})),
                 "warm_loading_paths": tuple(sorted(self._warm_loading_paths)),
-                "warm_cache_mb": self._warm_cache_bytes / (1024.0 * 1024.0),
+                "warm_cache_mb": (self._warm_cache_bytes + self._rendered_pair_cache_bytes) / (1024.0 * 1024.0),
                 "preload_urgent": self._preload_urgent,
                 "seconds_to_transition": (
                     max(0.0, (plan.current_start - current_pos) / self.config.sample_rate)

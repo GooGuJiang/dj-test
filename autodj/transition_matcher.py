@@ -9,7 +9,7 @@ import numpy as np
 from scipy import signal
 
 from .edm_structure import camelot_compatibility
-from .dj_phrase_policy import evaluate_phrase_policy, structural_candidate_prior
+from .dj_phrase_policy import evaluate_phrase_policy
 from .models import BarFeatures, PreparedTrack, TransitionPlan
 from .muq_analyzer import cosine_similarity
 
@@ -275,6 +275,29 @@ def _muq_candidate_metrics(
     return style, segment, trajectory
 
 
+def _kick_phase_envelope(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Kick-focused onset envelope used like a DJ headphone phase check."""
+    if audio.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    mono = np.mean(audio, axis=1, dtype=np.float64)
+    nyquist = sample_rate / 2.0
+    try:
+        lo = max(25.0 / nyquist, 1e-4)
+        hi = min(190.0 / nyquist, 0.96)
+        if hi > lo:
+            sos = signal.butter(3, [lo, hi], btype="bandpass", output="sos")
+            mono = signal.sosfiltfilt(sos, mono)
+    except ValueError:
+        pass
+    energy = mono * mono
+    smooth = max(1, int(round(0.008 * sample_rate)))
+    kernel = np.ones(smooth, dtype=np.float64) / smooth
+    energy = np.convolve(energy, kernel, mode="same")
+    onset = np.maximum(np.diff(energy, prepend=energy[0]), 0.0)
+    scale = float(np.percentile(onset, 95.0) + 1e-12)
+    return np.clip(onset / scale, 0.0, 5.0)
+
+
 def estimate_micro_alignment(
     current: PreparedTrack,
     next_track: PreparedTrack,
@@ -282,9 +305,16 @@ def estimate_micro_alignment(
     next_start: int,
     max_offset_ms: float = 80.0,
 ) -> tuple[int, float]:
-    """Fine-align downbeat transients to reduce kick flam after model beat tracking."""
+    """Robust launch nudge from several beats instead of one transient.
+
+    A human DJ cues the incoming deck, listens to a few kicks, and nudges the
+    whole deck until the phase stops flamming.  Looking at only the first peak
+    can confuse a hi-hat/snare or a weak pickup for the kick, so this estimator
+    correlates a kick-focused envelope across roughly four beats.
+    """
     sr = current.sample_rate
-    window = int(round(min(0.42, 60.0 / max(current.playback_bpm, 1.0)) * sr))
+    beat_seconds = 60.0 / max(current.playback_bpm, 1.0)
+    window = int(round(min(4.25 * beat_seconds, 3.2) * sr))
     if window < 128:
         return 0, 0.0
     a = current.audio[current_start : current_start + window]
@@ -292,32 +322,48 @@ def estimate_micro_alignment(
     length = min(len(a), len(b))
     if length < 128:
         return 0, 0.0
-    a_mono = np.mean(a[:length], axis=1, dtype=np.float64)
-    b_mono = np.mean(b[:length], axis=1, dtype=np.float64)
-    try:
-        sos = signal.butter(3, min(220.0 / (sr / 2.0), 0.95), btype="lowpass", output="sos")
-        a_mono = signal.sosfiltfilt(sos, a_mono)
-        b_mono = signal.sosfiltfilt(sos, b_mono)
-    except ValueError:
-        pass
-    a_onset = np.abs(np.diff(a_mono, prepend=a_mono[0]))
-    b_onset = np.abs(np.diff(b_mono, prepend=b_mono[0]))
-    smooth = max(1, int(round(0.004 * sr)))
-    kernel = np.ones(smooth, dtype=np.float64) / smooth
-    a_onset = np.convolve(a_onset, kernel, mode="same")
-    b_onset = np.convolve(b_onset, kernel, mode="same")
-    search = min(length, int(round(0.18 * sr)))
-    a_peak = int(np.argmax(a_onset[:search]))
-    b_peak = int(np.argmax(b_onset[:search]))
-    maximum = int(round(max_offset_ms * sr / 1000.0))
-    offset = int(np.clip(b_peak - a_peak, -maximum, maximum))
-    strength_a = float(a_onset[a_peak] / (np.mean(a_onset[:search]) + 1e-9))
-    strength_b = float(b_onset[b_peak] / (np.mean(b_onset[:search]) + 1e-9))
-    confidence = float(np.clip(min(strength_a, strength_b) / 8.0, 0.0, 1.0))
+    ea = _kick_phase_envelope(a[:length], sr)
+    eb = _kick_phase_envelope(b[:length], sr)
+    maximum = min(int(round(max_offset_ms * sr / 1000.0)), max(1, length // 5))
+    if maximum < 1 or float(np.max(ea)) < 1e-6 or float(np.max(eb)) < 1e-6:
+        return 0, 0.0
+
+    scores: list[float] = []
+    lags = np.arange(-maximum, maximum + 1, dtype=np.int64)
+    for lag in lags:
+        if lag >= 0:
+            xa = ea[: length - lag]
+            xb = eb[lag:length]
+        else:
+            xa = ea[-lag:length]
+            xb = eb[: length + lag]
+        if xa.size < 64:
+            scores.append(-1.0)
+            continue
+        # Emphasize the first two bars, as DJs lock the phase before opening EQ.
+        weights = np.linspace(1.35, 0.75, xa.size, dtype=np.float64)
+        numerator = float(np.sum(weights * xa * xb))
+        denominator = float(
+            np.sqrt(np.sum(weights * xa * xa) * np.sum(weights * xb * xb)) + 1e-12
+        )
+        scores.append(numerator / denominator)
+    score_array = np.asarray(scores, dtype=np.float64)
+    best_index = int(np.argmax(score_array))
+    best_lag = int(lags[best_index])
+    best_score = float(score_array[best_index])
+
+    # Peak uniqueness and signal strength prevent a repetitive hi-hat pattern
+    # from being treated as a confident kick lock.
+    guard = max(1, int(round(0.008 * sr)))
+    masked = score_array.copy()
+    masked[max(0, best_index - guard) : min(len(masked), best_index + guard + 1)] = -1.0
+    second = float(np.max(masked)) if masked.size else -1.0
+    uniqueness = float(np.clip((best_score - second) / 0.18, 0.0, 1.0))
+    strength = float(np.clip(best_score, 0.0, 1.0))
+    confidence = float(np.clip(0.65 * strength + 0.35 * uniqueness, 0.0, 1.0))
     if confidence < 0.18:
         return 0, confidence
-    return offset, confidence
-
+    return int(np.clip(best_lag, -maximum, maximum)), confidence
 
 def _smoothstep(values: np.ndarray) -> np.ndarray:
     values = np.clip(values, 0.0, 1.0)
@@ -604,16 +650,22 @@ def _score_candidate(
 
 
 def _candidate_indices(
-    features: BarFeatures,
+    track: PreparedTrack,
     earliest_sample: int,
     is_exit: bool,
     config: MatcherConfig,
 ) -> np.ndarray:
-    indices = np.arange(features.count, dtype=np.int64)
-    indices = indices[features.start_samples >= earliest_sample]
+    """Return CUE-DETR candidates only.
+
+    v1.2.9 intentionally removes the legacy all-bar/novelty candidate search.
+    Structure and MuQ may rank a neural cue, but cannot add another bar.
+    """
+    features = track.bar_features
+    indices = np.asarray(track.structure.cue_indices, dtype=np.int64)
+    indices = indices[(indices >= 0) & (indices < features.count)]
+    indices = indices[features.start_samples[indices] >= earliest_sample]
     if indices.size == 0:
         return indices
-
     positions = indices / max(features.count - 1, 1)
     if is_exit:
         preferred = indices[positions >= config.min_auto_exit_position]
@@ -625,7 +677,7 @@ def _candidate_indices(
         if preferred.size:
             indices = preferred
         indices = indices[: config.max_entry_candidates]
-    return indices
+    return np.unique(indices)
 
 
 def _rank_by_cue_scores(
@@ -708,7 +760,7 @@ def find_best_transition(
     config: MatcherConfig | None = None,
     fx_config: TransitionFXConfig | None = None,
 ) -> TransitionPlan:
-    """搜索最佳重拍片段、自动长度，并生成专业三段 EQ 过渡曲线。"""
+    """Search only CUE-DETR neural cues, then rank compatible cue pairs."""
     config = config or MatcherConfig()
     fx_config = fx_config or TransitionFXConfig()
     a = current.bar_features
@@ -723,36 +775,28 @@ def find_best_transition(
 
     if force_current_start is None:
         exit_indices = _candidate_indices(
-            a,
+            current,
             earliest_sample=earliest_start,
             is_exit=True,
             config=config,
         )
     else:
-        future = np.flatnonzero(a.start_samples >= force_current_start)
+        neural = np.asarray(current.structure.cue_indices, dtype=np.int64)
+        neural = neural[(neural >= 0) & (neural < a.count)]
+        future = neural[a.start_samples[neural] >= force_current_start]
         if future.size:
             exit_indices = np.asarray([int(future[0])], dtype=np.int64)
         else:
-            exit_indices = np.asarray([a.count - 1], dtype=np.int64)
+            raise RuntimeError("CUE-DETR 在请求位置之后没有可用 cue 点。")
 
     entry_indices = _candidate_indices(
-        b,
+        next_track,
         earliest_sample=0,
         is_exit=False,
         config=config,
     )
-    exit_prior = structural_candidate_prior(current, is_exit=True)
-    entry_prior = structural_candidate_prior(next_track, is_exit=False)
     exit_scores = np.asarray(current.structure.mix_out_score, dtype=np.float32)
     entry_scores = np.asarray(next_track.structure.mix_in_score, dtype=np.float32)
-    if exit_scores.size == exit_prior.size:
-        exit_scores = 0.58 * exit_scores + 0.42 * exit_prior
-    else:
-        exit_scores = exit_prior
-    if entry_scores.size == entry_prior.size:
-        entry_scores = 0.58 * entry_scores + 0.42 * entry_prior
-    else:
-        entry_scores = entry_prior
     if force_current_start is None:
         exit_indices = _rank_by_cue_scores(
             exit_indices,
@@ -765,7 +809,7 @@ def find_best_transition(
         config.max_entry_candidates,
     )
     if exit_indices.size == 0 or entry_indices.size == 0:
-        raise RuntimeError("没有足够的重拍候选点。")
+        raise RuntimeError("CUE-DETR 没有提供足够的 IN/OUT cue 点。")
 
     best: tuple[float, int, int, int, dict[str, float]] | None = None
     for bars in allowed_bars:

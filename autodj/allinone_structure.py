@@ -113,34 +113,14 @@ def fuse_allinone_structure(
         else:
             boundary_labels.append("")
 
-    cue = np.asarray(base.cue_score, dtype=np.float32).copy()
-    mix_in = np.asarray(base.mix_in_score, dtype=np.float32).copy()
-    mix_out = np.asarray(base.mix_out_score, dtype=np.float32).copy()
-    phrase = np.asarray(base.phrase_mask, dtype=np.float32).copy()
+    # All-In-One supplies labels/boundaries only.  CUE-DETR is the sole
+    # transition-candidate generator in v1.2.9, so this function must not boost
+    # cue, phrase, mix-in or mix-out arrays.
 
-    for index, (functional_label, role) in enumerate(zip(functional, roles)):
-        boundary = float(boundary_score[index])
-        cue[index] = max(cue[index], 0.70 * boundary)
-        phrase[index] = max(phrase[index], 0.86 * boundary)
-        if functional_label in {"INTRO", "START", "INST"}:
-            mix_in[index] = max(mix_in[index], 0.72 * boundary + 0.18)
-        elif functional_label in {"CHORUS", "BRIDGE", "SOLO"}:
-            mix_in[index] = max(mix_in[index], 0.62 * boundary + 0.12)
-        if functional_label in {"OUTRO", "END", "BREAK", "BRIDGE"}:
-            mix_out[index] = max(mix_out[index], 0.74 * boundary + 0.16)
-        elif functional_label in {"VERSE", "CHORUS", "SOLO"}:
-            mix_out[index] = max(mix_out[index], 0.54 * boundary + 0.08)
-        if role == "DROP":
-            mix_in[index] = max(mix_in[index], 0.78 * boundary + 0.12)
-
-    base.cue_score = np.clip(cue, 0.0, 1.0).astype(np.float32)
-    base.mix_in_score = np.clip(mix_in, 0.0, 1.0).astype(np.float32)
-    base.mix_out_score = np.clip(mix_out, 0.0, 1.0).astype(np.float32)
-    base.phrase_mask = np.clip(phrase, 0.0, 1.0).astype(np.float32)
     base.labels = tuple(roles)
     base.functional_labels = tuple(functional)
     base.allin1_boundary_score = np.ascontiguousarray(boundary_score, dtype=np.float32)
-    base.structure_source = f"All-In-One/{profile.model_name} + local EDM"
+    base.structure_source = f"All-In-One/{profile.model_name} roles + local acoustic features"
     base.allin1_backend = profile.backend
     # Functional segmentation evidence increases confidence but cannot force an
     # EDM classification on non-EDM songs.

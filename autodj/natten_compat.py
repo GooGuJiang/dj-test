@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import importlib.machinery
 import sys
 import types
 from dataclasses import dataclass
@@ -137,9 +138,29 @@ def _install_torch_module() -> NattenCompatStatus:
     functional.na2d_qk = natten2dqkrpb
     functional.na2d_av = natten2dav
 
+    # ``transformers`` and other libraries use ``importlib.util.find_spec`` to
+    # inspect optional packages. A synthetic module with ``__spec__ = None``
+    # makes find_spec raise ``ValueError: natten.__spec__ is None``. Give both
+    # injected modules proper specs so All-In-One and CUE-DETR can coexist in
+    # the same Python process.
+    functional.__package__ = "natten"
+    functional.__spec__ = importlib.machinery.ModuleSpec(
+        name="natten.functional",
+        loader=None,
+        is_package=False,
+    )
+
     package = types.ModuleType("natten")
     package.functional = functional
     package.__version__ = "autodj-torch-fallback"
+    package.__package__ = "natten"
+    package.__path__ = []
+    package.__spec__ = importlib.machinery.ModuleSpec(
+        name="natten",
+        loader=None,
+        is_package=True,
+    )
+    package.__spec__.submodule_search_locations = []
     sys.modules["natten"] = package
     sys.modules["natten.functional"] = functional
     return NattenCompatStatus(

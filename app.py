@@ -11,7 +11,8 @@ from tkinter import filedialog, messagebox, ttk
 from autodj.audio_engine import AutoDJEngine, EngineConfig
 from autodj.allinone_analyzer import AllInOneAnalyzer, probe_allinone
 from autodj.beat_this_analyzer import BeatThisAnalyzer
-from autodj.models import AllInOneProfile, MuQProfile, TrackAnalysis
+from autodj.cuedetr_analyzer import CueDETRAnalyzer, probe_cuedetr
+from autodj.models import AllInOneProfile, CueDETRProfile, MuQProfile, TrackAnalysis
 from autodj.muq_analyzer import MuQAnalyzer
 from autodj.playlist_ranker import PairScore, rank_playlist, style_clusters, transition_compatibility
 from autodj.timeline import DJTimeline
@@ -125,7 +126,7 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! + MuQ + All-In-One Auto DJ 1.2.7")
+        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.10")
         self.settings_store = SettingsStore()
         self.saved_settings = self.settings_store.load()
         self._settings_after_id: str | None = None
@@ -166,6 +167,9 @@ class AutoDJApp(tk.Tk):
         self.allin1_profiles: dict[str, AllInOneProfile] = {}
         self.allin1_analysis_active = False
         self.allin1_probe_result: dict[str, object] = {}
+        self.cuedetr_profiles: dict[str, CueDETRProfile] = {}
+        self.cuedetr_analysis_active = False
+        self.cuedetr_probe_result: dict[str, object] = {}
         self._preload_after_id: str | None = None
 
         self._build_style()
@@ -178,7 +182,8 @@ class AutoDJApp(tk.Tk):
         self.bind("<Configure>", lambda _event: self._schedule_settings_save(), add="+")
         self.after(150, self._detect_rubberband)
         self.after(240, self._detect_allin1)
-        LOGGER.info("Auto DJ 1.2.7 GUI 启动，主环境 Python=%s", os.sys.executable)
+        self.after(320, self._detect_cuedetr)
+        LOGGER.info("Auto DJ 1.2.10 GUI 启动，主环境 Python=%s", os.sys.executable)
         self.after(100, self._poll)
 
     _SETTING_VARIABLES = {
@@ -199,6 +204,10 @@ class AutoDJApp(tk.Tk):
         "allin1_enabled": "allin1_enabled_var",
         "allin1_model": "allin1_model_var",
         "allin1_device": "allin1_device_var",
+        "cuedetr_model": "cuedetr_model_var",
+        "cuedetr_device": "cuedetr_device_var",
+        "cuedetr_sensitivity": "cuedetr_sensitivity_var",
+        "cuedetr_min_bars": "cuedetr_min_bars_var",
         "muq_enabled": "muq_enabled_var",
         "auto_muq_sort": "auto_muq_sort_var",
         "preload_enabled": "preload_pair_var",
@@ -366,7 +375,7 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! + MuQ + All-In-One Auto DJ 1.2.7", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.10", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
@@ -931,13 +940,80 @@ class AutoDJApp(tk.Tk):
         ).pack(anchor=tk.W, pady=(0, 10))
 
         ttk.Separator(settings_frame).pack(fill=tk.X, pady=10)
+        ttk.Label(settings_frame, text="CUE-DETR 专业切点", style="Now.TLabel").pack(
+            anchor=tk.W, pady=(0, 6)
+        )
+        self.cuedetr_enabled_var = tk.BooleanVar(value=True)
+        ttk.Label(
+            settings_frame,
+            text="CUE-DETR 固定启用（唯一切点来源）",
+            style="Muted.TLabel",
+        ).pack(anchor=tk.W)
+        ttk.Label(settings_frame, text="CUE-DETR 模型", style="Muted.TLabel").pack(
+            anchor=tk.W, pady=(6, 0)
+        )
+        self.cuedetr_model_var = tk.StringVar(value="disco-eth/cue-detr")
+        ttk.Entry(settings_frame, textvariable=self.cuedetr_model_var).pack(
+            fill=tk.X, pady=(4, 4)
+        )
+        cue_grid = ttk.Frame(settings_frame, style="Card.TFrame")
+        cue_grid.pack(fill=tk.X, pady=(4, 4))
+        cue_grid.grid_columnconfigure(1, weight=1)
+        ttk.Label(cue_grid, text="运行设备", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        self.cuedetr_device_var = tk.StringVar(value="auto")
+        ttk.Combobox(
+            cue_grid, textvariable=self.cuedetr_device_var,
+            values=("auto", "cuda", "cpu", "mps"), state="readonly", width=10
+        ).grid(row=0, column=1, sticky="ew", pady=2)
+        ttk.Label(cue_grid, text="灵敏度", style="Muted.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        self.cuedetr_sensitivity_var = tk.StringVar(value="0.90")
+        ttk.Combobox(
+            cue_grid, textvariable=self.cuedetr_sensitivity_var,
+            values=("0.75", "0.82", "0.88", "0.90", "0.93", "0.96"),
+            state="readonly", width=10
+        ).grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Label(cue_grid, text="最小间隔", style="Muted.TLabel").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        self.cuedetr_min_bars_var = tk.StringVar(value="8")
+        ttk.Combobox(
+            cue_grid, textvariable=self.cuedetr_min_bars_var,
+            values=("4", "8", "16", "32"), state="readonly", width=10
+        ).grid(row=2, column=1, sticky="ew", pady=2)
+        self.cuedetr_status_label = ttk.Label(
+            settings_frame,
+            text="正在检测 CUE-DETR…",
+            style="Muted.TLabel", wraplength=280,
+        )
+        self.cuedetr_status_label.pack(anchor=tk.W, fill=tk.X, pady=(2, 4))
+        cue_actions = ttk.Frame(settings_frame, style="Card.TFrame")
+        cue_actions.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(cue_actions, text="检测模型", command=self._detect_cuedetr).pack(side=tk.LEFT)
+        ttk.Button(
+            cue_actions, text="分析全部 cue",
+            command=lambda: self._analyze_cuedetr(force=False, automatic=False),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(
+            settings_frame,
+            text=(
+                "旧的 novelty/规则切点已移除。只有 CUE-DETR 可以产生 IN/OUT 候选；"
+                "Beat This! 只把预测吸附到 downbeat，All-In-One 只提供段落标签。"
+            ),
+            style="Muted.TLabel", wraplength=280,
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        ttk.Separator(settings_frame).pack(fill=tk.X, pady=10)
         ttk.Label(settings_frame, text="MuQ 风格与排序", style="Now.TLabel").pack(
             anchor=tk.W, pady=(0, 6)
         )
         self.muq_enabled_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             settings_frame,
-            text="使用 MuQ-large-msd-iter 参与选歌与切点匹配",
+            text="使用 MuQ-large-msd-iter 参与选歌与 cue 配对评分",
             variable=self.muq_enabled_var,
             command=lambda: self.engine.set_muq_enabled(self.muq_enabled_var.get()),
         ).pack(anchor=tk.W)
@@ -1040,7 +1116,7 @@ class AutoDJApp(tk.Tk):
         )
         ttk.Label(
             settings_frame,
-            text="Beat This! 与 MuQ 可用 auto/cuda；All-In-One 有独立设备设置，默认 CPU。",
+            text="Beat This!、MuQ、CUE-DETR 可用 auto/cuda；All-In-One 默认 CPU。",
             style="Muted.TLabel",
             wraplength=280,
         ).pack(anchor=tk.W, pady=(0, 12))
@@ -1268,6 +1344,74 @@ class AutoDJApp(tk.Tk):
                 foreground="#ffb86c",
             )
 
+    def _detect_cuedetr(self) -> None:
+        result = probe_cuedetr()
+        self.cuedetr_probe_result = dict(result)
+        if result.get("ok"):
+            self.cuedetr_status_label.configure(
+                text=(
+                    f"CUE-DETR 依赖已就绪 · Transformers {result.get('transformers', '')} · "
+                    f"CUDA {'可用' if result.get('cuda') else '不可用'}；首次分析下载权重"
+                ),
+                foreground="#7ee787",
+            )
+        else:
+            error_type = str(result.get("error_type", ""))
+            if error_type == "missing_dependency":
+                text = (
+                    f"CUE-DETR 缺少依赖：{result.get('message', '')}；"
+                    "运行 python install_cuedetr.py"
+                )
+            else:
+                text = (
+                    f"CUE-DETR 依赖冲突：{result.get('message', '')}；"
+                    "运行 python verify_cuedetr.py 查看详细诊断"
+                )
+            self.cuedetr_status_label.configure(
+                text=text,
+                foreground="#ffb86c",
+            )
+
+    def _analyze_cuedetr(self, force: bool = False, automatic: bool = False) -> None:
+        if self.cuedetr_analysis_active:
+            if not automatic:
+                messagebox.showinfo("正在分析", "CUE-DETR cue 分析正在运行。")
+            return
+        if not self.tracks:
+            return
+        self.cuedetr_analysis_active = True
+        tracks_snapshot = list(self.tracks)
+        snapshot_paths = tuple(track.path for track in tracks_snapshot)
+        model = self.cuedetr_model_var.get().strip() or "disco-eth/cue-detr"
+        device = self.cuedetr_device_var.get()
+        sensitivity = float(self.cuedetr_sensitivity_var.get())
+        min_bars = int(self.cuedetr_min_bars_var.get())
+        self._log(
+            f"CUE-DETR 正在批量搜索 cue · {model} · {device} · "
+            f"灵敏度 {sensitivity:.2f} · 间隔 {min_bars} 小节"
+        )
+        self.ui_events.put(("analysis_progress", ("CUE-DETR", -1, len(tracks_snapshot), "加载官方模型")))
+
+        def worker() -> None:
+            try:
+                analyzer = CueDETRAnalyzer(
+                    model_name=model, device=device, sensitivity=sensitivity,
+                    min_bars=min_bars, batch_size=6,
+                )
+                profiles = analyzer.analyze_many(
+                    tracks_snapshot,
+                    status=lambda text: self.ui_events.put(("status", text)),
+                    progress=lambda current, total, detail: self.ui_events.put(
+                        ("analysis_progress", ("CUE-DETR", current, total, detail))
+                    ),
+                    force=force,
+                )
+                self.ui_events.put(("cuedetr_done", (snapshot_paths, profiles, automatic)))
+            except Exception as exc:
+                self.ui_events.put(("cuedetr_error", (str(exc), automatic)))
+
+        threading.Thread(target=worker, daemon=True, name="CUE-DETR-Analyzer").start()
+
     def _analyze_allin1(self, force: bool = False, automatic: bool = False) -> None:
         if self.allin1_analysis_active:
             if not automatic:
@@ -1275,7 +1419,7 @@ class AutoDJApp(tk.Tk):
             return
         if not self.allin1_enabled_var.get():
             if automatic:
-                self._continue_after_structure_analysis()
+                self._continue_after_allin1()
             else:
                 messagebox.showinfo("未启用", "请先勾选启用 All-In-One 功能段模型。")
             return
@@ -1316,12 +1460,19 @@ class AutoDJApp(tk.Tk):
             target=worker, daemon=True, name="All-In-One-InProcess"
         ).start()
 
-    def _continue_after_structure_analysis(self) -> None:
+    def _continue_after_allin1(self) -> None:
+        if self.cuedetr_enabled_var.get():
+            self._log("结构标签完成，正在运行 CUE-DETR 专业 cue 检测…")
+            self._analyze_cuedetr(force=False, automatic=True)
+        else:
+            self._continue_after_cuedetr()
+
+    def _continue_after_cuedetr(self) -> None:
         if self.auto_muq_sort_var.get() and self.muq_enabled_var.get():
             self._log("歌曲结构分析完成，正在进行 MuQ 风格分析与排序…")
             self._rank_with_muq(automatic=True)
         else:
-            self._log("Beat This! 与 All-In-One 分析完成。")
+            self._log("Beat This!、All-In-One 与 CUE-DETR 分析完成。")
             self._schedule_preload()
 
     def _set_effect_strength(self, value: str) -> None:
@@ -1351,6 +1502,13 @@ class AutoDJApp(tk.Tk):
         self.engine.set_allin1_device(self.allin1_device_var.get())
         self.engine.set_allin1_model(self.allin1_model_var.get())
         self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
+        self.cuedetr_enabled_var.set(True)
+        self.engine.set_cuedetr_enabled(True)
+        self.engine.set_cuedetr_device(self.cuedetr_device_var.get())
+        self.engine.set_cuedetr_model(self.cuedetr_model_var.get())
+        self.engine.set_cuedetr_sensitivity(float(self.cuedetr_sensitivity_var.get()))
+        self.engine.set_cuedetr_min_bars(int(self.cuedetr_min_bars_var.get()))
+        self.engine.set_preloaded_cuedetr_profiles(self.cuedetr_profiles)
         self.engine.set_preload_window_tracks(int(self.preload_window_var.get()))
         self.engine.set_preload_memory_mb(int(self.preload_memory_var.get()))
         self.engine.set_preload_deadline_seconds(
@@ -1370,6 +1528,7 @@ class AutoDJApp(tk.Tk):
             or self.analysis_active
             or self.allin1_analysis_active
             or self.muq_ranking_active
+            or self.cuedetr_analysis_active
             or self.engine.get_status().get("playing")
         ):
             return
@@ -1383,6 +1542,7 @@ class AutoDJApp(tk.Tk):
             or self.analysis_active
             or self.allin1_analysis_active
             or self.muq_ranking_active
+            or self.cuedetr_analysis_active
             or self.engine.get_status().get("playing")
         ):
             return
@@ -1417,7 +1577,7 @@ class AutoDJApp(tk.Tk):
         try:
             self.engine.set_muq_device(device)
             self.engine.clear_preload()
-            self._log(f"Beat This! / MuQ 计算设备已切换为 {device}；All-In-One 设备独立设置")
+            self._log(f"Beat This! / MuQ 计算设备已切换为 {device}；CUE-DETR 与 All-In-One 设备独立设置")
         except Exception as exc:
             self._log(f"切换计算设备失败：{exc}")
 
@@ -1439,7 +1599,7 @@ class AutoDJApp(tk.Tk):
             self._analyze_paths([Path(path) for path in paths], force=False)
 
     def _analyze_paths(self, paths: list[Path], force: bool) -> None:
-        if self.analysis_active or self.allin1_analysis_active or self.muq_ranking_active:
+        if self.analysis_active or self.allin1_analysis_active or self.cuedetr_analysis_active or self.muq_ranking_active:
             messagebox.showinfo("正在分析", "请等待当前模型分析完成。")
             return
         self.analysis_active = True
@@ -1541,14 +1701,19 @@ class AutoDJApp(tk.Tk):
             elif track.path in warm_ready:
                 state = "暖轨就绪"
             structure_profile = self.allin1_profiles.get(track.path)
+            cue_profile = self.cuedetr_profiles.get(track.path)
+            cue_suffix = (
+                f" · CUE {len(cue_profile.cue_times)}"
+                if cue_profile and cue_profile.available else ""
+            )
             if structure_profile and structure_profile.available:
                 structure_text = "/".join(
                     label.upper() for label in structure_profile.unique_labels[:4]
-                )
-            elif self.allin1_analysis_active:
+                ) + cue_suffix
+            elif self.allin1_analysis_active or self.cuedetr_analysis_active:
                 structure_text = "分析中…"
             else:
-                structure_text = "—"
+                structure_text = (cue_suffix.strip(" ·") or "—")
             self.tree.insert(
                 "",
                 tk.END,
@@ -1575,9 +1740,9 @@ class AutoDJApp(tk.Tk):
     def _rank_with_muq(self, automatic: bool = False) -> None:
         if self.muq_ranking_active:
             return
-        if self.analysis_active or self.allin1_analysis_active:
+        if self.analysis_active or self.allin1_analysis_active or self.cuedetr_analysis_active:
             if not automatic:
-                messagebox.showinfo("正在分析", "请等待 Beat This! / All-In-One 分析完成。")
+                messagebox.showinfo("正在分析", "请等待 Beat This! / All-In-One / CUE-DETR 分析完成。")
             return
         if len(self.tracks) < 2:
             if not automatic:
@@ -1703,6 +1868,7 @@ class AutoDJApp(tk.Tk):
             self.muq_groups.pop(removed.path, None)
             self.muq_pair_scores.pop(removed.path, None)
             self.allin1_profiles.pop(removed.path, None)
+            self.cuedetr_profiles.pop(removed.path, None)
             self.engine.clear_preload()
             self._refresh_tree()
             self._schedule_preload()
@@ -1714,6 +1880,7 @@ class AutoDJApp(tk.Tk):
         self.muq_groups.clear()
         self.muq_pair_scores.clear()
         self.allin1_profiles.clear()
+        self.cuedetr_profiles.clear()
         self.engine.clear_preload()
         self._refresh_tree()
 
@@ -1735,6 +1902,21 @@ class AutoDJApp(tk.Tk):
 
         index = self._selected_index()
         playlist = list(self.tracks)
+        missing_cues = [
+            track.title
+            for track in playlist[index:]
+            if not self.cuedetr_profiles.get(track.path, CueDETRProfile()).available
+        ]
+        if missing_cues:
+            self._log("播放已阻止：必须先完成 CUE-DETR cue 分析。")
+            messagebox.showinfo(
+                "需要 CUE-DETR",
+                "以下歌曲尚未完成 CUE-DETR cue 分析：\n"
+                + "\n".join(missing_cues[:8])
+                + ("\n…" if len(missing_cues) > 8 else ""),
+            )
+            self._analyze_cuedetr(force=False, automatic=False)
+            return
         device = self.device_map.get(self.output_var.get())
         self.starting_playback = True
         self.play_button.state(["disabled"])
@@ -1843,7 +2025,7 @@ class AutoDJApp(tk.Tk):
                     self._log("Beat This! 完成，正在运行 All-In-One 功能段分析…")
                     self._analyze_allin1(force=False, automatic=True)
                 else:
-                    self._continue_after_structure_analysis()
+                    self._continue_after_allin1()
             elif kind == "allin1_done":
                 snapshot_paths, profiles, automatic = payload  # type: ignore[misc]
                 self.allin1_analysis_active = False
@@ -1863,7 +2045,7 @@ class AutoDJApp(tk.Tk):
                     foreground="#7ee787",
                 )
                 if automatic:
-                    self._continue_after_structure_analysis()
+                    self._continue_after_allin1()
                 else:
                     self._log(f"All-In-One 结构分析完成：{available} 首")
                     self._finish_analysis_progress("All-In-One 分析完成")
@@ -1878,7 +2060,42 @@ class AutoDJApp(tk.Tk):
                 if not automatic:
                     messagebox.showerror("All-In-One 分析失败", str(message))
                 if automatic:
-                    self._continue_after_structure_analysis()
+                    self._continue_after_allin1()
+                else:
+                    self._schedule_preload()
+            elif kind == "cuedetr_done":
+                snapshot_paths, profiles, automatic = payload  # type: ignore[misc]
+                self.cuedetr_analysis_active = False
+                current_paths = tuple(track.path for track in self.tracks)
+                if set(snapshot_paths) != set(current_paths):
+                    self._log("队列在 CUE-DETR 分析期间变化，正在重新分析…")
+                    self._analyze_cuedetr(force=False, automatic=True)
+                    continue
+                self.cuedetr_profiles.update(dict(profiles))
+                self.engine.set_preloaded_cuedetr_profiles(self.cuedetr_profiles)
+                count = sum(len(profile.cue_times) for profile in self.cuedetr_profiles.values())
+                self.cuedetr_status_label.configure(
+                    text=f"CUE-DETR 已完成 {len(self.cuedetr_profiles)} 首 · 共 {count} 个 downbeat cue",
+                    foreground="#7ee787",
+                )
+                self.engine.clear_preload()
+                if automatic:
+                    self._continue_after_cuedetr()
+                else:
+                    self._log(f"CUE-DETR cue 分析完成：共 {count} 个")
+                    self._finish_analysis_progress("CUE-DETR 分析完成")
+                    self._schedule_preload(delay_ms=120)
+            elif kind == "cuedetr_error":
+                message, automatic = payload  # type: ignore[misc]
+                self.cuedetr_analysis_active = False
+                self.cuedetr_status_label.configure(
+                    text=f"CUE-DETR 失败：{message}", foreground="#ffb86c"
+                )
+                self._log(f"CUE-DETR 失败：{message}")
+                if not automatic:
+                    messagebox.showerror("CUE-DETR 分析失败", str(message))
+                if automatic:
+                    self._continue_after_cuedetr()
                 else:
                     self._schedule_preload()
             elif kind == "muq_ranked":
@@ -1909,6 +2126,7 @@ class AutoDJApp(tk.Tk):
                 self.tracks = list(ordered_tracks)
                 self.engine.set_preloaded_muq_profiles(self.muq_profiles)
                 self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
+                self.engine.set_preloaded_cuedetr_profiles(self.cuedetr_profiles)
                 if self.engine.get_status().get("playing"):
                     try:
                         self.engine.update_playlist_order(self.tracks)
@@ -2009,7 +2227,10 @@ class AutoDJApp(tk.Tk):
                 f"MuQ 片段  {float(metrics.get('muq_segment', 0.0)) * 100:5.0f}\n"
                 f"MuQ 轨迹  {float(metrics.get('muq_trajectory', 0.0)) * 100:5.0f}\n"
                 f"首拍微调  {float(metrics.get('micro_align_ms', 0.0)):5.1f} ms\n"
-                f"逐拍校正  {float(metrics.get('beat_grid_align_ms', 0.0)):5.1f} ms / {float(metrics.get('beat_grid_aligned_beats', 0.0)):2.0f} 拍\n"
+                f"相位锁定  {float(metrics.get('beat_lock_pre_error_ms', 0.0)):4.1f}→{float(metrics.get('beat_lock_post_error_ms', 0.0)):4.1f} ms  "
+                f"{float(metrics.get('beat_grid_aligned_beats', 0.0)):2.0f} 拍\n"
+                f"小节 Nudge {float(metrics.get('beat_lock_bar_nudges', 0.0)):4.0f} 次  "
+                f"置信 {float(metrics.get('beat_lock_confidence', 0.0)) * 100:3.0f}%\n"
                 f"真人手法  {str(status.get('human_archetype', '—'))}\n"
                 f"真人评分  {float(status.get('human_quality_score', 0.0)) * 100:5.0f}\n"
                 f"响度控制  {float(metrics.get('quality_loudness', 0.0)) * 100:5.0f}\n"

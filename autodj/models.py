@@ -130,6 +130,54 @@ class AllInOneProfile:
 
 
 @dataclass
+class CueDETRProfile:
+    """Cue points predicted by the official ``disco-eth/cue-detr`` checkpoint.
+
+    Cue times are already snapped to Beat This! downbeats.  No local novelty or
+    hand-written cue detector is allowed to add candidates after this profile is
+    attached to a PreparedTrack.
+    """
+
+    cue_times: tuple[float, ...] = ()
+    cue_scores: tuple[float, ...] = ()
+    raw_cue_times: tuple[float, ...] = ()
+    raw_cue_scores: tuple[float, ...] = ()
+    backend: str = "disabled"
+    model_name: str = "disco-eth/cue-detr"
+    sensitivity: float = 0.90
+    min_bars: int = 8
+
+    @property
+    def available(self) -> bool:
+        return bool(self.cue_times)
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "cue_times": list(self.cue_times),
+            "cue_scores": list(self.cue_scores),
+            "raw_cue_times": list(self.raw_cue_times),
+            "raw_cue_scores": list(self.raw_cue_scores),
+            "backend": self.backend,
+            "model_name": self.model_name,
+            "sensitivity": self.sensitivity,
+            "min_bars": self.min_bars,
+        }
+
+    @classmethod
+    def from_json_dict(cls, data: dict[str, Any]) -> "CueDETRProfile":
+        return cls(
+            cue_times=tuple(float(x) for x in data.get("cue_times", [])),
+            cue_scores=tuple(float(x) for x in data.get("cue_scores", [])),
+            raw_cue_times=tuple(float(x) for x in data.get("raw_cue_times", [])),
+            raw_cue_scores=tuple(float(x) for x in data.get("raw_cue_scores", [])),
+            backend=str(data.get("backend", "cache")),
+            model_name=str(data.get("model_name", "disco-eth/cue-detr")),
+            sensitivity=float(data.get("sensitivity", 0.90)),
+            min_bars=int(data.get("min_bars", 8)),
+        )
+
+
+@dataclass
 class BarFeatures:
     """按重拍分割后的逐小节音乐特征。"""
 
@@ -149,7 +197,7 @@ class BarFeatures:
 
 @dataclass
 class EDMStructure:
-    """论文驱动的 EDM 结构与 cue-point 分析结果。"""
+    """EDM role/key features plus CUE-DETR-only transition candidates."""
 
     novelty: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     cue_score: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
@@ -271,6 +319,7 @@ class PreparedTrack:
     structure: EDMStructure = field(default_factory=EDMStructure)
     muq_profile: MuQProfile = field(default_factory=MuQProfile)
     allin1_profile: AllInOneProfile = field(default_factory=AllInOneProfile)
+    cuedetr_profile: CueDETRProfile = field(default_factory=CueDETRProfile)
     stretch_backend: str = "librosa"
 
     @property

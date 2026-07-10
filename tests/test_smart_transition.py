@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from autodj.models import BarFeatures, PreparedTrack, TrackAnalysis
+from autodj.models import BarFeatures, EDMStructure, PreparedTrack, TrackAnalysis
 from autodj.transition_matcher import TransitionFXConfig, find_best_transition
 
 
@@ -44,6 +44,13 @@ def make_track(
     )
     beat_samples = np.arange(bars * 4, dtype=np.int64) * 250
     beat_numbers = np.tile(np.arange(1, 5), bars)
+    cue = np.zeros(bars, dtype=np.float32)
+    cue[np.arange(0, bars, 8)] = 0.95
+    cue[max(0, bars - 16)] = 0.95
+    structure = EDMStructure(
+        cue_score=cue, mix_in_score=cue.copy(), mix_out_score=cue.copy(),
+        phrase_mask=cue.copy(), labels=tuple("SECTION" for _ in range(bars)),
+    )
     return PreparedTrack(
         analysis=analysis,
         audio=audio,
@@ -64,6 +71,7 @@ def make_track(
         cue_sample=0,
         waveform_envelope=np.zeros(64, dtype=np.float32),
         bar_features=features,
+        structure=structure,
     )
 
 

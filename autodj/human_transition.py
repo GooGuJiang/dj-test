@@ -186,6 +186,348 @@ def _onset_similarity(a: np.ndarray, b: np.ndarray, sample_rate: int) -> float:
 
 
 
+def _sanitize_positions(values: np.ndarray | Sequence[float] | None, length: int) -> np.ndarray:
+    if values is None:
+        return np.zeros(0, dtype=np.float64)
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    arr = np.unique(arr[(arr >= 0.0) & (arr < float(length))])
+    return np.ascontiguousarray(arr, dtype=np.float64)
+
+
+def _best_beat_pairing(
+    a_positions: np.ndarray,
+    b_positions: np.ndarray,
+    max_index_shift: int = 2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pair beat grids while tolerating a tracker starting one beat early/late.
+
+    Human DJs listen for the same count position rather than forcing the first
+    detected transient to be "beat one".  Searching a tiny index neighbourhood
+    handles a downbeat label that is off by one without accepting a full-bar
+    phase error.
+    """
+    if a_positions.size == 0 or b_positions.size == 0:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    best: tuple[float, np.ndarray, np.ndarray] | None = None
+    for shift in range(-max_index_shift, max_index_shift + 1):
+        a_start = max(0, shift)
+        b_start = max(0, -shift)
+        count = min(a_positions.size - a_start, b_positions.size - b_start)
+        if count < 2:
+            continue
+        aa = a_positions[a_start : a_start + count]
+        bb = b_positions[b_start : b_start + count]
+        residual = bb - aa
+        # Prefer a pairing that already has a small absolute phase error and a
+        # stable interval. A one-beat-wrong pairing is approximately 500 ms off.
+        score = float(np.median(np.abs(residual))) + 0.35 * float(
+            np.median(np.abs(np.diff(residual))) if residual.size > 1 else 0.0
+        )
+        if best is None or score < best[0]:
+            best = (score, aa, bb)
+    if best is None:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    return best[1], best[2]
+
+
+def _kick_onset_envelope(low: np.ndarray, perc: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Low-frequency kick attack envelope with a small broadband transient cue."""
+    length = min(len(low), len(perc))
+    if length == 0:
+        return np.zeros(0, dtype=np.float64)
+    low_mono = np.mean(low[:length], axis=1, dtype=np.float64)
+    perc_mono = np.mean(perc[:length], axis=1, dtype=np.float64)
+    nyquist = sample_rate / 2.0
+    try:
+        lo = max(20.0 / nyquist, 1e-4)
+        hi = min(190.0 / nyquist, 0.96)
+        if hi > lo:
+            sos = signal.butter(3, [lo, hi], btype="bandpass", output="sos")
+            low_mono = signal.sosfiltfilt(sos, low_mono)
+    except ValueError:
+        pass
+    energy = low_mono * low_mono
+    energy_smooth = max(1, int(round(0.009 * sample_rate)))
+    kernel = np.ones(energy_smooth, dtype=np.float64) / energy_smooth
+    energy = np.convolve(energy, kernel, mode="same")
+    kick_attack = np.maximum(np.diff(energy, prepend=energy[0]), 0.0)
+
+    perc_attack = np.abs(np.diff(perc_mono, prepend=perc_mono[0]))
+    perc_smooth = max(1, int(round(0.003 * sample_rate)))
+    p_kernel = np.ones(perc_smooth, dtype=np.float64) / perc_smooth
+    perc_attack = np.convolve(perc_attack, p_kernel, mode="same")
+
+    def robust_norm(x: np.ndarray) -> np.ndarray:
+        scale = float(np.percentile(x, 95.0) + 1e-12)
+        return np.clip(x / scale, 0.0, 4.0)
+
+    return 0.82 * robust_norm(kick_attack) + 0.18 * robust_norm(perc_attack)
+
+
+def _weighted_line_fit(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> tuple[float, float, np.ndarray]:
+    """Small robust linear fit used as a deck pitch/nudge model."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    w = np.maximum(np.asarray(w, dtype=np.float64), 1e-6)
+    if x.size == 0:
+        return 0.0, 0.0, np.zeros(0, dtype=np.float64)
+    if x.size == 1 or float(np.ptp(x)) < 1e-9:
+        return float(y[0]), 0.0, np.ones_like(w)
+    design = np.column_stack([np.ones_like(x), x])
+    robust = w.copy()
+    beta = np.zeros(2, dtype=np.float64)
+    for _ in range(4):
+        root = np.sqrt(np.maximum(robust, 1e-9))
+        beta, *_ = np.linalg.lstsq(design * root[:, None], y * root, rcond=None)
+        resid = y - design @ beta
+        mad = float(np.median(np.abs(resid - np.median(resid))) + 1e-9)
+        cutoff = 2.5 * 1.4826 * mad + 1.0
+        huber = np.ones_like(resid)
+        mask = np.abs(resid) > cutoff
+        huber[mask] = cutoff / np.maximum(np.abs(resid[mask]), 1e-9)
+        robust = w * huber
+    return float(beta[0]), float(beta[1]), robust
+
+
+def _apply_source_map(audio: np.ndarray, source: np.ndarray, length: int) -> np.ndarray:
+    out = np.empty((length, audio.shape[1]), dtype=np.float32)
+    x = np.arange(length, dtype=np.float64)
+    for channel in range(audio.shape[1]):
+        out[:, channel] = np.interp(source, x, audio[:length, channel]).astype(np.float32)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+def lock_incoming_deck_phase(
+    *,
+    a_low: np.ndarray,
+    b_low: np.ndarray,
+    a_harm: np.ndarray,
+    b_harm: np.ndarray,
+    a_perc: np.ndarray,
+    b_perc: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+    beats_per_bar: int,
+    bars: int,
+    a_beat_positions: np.ndarray | Sequence[float] | None = None,
+    b_beat_positions: np.ndarray | Sequence[float] | None = None,
+    a_downbeat_positions: np.ndarray | Sequence[float] | None = None,
+    b_downbeat_positions: np.ndarray | Sequence[float] | None = None,
+    initial_offset_samples: float = 0.0,
+    max_nudge_ms: float = 48.0,
+    max_bar_step_ms: float = 14.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+    """DJ-style deck phase lock using phrase beats and smooth bar-level nudges.
+
+    Real beatmatching changes the phase/tempo of the *whole incoming deck*.
+    It does not independently drag every kick transient.  This function therefore
+    estimates a robust phase trajectory from the detected beat grids and kick
+    attacks, then applies the same monotonic source map to bass, harmonic and
+    percussion layers.  Corrections are only allowed to change at bar scale.
+    """
+    length = min(len(a_low), len(b_low), len(a_harm), len(b_harm), len(a_perc), len(b_perc))
+    empty_metrics = {
+        "beat_grid_alignment_score": 0.5,
+        "beat_grid_align_ms": 0.0,
+        "beat_grid_aligned_beats": 0.0,
+        "beat_lock_pre_error_ms": 0.0,
+        "beat_lock_post_error_ms": 0.0,
+        "beat_lock_confidence": 0.0,
+        "beat_lock_bar_nudges": 0.0,
+        "beat_lock_terminal_shift_samples": 0.0,
+    }
+    if length < 512 or bpm <= 1.0:
+        return b_low, b_harm, b_perc, empty_metrics
+
+    beat_samples = float(sample_rate) * 60.0 / float(bpm)
+    nominal_count = min(
+        max(2, int(bars) * max(1, int(beats_per_bar)) + 1),
+        int(length / beat_samples) + 2,
+    )
+    nominal = np.arange(nominal_count, dtype=np.float64) * beat_samples
+    nominal = nominal[nominal < length]
+
+    a_grid = _sanitize_positions(a_beat_positions, length)
+    b_grid = _sanitize_positions(b_beat_positions, length)
+    if a_grid.size < 2:
+        a_grid = nominal
+    if b_grid.size < 2:
+        b_grid = nominal + float(initial_offset_samples)
+        b_grid = b_grid[(b_grid >= 0.0) & (b_grid < length)]
+    aa, bb = _best_beat_pairing(a_grid, b_grid)
+    if aa.size < 2:
+        return b_low, b_harm, b_perc, empty_metrics
+
+    a_down = _sanitize_positions(a_downbeat_positions, length)
+    b_down = _sanitize_positions(b_downbeat_positions, length)
+    onset_a = _kick_onset_envelope(a_low[:length], a_perc[:length], sample_rate)
+    onset_b = _kick_onset_envelope(b_low[:length], b_perc[:length], sample_rate)
+    search = max(8, int(round(0.060 * sample_rate)))
+    maximum = max(1, int(round(max_nudge_ms * sample_rate / 1000.0)))
+
+    obs_x: list[float] = []
+    obs_y: list[float] = []
+    obs_w: list[float] = []
+    acoustic_residuals: list[float] = []
+    acoustic_weights: list[float] = []
+
+    def is_downbeat(pos: float, grid: np.ndarray) -> bool:
+        return bool(grid.size and np.min(np.abs(grid - pos)) <= max(0.035 * sample_rate, 1.0))
+
+    for pa, pb in zip(aa, bb):
+        center = float(0.5 * (pa + pb))
+        grid_residual = float(np.clip(pb - pa, -maximum, maximum))
+        downbeat_weight = 1.8 if is_downbeat(pa, a_down) and is_downbeat(pb, b_down) else 1.0
+        obs_x.append(center)
+        obs_y.append(grid_residual)
+        obs_w.append(0.38 * downbeat_weight)
+
+        ia = int(round(pa))
+        ib = int(round(pb))
+        alo, ahi = max(0, ia - search), min(length, ia + search + 1)
+        blo, bhi = max(0, ib - search), min(length, ib + search + 1)
+        if ahi - alo < 8 or bhi - blo < 8:
+            continue
+        peak_a = alo + int(np.argmax(onset_a[alo:ahi]))
+        peak_b = blo + int(np.argmax(onset_b[blo:bhi]))
+        floor_a = float(np.median(onset_a[alo:ahi]) + 1e-9)
+        floor_b = float(np.median(onset_b[blo:bhi]) + 1e-9)
+        prominence = float(np.clip(min(onset_a[peak_a] / floor_a, onset_b[peak_b] / floor_b) / 12.0, 0.0, 1.0))
+        residual = float(np.clip(peak_b - peak_a, -maximum, maximum))
+        if prominence >= 0.16:
+            weight = (0.75 + 1.45 * prominence) * downbeat_weight
+            obs_x.append(center)
+            obs_y.append(residual)
+            obs_w.append(weight)
+            acoustic_residuals.append(residual)
+            acoustic_weights.append(weight)
+
+    if len(obs_y) < 2:
+        return b_low, b_harm, b_perc, empty_metrics
+
+    x = np.asarray(obs_x, dtype=np.float64)
+    y = np.asarray(obs_y, dtype=np.float64)
+    w = np.asarray(obs_w, dtype=np.float64)
+    intercept, slope, robust_w = _weighted_line_fit(x, y, w)
+    intercept = float(np.clip(intercept, -maximum, maximum))
+    total_drift_limit = max(1.0, int(round(0.040 * sample_rate)))
+    end_value = intercept + slope * max(length - 1, 1)
+    end_value = float(np.clip(end_value, -maximum - total_drift_limit, maximum + total_drift_limit))
+    slope = (end_value - intercept) / max(length - 1, 1)
+
+    # Manual DJs nudge the deck occasionally, not on every kick.  Estimate one
+    # correction per bar, robustly smooth it, then interpolate between bars.
+    beats_per_bar = max(1, int(beats_per_bar))
+    bar_samples = beat_samples * beats_per_bar
+    bar_count = max(1, int(np.ceil(length / max(bar_samples, 1.0))))
+    bar_x = [0.0]
+    bar_y = [intercept]
+    for bar_index in range(1, bar_count + 1):
+        center = min(float(length - 1), bar_index * bar_samples)
+        mask = np.abs(x - center) <= 0.72 * bar_samples
+        if np.any(mask):
+            local_y = y[mask]
+            local_w = robust_w[mask]
+            order = np.argsort(local_y)
+            ly = local_y[order]
+            lw = local_w[order]
+            cumulative = np.cumsum(lw)
+            target_w = 0.5 * cumulative[-1]
+            value = float(ly[min(int(np.searchsorted(cumulative, target_w)), len(ly) - 1)])
+            model_value = intercept + slope * center
+            value = 0.72 * value + 0.28 * model_value
+        else:
+            value = intercept + slope * center
+        bar_x.append(center)
+        bar_y.append(float(np.clip(value, -maximum - total_drift_limit, maximum + total_drift_limit)))
+
+    bar_y_arr = np.asarray(bar_y, dtype=np.float64)
+    if bar_y_arr.size >= 3:
+        bar_y_arr = signal.medfilt(bar_y_arr, kernel_size=3)
+    max_bar_step = max(1.0, max_bar_step_ms * sample_rate / 1000.0)
+    for i in range(1, len(bar_y_arr)):
+        bar_y_arr[i] = np.clip(bar_y_arr[i], bar_y_arr[i - 1] - max_bar_step, bar_y_arr[i - 1] + max_bar_step)
+    for i in range(len(bar_y_arr) - 2, -1, -1):
+        bar_y_arr[i] = np.clip(bar_y_arr[i], bar_y_arr[i + 1] - max_bar_step, bar_y_arr[i + 1] + max_bar_step)
+
+    target = np.arange(length, dtype=np.float64)
+    correction = np.interp(target, np.asarray(bar_x, dtype=np.float64), bar_y_arr)
+    correction = np.clip(correction, -maximum - total_drift_limit, maximum + total_drift_limit)
+
+    # The renderer must reconnect to the unmodified incoming track. Keep the
+    # deck locked while both tracks are audible, then release the nudge over the
+    # final ~1.25 beats after deck A is normally almost gone. This avoids the
+    # frozen-edge artifact caused by clipping a non-zero terminal source offset.
+    release = int(round(min(1.25 * beat_samples, 0.18 * length)))
+    release = max(32, min(release, max(32, length - 1)))
+    release_start = max(0, length - release)
+    if release_start < length - 1:
+        release_phase = np.clip(
+            (target - release_start) / max(length - 1 - release_start, 1), 0.0, 1.0
+        )
+        release_curve = 1.0 - (
+            release_phase**3 * (release_phase * (release_phase * 6.0 - 15.0) + 10.0)
+        )
+        correction *= release_curve
+    correction[-1] = 0.0
+    source = np.clip(target + correction, 0.0, length - 1.0)
+    # Monotonic source positions are required for a click-free deck nudge.
+    source = np.maximum.accumulate(source)
+    source[-1] = length - 1.0
+
+    active_obs = x <= max(0.0, release_start - 0.25 * beat_samples)
+    if not np.any(active_obs):
+        active_obs = np.ones_like(x, dtype=bool)
+    before_error = np.abs(y[active_obs])
+    after_error = np.abs(
+        y[active_obs] - np.interp(x[active_obs], target, correction)
+    )
+    active_weights = np.maximum(robust_w[active_obs], 1e-9)
+
+    def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+        order = np.argsort(values)
+        sorted_values = values[order]
+        sorted_weights = weights[order]
+        cumulative = np.cumsum(sorted_weights)
+        index = min(
+            int(np.searchsorted(cumulative, 0.5 * cumulative[-1])),
+            len(sorted_values) - 1,
+        )
+        return float(sorted_values[index])
+
+    pre_ms = 1000.0 * weighted_median(before_error, active_weights) / sample_rate
+    post_ms = 1000.0 * weighted_median(after_error, active_weights) / sample_rate
+    if acoustic_residuals:
+        spread = float(np.median(np.abs(np.asarray(acoustic_residuals) - np.median(acoustic_residuals))))
+        prominence_conf = float(np.average(np.clip(np.asarray(acoustic_weights) / 3.0, 0.0, 1.0)))
+    else:
+        spread = maximum
+        prominence_conf = 0.0
+    consistency = float(np.clip(1.0 - spread / max(maximum, 1), 0.0, 1.0))
+    confidence = float(np.clip(0.35 + 0.40 * consistency + 0.25 * prominence_conf, 0.0, 1.0))
+    score = float(np.clip(0.55 + 0.30 * confidence + 0.15 * (1.0 - min(post_ms / 35.0, 1.0)), 0.0, 1.0))
+    weighted_ms = 1000.0 * float(np.average(np.abs(correction), weights=np.linspace(1.2, 0.8, length))) / sample_rate
+
+    metrics = {
+        "beat_grid_alignment_score": score,
+        "beat_grid_align_ms": weighted_ms,
+        "beat_grid_aligned_beats": float(len(aa)),
+        "beat_lock_pre_error_ms": pre_ms,
+        "beat_lock_post_error_ms": post_ms,
+        "beat_lock_confidence": confidence,
+        "beat_lock_bar_nudges": float(max(0, len(bar_x) - 1)),
+        "beat_lock_terminal_shift_samples": 0.0,
+        "beat_lock_release_start": float(release_start),
+    }
+    return (
+        _apply_source_map(b_low, source, length),
+        _apply_source_map(b_harm, source, length),
+        _apply_source_map(b_perc, source, length),
+        metrics,
+    )
+
+
 def align_percussive_beat_grid(
     *,
     a_low: np.ndarray,
@@ -198,96 +540,28 @@ def align_percussive_beat_grid(
     bars: int,
     max_shift_ms: float = 42.0,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
-    """Micro-warp incoming kick/percussion so every beat follows deck A.
+    """Backward-compatible wrapper around the whole-deck phase lock.
 
-    The phrase endpoints remain fixed.  Only small, smooth residual corrections
-    are applied after the phrase-level Rubber Band warp, so the next track can
-    resume at the original complete-beat endpoint without a seam.
+    Existing callers/tests receive low and percussion outputs, while the real
+    engine uses :func:`lock_incoming_deck_phase` so harmonic content follows the
+    exact same nudge map.
     """
-    length = min(len(a_low), len(b_low), len(a_perc), len(b_perc))
-    if length < 512 or bpm <= 1.0:
-        return b_low, b_perc, {
-            "beat_grid_alignment_score": 0.5,
-            "beat_grid_align_ms": 0.0,
-            "beat_grid_aligned_beats": 0.0,
-        }
-
-    beat_samples = float(sample_rate) * 60.0 / float(bpm)
-    expected = min(max(1, int(bars) * max(1, int(beats_per_bar))), int(length / beat_samples) + 1)
-    search = max(8, int(round(0.075 * sample_rate)))
-    smooth = max(1, int(round(0.0035 * sample_rate)))
-    maximum = max(1, int(round(max_shift_ms * sample_rate / 1000.0)))
-
-    # Mix the click/body of the separated drum with a little low-end kick energy.
-    detector_a = np.mean(a_perc[:length] + 0.38 * a_low[:length], axis=1, dtype=np.float64)
-    detector_b = np.mean(b_perc[:length] + 0.38 * b_low[:length], axis=1, dtype=np.float64)
-    onset_a = np.abs(np.diff(detector_a, prepend=detector_a[0]))
-    onset_b = np.abs(np.diff(detector_b, prepend=detector_b[0]))
-    kernel = np.ones(smooth, dtype=np.float64) / smooth
-    onset_a = np.convolve(onset_a, kernel, mode="same")
-    onset_b = np.convolve(onset_b, kernel, mode="same")
-
-    anchors: list[int] = []
-    offsets: list[float] = []
-    confidences: list[float] = []
-    for beat_index in range(expected):
-        nominal = int(round(beat_index * beat_samples))
-        if nominal <= search or nominal >= length - search:
-            continue
-        lo, hi = nominal - search, nominal + search + 1
-        pa = lo + int(np.argmax(onset_a[lo:hi]))
-        pb = lo + int(np.argmax(onset_b[lo:hi]))
-        offset = float(np.clip(pb - pa, -maximum, maximum))
-        floor_a = float(np.median(onset_a[lo:hi]) + 1e-9)
-        floor_b = float(np.median(onset_b[lo:hi]) + 1e-9)
-        confidence = float(np.clip(min(onset_a[pa] / floor_a, onset_b[pb] / floor_b) / 10.0, 0.0, 1.0))
-        if confidence >= 0.16:
-            anchors.append(nominal)
-            offsets.append(offset)
-            confidences.append(confidence)
-
-    if len(offsets) < 2:
-        return b_low, b_perc, {
-            "beat_grid_alignment_score": 0.5,
-            "beat_grid_align_ms": 0.0,
-            "beat_grid_aligned_beats": float(len(offsets)),
-        }
-
-    values = np.asarray(offsets, dtype=np.float64)
-    if len(values) >= 3:
-        values = signal.medfilt(values, kernel_size=3)
-    # Prevent one odd onset from creating audible local speed jumps.
-    max_step = max(1.0, 0.010 * sample_rate)
-    for i in range(1, len(values)):
-        values[i] = np.clip(values[i], values[i - 1] - max_step, values[i - 1] + max_step)
-    for i in range(len(values) - 2, -1, -1):
-        values[i] = np.clip(values[i], values[i + 1] - max_step, values[i + 1] + max_step)
-
-    # Fade the correction to zero at both phrase endpoints to preserve continuity.
-    anchor_x = np.asarray([0, *anchors, length - 1], dtype=np.float64)
-    anchor_y = np.asarray([0.0, *values.tolist(), 0.0], dtype=np.float64)
-    target = np.arange(length, dtype=np.float64)
-    correction = np.interp(target, anchor_x, anchor_y)
-    source = np.clip(target + correction, 0.0, length - 1.0)
-    # Monotonicity is required for a click-free time map.
-    source = np.maximum.accumulate(source)
-    source[-1] = length - 1.0
-
-    def warp(audio: np.ndarray) -> np.ndarray:
-        out = np.empty((length, audio.shape[1]), dtype=np.float32)
-        x = np.arange(length, dtype=np.float64)
-        for channel in range(audio.shape[1]):
-            out[:, channel] = np.interp(source, x, audio[:length, channel]).astype(np.float32)
-        return np.ascontiguousarray(out, dtype=np.float32)
-
-    weighted_ms = 1000.0 * float(np.average(np.abs(values), weights=np.maximum(confidences, 1e-3))) / sample_rate
-    confidence = float(np.mean(confidences))
-    score = float(np.clip(0.55 + 0.45 * confidence, 0.0, 1.0))
-    return warp(b_low), warp(b_perc), {
-        "beat_grid_alignment_score": score,
-        "beat_grid_align_ms": weighted_ms,
-        "beat_grid_aligned_beats": float(len(values)),
-    }
+    zeros_a = np.zeros_like(a_perc, dtype=np.float32)
+    zeros_b = np.zeros_like(b_perc, dtype=np.float32)
+    out_low, _, out_perc, metrics = lock_incoming_deck_phase(
+        a_low=a_low,
+        b_low=b_low,
+        a_harm=zeros_a,
+        b_harm=zeros_b,
+        a_perc=a_perc,
+        b_perc=b_perc,
+        sample_rate=sample_rate,
+        bpm=bpm,
+        beats_per_bar=beats_per_bar,
+        bars=bars,
+        max_nudge_ms=max_shift_ms,
+    )
+    return out_low, out_perc, metrics
 
 def _delay_echo(
     audio: np.ndarray,

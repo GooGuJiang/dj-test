@@ -119,5 +119,5 @@ def test_sliding_window_warms_tracks_after_hot_next(monkeypatch) -> None:
 
     assert engine._prime_current.analysis.path == "A.wav"
     assert engine._prime_next.analysis.path == "B.wav"
-    warm_paths = {key[1] for key in engine._warm_cache.keys()}
-    assert warm_paths == {"C.wav", "D.wav"}
+    rendered_paths = {key[2] for key in engine._rendered_pair_cache.keys()}
+    assert rendered_paths == {"C.wav", "D.wav"}

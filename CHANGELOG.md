@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.10
+
+- 修复 All-In-One 纯 PyTorch NATTEN 兼容模块缺少 `__spec__`，导致 Transformers 报 `natten.__spec__ is None`。
+- CUE-DETR 检测现在区分“缺少依赖”和“依赖导入冲突”。
+- 检测时直接验证 `DetrImageProcessor` 与 `DetrForObjectDetection`。
+
+
+## 1.2.9
+
+- 接入官方 `disco-eth/cue-detr`，并将其设为唯一 IN/OUT cue 来源。
+- 移除旧 checkerboard novelty、周期、salience 和静音尾部规则切点。
+- Beat This! 只负责把 neural cue 吸附到 downbeat。
+- All-In-One 和 MuQ 只对 CUE-DETR cue 排序，不允许新增候选。
+- CUE-DETR 使用官方 75% 重叠 Mel 频谱滑窗流程，并增加批量 GPU 推理与磁盘缓存。
+- 滑动窗口升级为完整相邻 pair 预渲染：解码、变速、cue 配对、BPM 恢复和最终过渡全部提前完成。
+- 播放流启动前强制准备好当前→下一首的最终过渡。
+- 简单淡化、Gapless 和截止保护不再移动已选中的 neural cue。
+- 新增 CUE-DETR 安装、验证、GUI 进度和 4 项专项回归测试。
+
 ## 1.2.7
 
 - 修复 Spectral Seam 渲染分支未定义 `phrase_length` 导致的 NameError。

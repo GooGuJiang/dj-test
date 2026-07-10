@@ -18,3 +18,8 @@ soxr>=0.3
 muq
 huggingface-hub>=0.24
 safetensors>=0.4
+
+# CUE-DETR official cue-point model
+transformers>=4.42.3,<5
+pillow>=10.4,<12
+timm>=1.0.7,<2

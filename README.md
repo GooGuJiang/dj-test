@@ -1,167 +1,147 @@
-# Beat This! + MuQ + All-In-One Auto DJ 1.2.7
+# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.10
 
-本版本把结构分析从 SongFormer 恢复为 `mir-aidj/all-in-one`，并按要求取消独立 worker。All-In-One 直接在主程序进程的后台线程中运行。
-
-## 1.2.7 鼓拍锁定与 Double Drop 交接
-
-### 逐拍鼓组对齐
-
-原来的微对齐只校正过渡开始处的第一个 kick。新版在完整乐句已经完成 Rubber Band Phrase-Lock 后，再检查过渡内每一个 beat：
-
-```text
-完整小节/乐句时间拉伸
-  → 首个 downbeat 低频微对齐
-  → 每拍 kick/percussion 瞬态检测
-  → 平滑小幅 time-map 校正下一首低频与鼓组
-  → 两端校正归零，保持下一首完整小节终点不变
-```
-
-单拍最大残差校正约 42 ms。异常或置信度不足的瞬态不会参与校正。命令行会输出：
-
-```text
-鼓拍微对齐：Track B · 24 拍 · 平均校正 11.8 ms
-```
-
-### 两边鼓组先重叠，再降低上一首
-
-过渡不再在下一首 kick 到达的同一瞬间立刻抽走上一首鼓组。现在会让 B 的鼓组先建立 groove，A 保持一段短重叠，然后再释放：
-
-```text
-B drums 渐入
-     ↓
-A + B 鼓拍短暂重叠
-     ↓
-A drums 延迟衰减
-     ↓
-B drums 完整接管
-```
-
-低频 bass 不跟随鼓组长时间叠加，仍在结构落点附近快速交换，减少低频糊成一团。
-
-### Double Drop 优先
-
-当两首歌都能在完整 downbeat/乐句边界落到 `DROP` 或 `CHORUS`，且和声、低频净度和节拍条件达到安全阈值时，系统会优先选择 Double Drop。
-
-Double Drop 会额外保留最多 2 拍的落点后窗口：落点时两边鼓组同时出现，约 3/4 拍后才开始降低 A，并在随后约 1 拍内完成交接。若 Double Drop 的最终响度、低频碰撞或节拍质量明显低于其他候选，系统仍会选择更安全的手法。
-
-GUI 匹配详情新增：
-
-- `首拍微调`
-- `逐拍校正`
-- `双鼓交接`
-
-
-## 1.2.5 预加载与跳转修复
-
-### 下一首只准备一次
-
-播放前预加载、点击播放和滑动窗口现在共享同一个音轨准备任务。对于相同文件和目标 BPM，只会执行一次解码与 Rubber Band 变速，其余调用等待并复用结果。
-
-正常日志应类似：
-
-```text
-后台预加载：Track A
-后台预分析下一首：Track B
-复用正在准备的音轨：Track B
-已同步 Track B：100.0 → 103.4 BPM · Rubber Band R3
-下一首基础准备完成：Track B，正在搜索结构切点
-正在生成下一首连续 BPM 恢复桥：Track B
-正在渲染最终 DJ 过渡：Track B
-下一首已提交到播放器：Track B
-```
-
-不会再连续出现多次相同的“已同步 Track B”。重复的 GUI 预加载调度也不会重复打印启动日志。
-
-### 节拍跳转不重新计算
-
-点击或拖动 A 轨时间轴后：
-
-- 只移动播放游标并吸附最近 beat；
-- 保留已准备的下一首和切歌计划；
-- 不重新调用 Beat This!、MuQ、All-In-One、Rubber Band；
-- 不重新渲染 BPM 恢复桥或 DJ 过渡；
-- 跳进已有过渡区时，从已渲染过渡的对应位置继续；
-- 跳过原切歌终点时，仅跳过本次计划，让当前歌曲自然播完。
+这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.9 将切歌候选改为只来自官方 CUE-DETR；1.2.10 修复 CUE-DETR 与 All-In-One 的 NATTEN 兼容层在同一进程中的导入冲突。
 
 ## 模型分工
 
-- Beat This!：beat、downbeat 和播放时间网格
-- All-In-One：intro、verse、chorus、break、bridge、solo、outro 等功能段
-- MuQ-large-msd-iter：风格语义、播放顺序和 Outro→Intro 兼容度
-- 本地 EDM 融合：将结构标签、能量、鼓组、低频和新颖度融合为 BUILDUP、DROP、BREAKDOWN 等 DJ 角色
+- **CUE-DETR (`disco-eth/cue-detr`)**：唯一的 IN/OUT cue 候选来源。
+- **Beat This!**：beat/downbeat 网格，并将 CUE-DETR 的时间预测量化到最近 downbeat。
+- **All-In-One**：`intro / verse / chorus / break / bridge / outro` 等结构角色，只给 neural cue 排序，不新增 cue。
+- **MuQ**：歌曲风格、Outro→Intro 语义关系、播放顺序和 cue 配对兼容度。
+- **本地 DSP 特征**：调性、能量、低频、人声和鼓组冲突评分，只影响候选分数和渲染方式。
 
-## 资源策略
+## 1.2.10 的主要变化
 
-All-In-One 有独立的运行设备设置，默认是 `cpu`。这不会改变 Beat This! 和 MuQ 的设备选择；它们仍可使用 `auto` 或 `cuda`。
+### CUE-DETR 与 All-In-One 共存修复
 
-分析顺序为：
+- 为纯 PyTorch `natten` 和 `natten.functional` 兼容模块补充合法 `ModuleSpec`。
+- Transformers 的可选依赖检查不再报 `natten.__spec__ is None`。
+- CUE-DETR 检测会直接导入 `DetrImageProcessor` 与 `DetrForObjectDetection`。
+- GUI 会区分缺少依赖与导入冲突。
+- 安装器和验证器会模拟真实的 All-In-One → CUE-DETR 导入顺序。
+
+### CUE-DETR-only 切点（1.2.9 起）
+
+旧版的以下切点来源已经停用：
+
+- checkerboard novelty 自动边界
+- 固定 4/8/16 小节周期候选
+- 能量阈值自动造点
+- 静音尾部重新选择切点
+- 截止保护临时移动到任意位置
+
+新的流程：
 
 ```text
-Beat This!
-  → All-In-One 主进程后台线程
-  → MuQ 风格分析与重排
-  → 滑动窗口预加载
+整曲音频
+  ↓
+22.05 kHz Mel 频谱
+  ↓
+CUE-DETR 75% 重叠滑窗预测
+  ↓
+合并重叠窗口候选并做峰值筛选
+  ↓
+吸附到 Beat This! downbeat
+  ↓
+All-In-One / MuQ / BPM / 调性只做排序
 ```
 
-分析期间会暂停 MuQ 排序和音频预加载，避免 Demucs、结构模型、MuQ 和时间拉伸同时争用内存。All-In-One 调用被全局锁串行化，不会同时运行多个结构分析。
+即使 AutoMix 降级为短淡化，也只能缩短已经选中的 CUE-DETR cue 对，不能移动到新的规则位置。
+
+### Mixxx 风格的三级预读
+
+本项目没有复制 Mixxx 源码，而是采用其 `CachingReader / ReadAheadManager / worker scheduler` 所体现的实时播放原则：耗时工作不能等到音频回调或 OUT 点附近才开始。
+
+滑动窗口现在分为：
+
+1. **分析窗口**：提前完成 Beat This!、All-In-One、CUE-DETR 和 MuQ 缓存。
+2. **计划窗口**：提前解码、BPM 同步并搜索相邻歌曲的 CUE-DETR cue 对。
+3. **渲染窗口**：提前生成 Phrase-Lock、Deck Phase Lock、BPM 恢复桥和最终过渡音频。
+
+播放启动前，当前歌曲与紧邻下一首的完整过渡必须已经就绪。窗口后方的相邻歌曲对继续后台渲染，并受内存上限控制。
+
+日志示例：
+
+```text
+CUE-DETR 完成：Track B.flac · 7 个 cue
+滑动窗口提前渲染 2/8：Track A → Track B
+滑动窗口完整过渡就绪：Track A → Track B · CUE-DETR 184.0s
+开始播放：Track A
+滑动窗口命中完整过渡：Track A → Track B
+```
 
 ## 安装
 
-在原来的主环境中安装，不创建独立 Conda worker：
+建议解压到新目录：
 
 ```powershell
 conda activate beatthis-auto-dj
-python install_allinone.py
-python verify_allinone.py
+cd beatthis_muq_cuedetr_auto_dj_gui_v1210
+
+python install_cuedetr.py
+python verify_cuedetr.py
 python app.py
 ```
 
-进行一次真实分析验证：
+`install_cuedetr.py` 不会重装 PyTorch，避免覆盖已有 CUDA 构建。首次分析会下载：
 
-```powershell
-python verify_allinone.py demo_tracks/demo_01_120bpm.wav --device cpu
-```
+- `disco-eth/cue-detr`
+- `facebook/detr-resnet-50` 图像处理配置
 
-## GUI 设置
-
-建议 RTX 5070 用户使用：
+## 推荐设置
 
 ```text
-Beat This! / MuQ 计算设备：auto 或 cuda
-All-In-One 运行设备：cpu
-All-In-One 模型：harmonix-all
+CUE-DETR 设备：cuda 或 auto
+灵敏度：0.88–0.93
+最小 cue 间隔：8 或 16 小节
+滑动窗口：3–4 轨
+预加载内存：1024–2048 MB
+截止保护：60–90 秒
+Beat This! / MuQ：auto 或 cuda
+All-In-One：cpu
+Rubber Band：R3
 ```
 
-All-In-One 可选 `harmonix-all` 或 `harmonix-fold0` 至 `harmonix-fold7`。`harmonix-all` 精度优先，fold 模型速度和内存略低。
+灵敏度过高会减少候选，过低会产生过多候选。电子音乐建议先从 `0.90 / 8 小节` 开始。
 
-## 进度与日志
+## 使用流程
 
-GUI 底部继续显示分析阶段、歌曲数量和百分比。All-In-One 加载 Demucs 与结构模型时使用动态进度条；完成批量推理后逐首更新结果。
+1. 添加歌曲。
+2. 等待 Beat This!、All-In-One、CUE-DETR 和 MuQ 完成。
+3. MuQ 完成后自动调整尚未播放的顺序。
+4. 等待状态显示“热下一轨预加载完成”。
+5. 点击播放。
 
-PowerShell 会实时显示主进程线程日志以及 All-In-One 自带的 Demucs、频谱提取和推理进度：
-
-```text
-All-In-One 主进程后台线程分析 6 首 · harmonix-all · cpu
-=> Found 6 tracks to analyze.
-Separating tracks: ...
-Extracting spectrograms: ...
-Analyzing Track01.flac: ...
-All-In-One 完成：Track01.flac · intro, verse, chorus, outro
-```
+如果任何待播放歌曲没有 CUE-DETR profile，程序会阻止播放并启动 cue 分析，不会静默使用旧算法。
 
 ## 缓存
 
-All-In-One 缓存：
+CUE-DETR 缓存目录：
 
 ```text
-~/.beatthis_muq_allinone_cache_v3.json
+~/.cache/beatthis_auto_dj/cue_detr
 ```
 
-缓存键包含文件路径、大小、修改时间、模型名称和分析器版本。
+缓存键包含文件大小、修改时间、模型、灵敏度、最小间隔和 Beat This! BPM 网格信息。
 
-## 运行
+## 验证
+
+- 56 项自动测试通过
+- CUE-DETR downbeat 吸附测试通过
+- 最小小节距离测试通过
+- 旧 cue 数组清零测试通过
+- 匹配器只使用 CUE-DETR cue 测试通过
+- Gapless/截止降级不移动 neural cue 测试通过
+- 完整相邻歌曲过渡滑动缓存测试通过
+- GUI 无头启动测试通过
+
+## CUE-DETR 显示 `natten.__spec__ is None`
+
+这是 1.2.9 中 All-In-One 的 NATTEN 兼容模块与 Transformers 的导入检测冲突，
+不是 CUE-DETR 依赖没有安装。1.2.10 已修复，已有环境无需重装：
 
 ```powershell
-conda activate beatthis-auto-dj
+python verify_cuedetr.py
 python app.py
 ```
+
