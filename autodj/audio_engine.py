@@ -39,6 +39,16 @@ from .transition_matcher import (
 
 
 @dataclass
+class _PrepareJob:
+    """One in-flight decode/time-stretch job shared by all preload callers."""
+
+    event: threading.Event
+    users: int = 0
+    result: PreparedTrack | None = None
+    error: BaseException | None = None
+
+
+@dataclass
 class EngineConfig:
     sample_rate: int = 44_100
     channels: int = 2
@@ -261,6 +271,9 @@ class AutoDJEngine:
         self._next_loader: threading.Thread | None = None
         self._next_loading = False
         self._loader_generation = 0
+        # Concurrent pair-preload/start/service calls must share one expensive
+        # decode + Rubber Band job for the same track and target BPM.
+        self._prepare_jobs: dict[tuple[Any, ...], _PrepareJob] = {}
         self._last_callback_status = ""
         self._muq_analyzer: MuQAnalyzer | None = None
         # Recent chosen techniques are used to avoid machine-like repetition.
@@ -294,6 +307,9 @@ class AutoDJEngine:
         # seek 后的短淡入，避免从非零采样位置突然起音产生 click。
         self._seek_fade_remaining = 0
         self._seek_fade_total = max(64, int(0.030 * self.config.sample_rate))
+        # A seek beyond the already-rendered transition can bypass that one plan
+        # without launching any heavy re-analysis.
+        self._skip_plan_after_seek = False
 
     def emit(self, message: str) -> None:
         self._events.put(message)
@@ -429,7 +445,79 @@ class AutoDJEngine:
             stretch_backend=stretch_backend,
         )
 
+    def _prepare_job_key(
+        self, analysis: TrackAnalysis, target_bpm: float | None
+    ) -> tuple[Any, ...]:
+        return (
+            analysis.path,
+            round(float(target_bpm), 4) if target_bpm is not None else None,
+            self.config.sample_rate,
+            round(self.config.max_stretch_percent, 3),
+            round(self.config.target_rms_db, 3),
+            self.config.cue_on_first_downbeat,
+            self.config.time_stretch_backend,
+            self.config.muq_enabled,
+            self.config.muq_device,
+            self.config.allin1_enabled,
+            self.config.allin1_model_name,
+        )
+
     def prepare_track(
+        self,
+        analysis: TrackAnalysis,
+        target_bpm: float | None = None,
+    ) -> PreparedTrack:
+        """Prepare a track once and share the in-flight result across callers.
+
+        Pair preload, playback startup and the sliding-window loader can overlap.
+        Without this rendezvous they may launch Rubber Band for the same file two
+        or three times and a stale task can finish after its result is no longer
+        installable.
+        """
+        key = self._prepare_job_key(analysis, target_bpm)
+        with self._lock:
+            job = self._prepare_jobs.get(key)
+            owner = job is None
+            if job is None:
+                job = _PrepareJob(event=threading.Event())
+                self._prepare_jobs[key] = job
+            job.users += 1
+
+        if not owner:
+            self.emit(f"复用正在准备的音轨：{analysis.title}")
+            job.event.wait()
+            with self._lock:
+                result = job.result
+                error = job.error
+                job.users -= 1
+                if job.users <= 0 and self._prepare_jobs.get(key) is job:
+                    self._prepare_jobs.pop(key, None)
+            if error is not None:
+                raise RuntimeError(f"准备音轨失败：{analysis.title}") from error
+            if result is None:
+                raise RuntimeError(f"准备音轨没有返回结果：{analysis.title}")
+            return result
+
+        try:
+            result = self._prepare_track_uncached(analysis, target_bpm=target_bpm)
+        except BaseException as exc:
+            with self._lock:
+                job.error = exc
+                job.event.set()
+                job.users -= 1
+                if job.users <= 0 and self._prepare_jobs.get(key) is job:
+                    self._prepare_jobs.pop(key, None)
+            raise
+        else:
+            with self._lock:
+                job.result = result
+                job.event.set()
+                job.users -= 1
+                if job.users <= 0 and self._prepare_jobs.get(key) is job:
+                    self._prepare_jobs.pop(key, None)
+            return result
+
+    def _prepare_track_uncached(
         self,
         analysis: TrackAnalysis,
         target_bpm: float | None = None,
@@ -959,7 +1047,7 @@ class AutoDJEngine:
             if self._prime_key == key and (
                 self._prime_loading or self._prime_current is not None
             ):
-                return True
+                return False
             self._prime_generation += 1
             generation = self._prime_generation
             self._prime_loading = True
@@ -974,6 +1062,18 @@ class AutoDJEngine:
             try:
                 self.emit(f"后台预加载：{snapshot[start_index].title}")
                 current = self.prepare_track(snapshot[start_index])
+                # Publish the current deck as soon as it is ready. If the user
+                # presses Play now, start_playlist can adopt it and cancel only
+                # the remaining prime work instead of decoding it again.
+                with self._lock:
+                    if (
+                        generation == self._prime_generation
+                        and self._prime_key == key
+                        and not self._playing
+                    ):
+                        self._prime_current = current
+                if not self._window_token_valid("prime", generation):
+                    return
                 synced_base: PreparedTrack | None = None
                 prepared: PreparedTrack | None = None
                 plan: TransitionPlan | None = None
@@ -983,6 +1083,8 @@ class AutoDJEngine:
                     synced_base = self.prepare_track(
                         incoming, target_bpm=current.original_bpm
                     )
+                    if not self._window_token_valid("prime", generation):
+                        return
                     plan = self._calculate_plan(
                         current,
                         synced_base,
@@ -1084,6 +1186,7 @@ class AutoDJEngine:
             self._next_pos = 0
             self._transition_pos = 0
             self._transitioning = False
+            self._skip_plan_after_seek = False
             self._playing = True
             self._paused = False
             self._device = device
@@ -1496,6 +1599,7 @@ class AutoDJEngine:
             plan: TransitionPlan | None = None
             prepared = synced_base
             if still_valid and current is not None:
+                self.emit(f"下一首基础准备完成：{analysis.title}，正在搜索结构切点")
                 plan = self._calculate_plan(current, synced_base, earliest)
                 with self._lock:
                     latest = self._current_pos
@@ -1526,7 +1630,9 @@ class AutoDJEngine:
                         plan.metrics["preload_deadline_fallback"] = 1.0
                         self.emit("预加载接近截止点：已切换为短节拍淡化，避免错过切歌")
 
+                self.emit(f"正在生成下一首连续 BPM 恢复桥：{analysis.title}")
                 prepared = self._apply_tempo_restore(synced_base, plan.next_end)
+                self.emit(f"正在渲染最终 DJ 过渡：{analysis.title}")
                 plan = self._render_advanced_transition(plan, current, prepared)
 
             installed = False
@@ -1550,6 +1656,7 @@ class AutoDJEngine:
                             f"{(str(plan.bars) + ' 小节') if plan.bars else '无缝裁切'} | {plan.dj_intent} | {plan.transition_mode} | "
                             f"匹配 {plan.score * 100:.0f}分"
                         )
+                    self.emit(f"下一首已提交到播放器：{analysis.title}")
 
             # The immediate next track is hot. Use the remaining background time
             # to prepare synchronized bases farther ahead in the queue.
@@ -1666,6 +1773,7 @@ class AutoDJEngine:
         if self._plan is None or self._next is None:
             return
         self._transitioning = True
+        self._skip_plan_after_seek = False
         self._transition_pos = max(0, self._current_pos - self._plan.current_start)
         self._next_pos = self._plan.next_start + self._transition_pos
 
@@ -1686,6 +1794,7 @@ class AutoDJEngine:
         self._next_synced_base = None
         self._plan = None
         self._transitioning = False
+        self._skip_plan_after_seek = False
         self._transition_pos = 0
         self._next_pos = 0
         self._loader_generation += 1
@@ -1720,6 +1829,7 @@ class AutoDJEngine:
                     and self._auto_mix
                     and self._plan is not None
                     and self._next is not None
+                    and not self._skip_plan_after_seek
                     and self._current_pos >= self._plan.current_start
                 ):
                     self._begin_transition_locked()
@@ -1776,7 +1886,12 @@ class AutoDJEngine:
                     break
 
                 stop_at = current.total_samples
-                if self._auto_mix and self._plan is not None and self._next is not None:
+                if (
+                    self._auto_mix
+                    and self._plan is not None
+                    and self._next is not None
+                    and not self._skip_plan_after_seek
+                ):
                     stop_at = min(stop_at, self._plan.current_start)
                 count = min(frames - written, max(0, stop_at - self._current_pos))
                 if count <= 0:
@@ -1819,10 +1934,12 @@ class AutoDJEngine:
                 self._playing = True
 
     def seek(self, seconds: float, snap_to_beat: bool = True) -> float:
-        """跳转当前歌曲位置，并在后台重新规划后续切歌。
+        """Move the play cursor without re-running transition analysis.
 
-        默认吸附到最近 beat，既便于 DJ 场景定位，也减少从瞬态中间起播的
-        违和感。跳转后加入 30ms 淡入以抑制 click。
+        The already prepared next deck and rendered transition are retained. A
+        seek inside that transition resumes at the matching transition offset.
+        A seek beyond it bypasses only that plan and lets the current song finish;
+        no Beat This!, MuQ, All-In-One, Rubber Band or transition render is started.
         """
         with self._lock:
             current = self._current
@@ -1839,44 +1956,26 @@ class AutoDJEngine:
             self._transition_pos = 0
             self._next_pos = 0
             self._seek_fade_remaining = self._seek_fade_total
+            self._skip_plan_after_seek = False
 
-            should_replan = self._next_synced_base is not None
-            if should_replan:
-                # 旧 plan 的 OUT 位置可能已经在跳转点之前；先撤销已渲染版本，
-                # 后台以新播放位置为 earliest_start 重新搜索。
-                self._next = None
-                self._plan = None
-                self._next_loading = True
-                replan_generation = self._loader_generation
-                replan_index = self._index
+            note = "沿用已有切歌规划"
+            if self._plan is not None and self._next is not None:
+                offset = target - int(self._plan.current_start)
+                if 0 <= offset < int(self._plan.length):
+                    self._transitioning = True
+                    self._transition_pos = int(offset)
+                    self._next_pos = int(self._plan.next_start + offset)
+                    note = "从已渲染过渡的对应节拍继续"
+                elif target >= int(self._plan.current_end):
+                    self._skip_plan_after_seek = True
+                    note = "已越过原切点，本次规划跳过且不重新计算"
+            elif self._next_loading:
+                note = "下一首仍在原预加载任务中，不重新计算"
             else:
-                replan_generation = -1
-                replan_index = -1
+                note = "未启动新的分析或变速任务"
             actual = target / float(self.config.sample_rate)
 
-        self.emit(f"已跳转到 {actual:.1f}s（吸附最近节拍）")
-        if should_replan:
-            def worker() -> None:
-                try:
-                    self._replan()
-                    self.emit("跳转后的切歌位置已重新规划")
-                except Exception as exc:
-                    self.emit(f"跳转后重新规划失败：{exc}")
-                finally:
-                    with self._lock:
-                        if (
-                            replan_generation == self._loader_generation
-                            and replan_index == self._index
-                        ):
-                            self._next_loading = False
-
-            threading.Thread(
-                target=worker,
-                daemon=True,
-                name="AutoDJ-SeekReplan",
-            ).start()
-        else:
-            self.service()
+        self.emit(f"已跳转到 {actual:.1f}s（吸附最近节拍；{note}）")
         return actual
 
     def update_playlist_order(self, playlist: Sequence[TrackAnalysis]) -> None:
@@ -1911,6 +2010,7 @@ class AutoDJEngine:
             self._next_loading = False
             self._warm_loading_paths.clear()
             self._preload_urgent = False
+            self._skip_plan_after_seek = False
 
             # 已经进入过渡后不能替换 B；GUI 排序器会锁住该歌曲。
             if not self._transitioning and desired_next != loaded_next:
@@ -1949,6 +2049,7 @@ class AutoDJEngine:
             self._transition_pos = 0
             self._transitioning = False
             self._seek_fade_remaining = 0
+            self._skip_plan_after_seek = False
             self._next_loading = False
             self._preload_urgent = False
             self._warm_loading_paths.clear()

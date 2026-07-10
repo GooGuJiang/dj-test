@@ -1,7 +1,15 @@
-# Research notes
+# Research and implementation notes — 1.2.2
 
-All-In-One predicts tempo, beats, downbeats, functional segment boundaries and labels. The application keeps Beat This! as the timing authority and samples All-In-One labels on the Beat This! downbeat grid.
+The runtime structure model is the official `ASLP-lab/SongFormer` checkpoint.
+SongFormer boundaries and functional labels are snapped to the Beat This! downbeat grid before being used by the transition matcher.
 
-All-In-One labels are fused with local energy, onset density, bass ratio, vocal proxy and novelty features. DJ-oriented roles such as BUILDUP, DROP and BREAKDOWN are fusion outputs, not direct All-In-One labels.
+MuQ provides global, intro, outro and local timeline embeddings. Playlist ordering uses directional Outro→Intro compatibility together with BPM, energy, timbre and structural-role penalties.
 
-Version 1.2.4 runs All-In-One in a background thread inside the GUI process. A module-level lock serializes calls. `multiprocess=False` is used for spectrogram extraction, and CPU is the default structure-analysis device to protect GPU memory for MuQ, Beat This! and real-time preload.
+EDM roles such as BUILDUP, DROP and BREAKDOWN are engineering-level fusion outputs derived from SongFormer labels plus local energy, onset, bass and novelty features. They are not presented as direct SongFormer labels.
+
+Version 1.2.1 removes the obsolete model setter that only accepted `harmonix-*` names. The public engine API is now exclusively `set_songformer_enabled`, `set_songformer_device`, `set_songformer_model` and `set_preloaded_songformer_profiles`.
+
+
+## Analysis observability
+
+Version 1.2.2 uses structured `AUTODJ_PROGRESS` JSON lines between the isolated SongFormer worker and the GUI process. Ordinary stdout/stderr is forwarded to the parent console while structured lines update the GUI progress bar. Beat This! and MuQ use in-process callbacks, with MuQ reporting fractional progress per semantic window.

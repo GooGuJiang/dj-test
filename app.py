@@ -125,7 +125,7 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! + MuQ + All-In-One Auto DJ 1.2.4")
+        self.title("Beat This! + MuQ + All-In-One Auto DJ 1.2.5")
         self.settings_store = SettingsStore()
         self.saved_settings = self.settings_store.load()
         self._settings_after_id: str | None = None
@@ -178,7 +178,7 @@ class AutoDJApp(tk.Tk):
         self.bind("<Configure>", lambda _event: self._schedule_settings_save(), add="+")
         self.after(150, self._detect_rubberband)
         self.after(240, self._detect_allin1)
-        LOGGER.info("Auto DJ 1.2.4 GUI 启动，主环境 Python=%s", os.sys.executable)
+        LOGGER.info("Auto DJ 1.2.5 GUI 启动，主环境 Python=%s", os.sys.executable)
         self.after(100, self._poll)
 
     _SETTING_VARIABLES = {
@@ -366,7 +366,7 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! + MuQ + All-In-One Auto DJ 1.2.4", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + MuQ + All-In-One Auto DJ 1.2.5", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
@@ -1389,15 +1389,16 @@ class AutoDJApp(tk.Tk):
         try:
             self._apply_engine_settings()
             index = self._selected_index()
-            self.engine.preload_pair(list(self.tracks), start_index=index)
-            next_title = (
-                self.tracks[index + 1].title
-                if index + 1 < len(self.tracks)
-                else "队列末尾"
-            )
-            self._log(
-                f"后台预加载：{self.tracks[index].title} / 下一首 {next_title}"
-            )
+            started = self.engine.preload_pair(list(self.tracks), start_index=index)
+            if started:
+                next_title = (
+                    self.tracks[index + 1].title
+                    if index + 1 < len(self.tracks)
+                    else "队列末尾"
+                )
+                self._log(
+                    f"后台预加载：{self.tracks[index].title} / 下一首 {next_title}"
+                )
         except Exception as exc:
             self._log(f"启动预加载失败：{exc}")
 
@@ -1407,7 +1408,7 @@ class AutoDJApp(tk.Tk):
             return
         try:
             actual = self.engine.seek(seconds, snap_to_beat=True)
-            self._log(f"已跳转到 {format_time(actual)}，切歌规划正在更新")
+            self._log(f"已跳转到 {format_time(actual)}，沿用已缓存结果，不重新计算")
         except Exception as exc:
             self._log(f"跳转失败：{exc}")
 

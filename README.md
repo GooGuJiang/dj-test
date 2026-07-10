@@ -1,6 +1,38 @@
-# Beat This! + MuQ + All-In-One Auto DJ 1.2.4
+# Beat This! + MuQ + All-In-One Auto DJ 1.2.5
 
 本版本把结构分析从 SongFormer 恢复为 `mir-aidj/all-in-one`，并按要求取消独立 worker。All-In-One 直接在主程序进程的后台线程中运行。
+
+## 1.2.5 预加载与跳转修复
+
+### 下一首只准备一次
+
+播放前预加载、点击播放和滑动窗口现在共享同一个音轨准备任务。对于相同文件和目标 BPM，只会执行一次解码与 Rubber Band 变速，其余调用等待并复用结果。
+
+正常日志应类似：
+
+```text
+后台预加载：Track A
+后台预分析下一首：Track B
+复用正在准备的音轨：Track B
+已同步 Track B：100.0 → 103.4 BPM · Rubber Band R3
+下一首基础准备完成：Track B，正在搜索结构切点
+正在生成下一首连续 BPM 恢复桥：Track B
+正在渲染最终 DJ 过渡：Track B
+下一首已提交到播放器：Track B
+```
+
+不会再连续出现多次相同的“已同步 Track B”。重复的 GUI 预加载调度也不会重复打印启动日志。
+
+### 节拍跳转不重新计算
+
+点击或拖动 A 轨时间轴后：
+
+- 只移动播放游标并吸附最近 beat；
+- 保留已准备的下一首和切歌计划；
+- 不重新调用 Beat This!、MuQ、All-In-One、Rubber Band；
+- 不重新渲染 BPM 恢复桥或 DJ 过渡；
+- 跳进已有过渡区时，从已渲染过渡的对应位置继续；
+- 跳过原切歌终点时，仅跳过本次计划，让当前歌曲自然播完。
 
 ## 模型分工
 
