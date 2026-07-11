@@ -27,11 +27,11 @@ def test_cuedetr_point_is_handoff_not_transition_start() -> None:
     plan = find_best_transition(a, b, requested_bars=8)
 
     beat = int(round(60.0 / a.playback_bpm * a.sample_rate))
-    assert plan.current_cue_sample - plan.current_start == 2 * beat
-    assert plan.next_cue_sample - plan.next_start == 2 * beat
-    assert plan.length == 4 * beat
+    assert plan.current_cue_sample - plan.current_start == 4 * beat
+    assert plan.next_cue_sample - plan.next_start == 4 * beat
+    assert plan.length == 6 * beat
     assert plan.next_resume_sample - plan.next_cue_sample == 2 * beat
-    assert plan.switch_position == pytest.approx(0.5)
+    assert plan.switch_position == pytest.approx(4.0 / 6.0)
     assert plan.switch_sample_a == plan.current_cue_sample
     assert plan.switch_sample_b == plan.next_cue_sample
 

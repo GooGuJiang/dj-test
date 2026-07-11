@@ -126,7 +126,7 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.15")
+        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.16")
         self.settings_store = SettingsStore()
         self.saved_settings = self.settings_store.load()
         self._settings_after_id: str | None = None
@@ -183,7 +183,7 @@ class AutoDJApp(tk.Tk):
         self.after(150, self._detect_rubberband)
         self.after(240, self._detect_allin1)
         self.after(320, self._detect_cuedetr)
-        LOGGER.info("Auto DJ 1.2.15 GUI 启动，主环境 Python=%s", os.sys.executable)
+        LOGGER.info("Auto DJ 1.2.16 GUI 启动，主环境 Python=%s", os.sys.executable)
         self.after(100, self._poll)
 
     _SETTING_VARIABLES = {
@@ -375,7 +375,7 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.15", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.16", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
@@ -633,7 +633,10 @@ class AutoDJApp(tk.Tk):
         bars.bind("<<ComboboxSelected>>", lambda _: self._apply_bars())
         ttk.Label(
             settings_frame,
-            text="只影响 cue 前后的结构评分；实际可听过渡固定为 cue 前后各约 2 拍。",
+            text=(
+                "只影响 cue 前后的结构评分；实际过渡为 cue 前约 4 拍量化鼓循环，"
+                "cue 后约 2 拍平滑释放。"
+            ),
             style="Muted.TLabel",
             wraplength=280,
         ).pack(anchor=tk.W, pady=(0, 12))

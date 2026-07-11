@@ -77,6 +77,88 @@ def _equal_power(progress: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _cue_quantized_drum_loop(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    bpm: float,
+    handoff_index: int,
+    loop_beats: float = 2.0,
+    seam_ms: float = 4.0,
+) -> np.ndarray:
+    """Repeat B's cue-start percussion before the cue, locked to whole beats.
+
+    A DJ commonly holds an incoming beat loop while the outgoing song keeps its
+    bass and musical body.  The loop is taken *from* the CUE-DETR landing point,
+    repeated backwards through the available pre-roll, and replaced by B's live
+    percussion exactly on the cue.  A very short cyclic bridge removes digital
+    clicks without changing the beat length or moving the neural cue.
+
+    Only the percussive stem is looped. Bass and harmonic material remain under
+    their normal cue-centered ownership curves, preventing double-bass and
+    double-vocal buildup during the longer rhythmic lead-in.
+    """
+    source = np.ascontiguousarray(audio, dtype=np.float32)
+    if source.ndim != 2 or len(source) < 8 or bpm <= 1.0:
+        return source
+
+    handoff = int(np.clip(handoff_index, 0, len(source) - 1))
+    if handoff < 2:
+        return source
+
+    beat_samples = max(1, int(round(60.0 / float(bpm) * int(sample_rate))))
+    requested = max(beat_samples, int(round(float(loop_beats) * beat_samples)))
+    available = len(source) - handoff
+    loop_length = min(requested, available)
+    # A partial beat is not a useful quantized loop. Leave the original stem in
+    # place instead of fabricating or padding rhythmic material.
+    if loop_length < max(32, int(round(0.80 * beat_samples))):
+        return source
+
+    # Keep the loop length on an integer beat count whenever enough material is
+    # available. This makes every wrap land on the same BeatGrid phase.
+    whole_beats = max(1, int(loop_length // beat_samples))
+    loop_length = min(available, whole_beats * beat_samples)
+    if loop_length < 8:
+        return source
+
+    loop = np.array(source[handoff : handoff + loop_length], copy=True)
+    seam = min(
+        max(2, int(round(float(seam_ms) * sample_rate / 1000.0))),
+        max(2, loop_length // 24),
+    )
+    if loop_length >= 4 * seam + 2:
+        # Replace a tiny region straddling the circular boundary with a smooth
+        # Hermite-like bridge. The loop duration stays exactly beat-quantized.
+        left = loop[-seam - 1].astype(np.float64)
+        right = loop[seam].astype(np.float64)
+        t = np.linspace(0.0, 1.0, 2 * seam, endpoint=False, dtype=np.float64)
+        t = t**3 * (t * (t * 6.0 - 15.0) + 10.0)
+        bridge = left[None, :] * (1.0 - t[:, None]) + right[None, :] * t[:, None]
+        loop[-seam:] = bridge[:seam].astype(np.float32)
+        loop[:seam] = bridge[seam:].astype(np.float32)
+
+    result = np.array(source, copy=True)
+    pre_positions = np.arange(handoff, dtype=np.int64)
+    # Counting backwards from the cue guarantees a loop wrap exactly on every
+    # beat before the handoff even when the window was shortened at its start.
+    loop_positions = np.mod(pre_positions - handoff, loop_length)
+    result[:handoff] = loop[loop_positions]
+
+    # Smooth the final synthetic-loop -> live-deck join. This bridge is only a
+    # few milliseconds and does not alter the audible transition duration.
+    join = min(seam, handoff, len(source) - handoff - 1)
+    if join >= 2:
+        left = result[handoff - join - 1].astype(np.float64)
+        right = source[handoff + join].astype(np.float64)
+        t = np.linspace(0.0, 1.0, 2 * join, endpoint=False, dtype=np.float64)
+        t = t**3 * (t * (t * 6.0 - 15.0) + 10.0)
+        bridge = left[None, :] * (1.0 - t[:, None]) + right[None, :] * t[:, None]
+        result[handoff - join : handoff] = bridge[:join].astype(np.float32)
+        result[handoff : handoff + join] = bridge[join:].astype(np.float32)
+    return np.ascontiguousarray(result, dtype=np.float32)
+
+
 def _frame_rms(audio: np.ndarray, frame: int = 2048, hop: int = 512) -> np.ndarray:
     mono = np.mean(audio, axis=1, dtype=np.float64)
     if mono.size < frame:
@@ -683,13 +765,14 @@ def _render_archetype(
     handoff_phase: float = 0.5,
     transition_beats: float = 4.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """Render a cue-centered DJ handoff with a perceptible short crossfade.
+    """Render a cue-centered DJ handoff with a quantized drum-loop bridge.
 
     The CUE-DETR marker remains the ownership-change point, not the beginning
-    of a long blend. Deck B is introduced across the two-beat pre-roll, becomes
-    dominant on the cue, and Deck A keeps a smooth one-beat musical release.
-    The full window is normally four beats, which is long enough to hear the
-    transition but still far shorter than a conventional multi-bar blend.
+    of a long two-song blend. Deck B's cue-start percussion is repeated through
+    the early pre-roll, then the live incoming deck becomes dominant on the cue
+    while Deck A keeps a smooth musical release. Harmonic and bass material are
+    still introduced only near the cue, so the extra time is rhythmic setup,
+    not several beats of competing vocals and low end.
     """
     del drop_landing_phase, bars
     if archetype not in SUPPORTED_ARCHETYPES:
@@ -701,6 +784,17 @@ def _render_archetype(
     vocal_risk = float(np.clip(vocal_risk, 0.0, 1.0))
     handoff = float(np.clip(handoff_phase, 0.20, 0.80))
     beat_width = 1.0 / max(float(transition_beats), 1.0)
+    # ``switch_position`` is stored as handoff_offset / window_length. Using
+    # ``length`` here reconstructs that exact integer sample instead of landing
+    # one sample early because the plotting/control phase includes both ends.
+    handoff_index = int(np.clip(round(handoff * length), 0, max(length - 1, 0)))
+    looped_b_perc = _cue_quantized_drum_loop(
+        b_perc[:length],
+        sample_rate=sample_rate,
+        bpm=bpm,
+        handoff_index=handoff_index,
+        loop_beats=2.0,
+    )
 
     # Bass ownership still changes close to the cue, but no longer in a
     # fraction-of-a-beat snap. The curve is biased slightly early so B owns the
@@ -719,15 +813,26 @@ def _render_archetype(
     bass_a = np.clip(1.0 - bass_progress, 0.0, 1.0).astype(np.float32)
     bass_b = np.clip(bass_progress, 0.0, 1.0).astype(np.float32)
 
-    # B first appears as a restrained rhythmic teaser, then the two drum beds
-    # cross over roughly two beats. B is clearly dominant on the cue, while A's
-    # kick/percussion tail remains audible for about three quarters of a beat.
-    teaser_end = max(0.0, handoff - 1.25 * beat_width)
-    teaser = 0.20 * np.sqrt(np.clip(_ramp(phase, 0.0, teaser_end), 0.0, 1.0))
-    drum_progress = _ramp(
+    # B first appears as a stable, beat-quantized drum loop. The loop fades up
+    # during the first ~0.75 beat and can repeat for several beats while A keeps
+    # its bass and musical body. The actual two-deck drum crossfade still occurs
+    # close to the cue, where B becomes clearly dominant.
+    teaser_fade_end = min(
+        max(0.50 * beat_width, 0.04),
+        max(0.0, handoff - 1.75 * beat_width),
+    )
+    teaser = 0.24 * np.sqrt(
+        np.clip(_ramp(phase, 0.0, teaser_fade_end), 0.0, 1.0)
+    )
+    teaser *= 1.0 - _ramp(
         phase,
         handoff - 1.25 * beat_width,
-        handoff + 0.75 * beat_width,
+        handoff + 0.05 * beat_width,
+    )
+    drum_progress = _ramp(
+        phase,
+        handoff - 1.50 * beat_width,
+        handoff + 0.85 * beat_width,
     )
     drum_a, drum_b_cross = _equal_power(drum_progress)
     drum_b = np.maximum(teaser, drum_b_cross).astype(np.float32)
@@ -761,7 +866,7 @@ def _render_archetype(
     b_contribution = (
         b_low[:length] * bass_b[:, None]
         + b_harm[:length] * harm_b[:, None]
-        + b_perc[:length] * drum_b[:, None]
+        + looped_b_perc * drum_b[:, None]
     ) * b_gain[:, None]
 
     echo = np.zeros_like(a_contribution, dtype=np.float32)
@@ -797,6 +902,7 @@ def _render_archetype(
         "drum_a": drum_a,
         "drum_b": drum_b,
         "drum_overlap": np.minimum(drum_a, drum_b).astype(np.float32),
+        "drum_loop_gain": np.asarray(teaser, dtype=np.float32),
         "harm_a": np.asarray(harm_a, dtype=np.float32),
         "harm_b": np.asarray(harm_b, dtype=np.float32),
         "echo_send": np.asarray(echo_send, dtype=np.float32),

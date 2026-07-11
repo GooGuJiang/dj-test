@@ -19,8 +19,8 @@ def _constant_roles(length: int = 16_000) -> tuple[np.ndarray, ...]:
     return a_low, b_low, a_harm, b_harm, a_perc, b_perc
 
 
-def test_default_matcher_uses_two_beats_on_each_side_of_cue() -> None:
-    assert MatcherConfig().pre_roll_beats == pytest.approx(2.0)
+def test_default_matcher_reserves_four_beats_for_drum_bridge() -> None:
+    assert MatcherConfig().pre_roll_beats == pytest.approx(4.0)
     assert MatcherConfig().release_beats == pytest.approx(2.0)
 
     a = make_track("balanced-A", np.linspace(0.6, 0.2, 64), 0)
@@ -28,11 +28,11 @@ def test_default_matcher_uses_two_beats_on_each_side_of_cue() -> None:
     plan = find_best_transition(a, b, requested_bars=8)
     beat = int(round(60.0 / a.playback_bpm * a.sample_rate))
 
-    assert plan.handoff_offset_samples == 2 * beat
-    assert plan.length == 4 * beat
-    assert plan.metrics["pre_roll_beats"] == pytest.approx(2.0, abs=0.01)
+    assert plan.handoff_offset_samples == 4 * beat
+    assert plan.length == 6 * beat
+    assert plan.metrics["pre_roll_beats"] == pytest.approx(4.0, abs=0.01)
     assert plan.metrics["release_beats"] == pytest.approx(2.0, abs=0.01)
-    assert plan.switch_position == pytest.approx(0.5)
+    assert plan.switch_position == pytest.approx(4.0 / 6.0)
 
 
 def test_advanced_renderer_has_audible_overlap_without_level_hole() -> None:

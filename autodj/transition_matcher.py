@@ -16,12 +16,14 @@ from .muq_analyzer import cosine_similarity
 
 @dataclass(frozen=True)
 class MatcherConfig:
-    # These bars are analysis context only. The audible overlap remains centered
-    # on the selected CUE-DETR switch point, but uses a balanced one-bar window
-    # (two beats before and two beats after in 4/4) so the handoff is audible
-    # without returning to an 8/16/32-bar long blend.
+    # These bars are analysis context only. The audible transition remains
+    # centered on the selected CUE-DETR switch point. Four beats before the cue
+    # are reserved for a beat-quantized incoming drum-loop bridge, while the
+    # outgoing deck is released over two beats after the cue. Only percussion is
+    # exposed during the early bridge; harmonic and bass ownership still change
+    # close to the neural cue, so this does not become a long two-song blend.
     allowed_bars: tuple[int, ...] = (4, 8, 16)
-    pre_roll_beats: float = 2.0
+    pre_roll_beats: float = 4.0
     release_beats: float = 2.0
     max_exit_candidates: int = 32
     max_entry_candidates: int = 24
@@ -754,13 +756,13 @@ def _cue_centered_window(
     pre_roll_beats: float,
     release_beats: float,
 ) -> tuple[int, int, int, int, int]:
-    """Return a common balanced window centered on the two neural cue points.
+    """Return a common drum-bridge window around the two neural cue points.
 
     The selected CUE-DETR points remain the exact ownership-change instant.
-    Normally two beats are exposed before the cue and two beats afterwards,
-    giving the listener a real crossfade while keeping the overlap to one 4/4
-    bar. Near a track boundary or playback deadline either side is shortened
-    without moving the neural cue or inventing another switch point.
+    Normally four beats are exposed before the cue for a quantized percussion
+    loop and two beats afterwards for the outgoing release. Near a track
+    boundary or playback deadline either side is shortened without moving the
+    neural cue or inventing another switch point.
     """
     sr = int(current.sample_rate)
     beat_samples = max(1, int(round(60.0 / max(current.playback_bpm, 1.0) * sr)))
@@ -848,7 +850,7 @@ def find_best_transition(
         )
         preferred = indices[mask]
         # Preserve CUE-DETR-only behavior for unusually short tracks: if no cue
-        # can hold the full two-beat window, keep the neural cues and let the
+        # can hold the full drum-bridge window, keep the neural cues and let the
         # window helper shorten symmetrically instead of inventing a new point.
         return preferred if preferred.size else indices
 
@@ -936,6 +938,8 @@ def find_best_transition(
         handoff_offset * max(current.playback_bpm, 1.0) / (60.0 * current.sample_rate)
     )
     metrics["release_beats"] = max(0.0, transition_beats - metrics["pre_roll_beats"])
+    metrics["drum_bridge_beats"] = metrics["pre_roll_beats"]
+    metrics["drum_loop_beats"] = min(2.0, max(1.0, metrics["pre_roll_beats"]))
     metrics["cue_handoff_phase"] = handoff_phase
     metrics["cue_handoff_sample_a"] = float(current_cue)
     metrics["cue_handoff_sample_b"] = float(adjusted_next_cue)

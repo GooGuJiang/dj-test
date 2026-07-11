@@ -91,7 +91,7 @@ def test_auto_transition_returns_professional_curves() -> None:
 
     assert plan.bars == 1
     assert plan.metrics["matching_context_bars"] in (4.0, 8.0, 16.0)
-    assert plan.metrics["transition_beats"] == pytest.approx(4.0, abs=0.01)
+    assert plan.metrics["transition_beats"] == pytest.approx(6.0, abs=0.01)
     assert plan.current_start < plan.current_cue_sample < plan.current_end
     assert plan.next_start < plan.next_cue_sample < plan.next_end
     assert plan.switch_sample_a == plan.current_cue_sample
@@ -120,7 +120,7 @@ def test_requested_bars_only_controls_matching_context() -> None:
     plan = find_best_transition(a, b, requested_bars=8)
     assert plan.bars == 1
     assert plan.metrics["matching_context_bars"] == 8.0
-    assert plan.metrics["transition_beats"] == pytest.approx(4.0, abs=0.01)
+    assert plan.metrics["transition_beats"] == pytest.approx(6.0, abs=0.01)
 
 
 def test_bpm_at_sample_returns_to_original() -> None:

@@ -69,7 +69,8 @@ class _RenderedPair:
 class EngineConfig:
     sample_rate: int = 44_100
     channels: int = 2
-    # 仅作为 cue 配对的上下文长度；实际可听重叠固定为 cue 前后各约 2 拍。
+    # 仅作为 cue 配对的上下文长度；实际过渡固定为 cue 前约 4 拍量化鼓循环，
+    # cue 后约 2 拍释放。早段不叠加下一首的完整旋律或低频。
     crossfade_bars: int = 0
     max_stretch_percent: float = 12.0
     cue_on_first_downbeat: bool = True
@@ -1242,9 +1243,9 @@ class AutoDJEngine:
                 outgoing, incoming, target_bpm, _PlannedPair(synced, plan)
             )
             self.emit(
-                f"滑动窗口轻量规划就绪：{outgoing.title} 尾部 "
+                f"滑动窗口轻量规划就绪：{outgoing.title} OUT cue 窗口 "
                 f"{plan.current_start / self.config.sample_rate:.1f}s → "
-                f"{incoming.title} 头部 {plan.next_start / self.config.sample_rate:.1f}s；"
+                f"{incoming.title} IN cue 窗口 {plan.next_start / self.config.sample_rate:.1f}s；"
                 "最终渲染将在其成为下一轨时执行"
             )
         except Exception as exc:
@@ -1863,7 +1864,15 @@ class AutoDJEngine:
             sample_rate=self.config.sample_rate,
             bpm=current.playback_bpm,
             beats_per_bar=max(2, current.analysis.beats_per_bar),
-            bars=max(1, plan.bars),
+            bars=max(
+                1,
+                int(
+                    math.ceil(
+                        float(plan.metrics.get("transition_beats", 4.0))
+                        / max(1, current.analysis.beats_per_bar)
+                    )
+                ),
+            ),
             a_beat_positions=a_beat_positions,
             b_beat_positions=b_beat_positions,
             a_downbeat_positions=a_downbeat_positions,
