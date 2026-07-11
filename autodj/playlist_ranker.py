@@ -177,6 +177,149 @@ def transition_compatibility(
     )
 
 
+def _path_objective(
+    path: Sequence[int],
+    scores: dict[tuple[int, int], PairScore],
+    energies: Sequence[float],
+) -> tuple[float, float]:
+    """Return the exact beam objective and weakest edge for a complete path."""
+    if len(path) <= 1:
+        return 0.0, 1.0
+    value = 0.0
+    weakest = 1.0
+    for index in range(1, len(path)):
+        prev = int(path[index - 1])
+        current = int(path[index])
+        pair = scores[prev, current]
+        weakest = min(weakest, pair.total)
+        value += math.log(max(pair.total, 1e-4))
+        value += 0.28 * math.log(max(weakest, 1e-4))
+        if index >= 2:
+            before = int(path[index - 2])
+            previous_delta = energies[prev] - energies[before]
+            next_delta = energies[current] - energies[prev]
+            if previous_delta * next_delta < 0.0:
+                value -= 0.18 * min(
+                    1.0, abs(previous_delta - next_delta) / 0.45
+                )
+            acceleration = abs(next_delta - previous_delta)
+            value -= 0.08 * min(1.0, acceleration / 0.55)
+    return float(value), float(weakest)
+
+
+def _future_potential(
+    node: int,
+    used_mask: int,
+    count: int,
+    scores: dict[tuple[int, int], PairScore],
+) -> float:
+    """Optimistic one-step continuation used only to rank beam states."""
+    remaining = [
+        scores[node, nxt].total
+        for nxt in range(count)
+        if not used_mask & (1 << nxt) and nxt != node
+    ]
+    if not remaining:
+        return 0.0
+    remaining.sort(reverse=True)
+    best = math.log(max(remaining[0], 1e-4))
+    second = math.log(max(remaining[1], 1e-4)) if len(remaining) > 1 else best
+    # The best edge avoids dead ends; the second-best term avoids nodes with one
+    # lucky exit but generally poor connectivity.
+    return 0.18 * best + 0.06 * second
+
+
+def _prune_dominated_states(
+    states: Sequence[tuple[float, tuple[int, ...], int, float]],
+) -> list[tuple[float, tuple[int, ...], int, float]]:
+    """Deduplicate equivalent search states while preserving bottleneck Pareto points."""
+    kept: dict[
+        tuple[int, int, int],
+        list[tuple[float, tuple[int, ...], int, float]],
+    ] = {}
+    for state in states:
+        value, path, used_mask, weakest = state
+        last = path[-1]
+        previous = path[-2] if len(path) >= 2 else -1
+        key = (used_mask, previous, last)
+        frontier = kept.setdefault(key, [])
+        if any(old[0] >= value and old[3] >= weakest for old in frontier):
+            continue
+        frontier[:] = [
+            old for old in frontier
+            if not (value >= old[0] and weakest >= old[3])
+        ]
+        frontier.append(state)
+        # In practice two nondominated variants are enough: one maximizing the
+        # accumulated score, one protecting the weakest edge.
+        frontier.sort(
+            key=lambda item: (
+                item[0] + 0.12 * math.log(max(item[3], 1e-4)),
+                item[3],
+                item[1],
+            ),
+            reverse=True,
+        )
+        del frontier[2:]
+    return [state for frontier in kept.values() for state in frontier]
+
+
+def _improve_path(
+    path: Sequence[int],
+    scores: dict[tuple[int, int], PairScore],
+    energies: Sequence[float],
+    max_passes: int = 2,
+) -> list[int]:
+    """Deterministic swap/relocate polish that keeps the requested first track."""
+    best = list(path)
+    best_value, best_weakest = _path_objective(best, scores, energies)
+    count = len(best)
+    # Full local search is intentionally bounded; larger playlists already gain
+    # most of the benefit from lookahead and transposition pruning.
+    if count > 36:
+        return best
+
+    for _ in range(max(0, int(max_passes))):
+        improved = False
+        candidate_best = best
+        candidate_value = best_value
+        candidate_weakest = best_weakest
+
+        for left in range(1, count - 1):
+            for right in range(left + 1, count):
+                candidate = best.copy()
+                candidate[left], candidate[right] = candidate[right], candidate[left]
+                value, weakest = _path_objective(candidate, scores, energies)
+                if (value, weakest, tuple(candidate)) > (
+                    candidate_value, candidate_weakest, tuple(candidate_best)
+                ):
+                    candidate_best = candidate
+                    candidate_value = value
+                    candidate_weakest = weakest
+
+        for source in range(1, count):
+            item = best[source]
+            reduced = best[:source] + best[source + 1 :]
+            for target in range(1, count):
+                candidate = reduced[:target] + [item] + reduced[target:]
+                value, weakest = _path_objective(candidate, scores, energies)
+                if (value, weakest, tuple(candidate)) > (
+                    candidate_value, candidate_weakest, tuple(candidate_best)
+                ):
+                    candidate_best = candidate
+                    candidate_value = value
+                    candidate_weakest = weakest
+
+        if (candidate_value, candidate_weakest) > (best_value, best_weakest):
+            best = candidate_best
+            best_value = candidate_value
+            best_weakest = candidate_weakest
+            improved = True
+        if not improved:
+            break
+    return best
+
+
 def rank_playlist(
     tracks: Sequence[TrackAnalysis],
     profiles: Sequence[MuQProfile],
@@ -184,7 +327,7 @@ def rank_playlist(
     beam_width: int = 192,
     structures: Sequence[AllInOneProfile] | None = None,
 ) -> tuple[list[int], dict[tuple[int, int], PairScore]]:
-    """Beam-search ordering with weak-edge and energy-zigzag penalties."""
+    """Directional graph search with lookahead, state pruning and local polish."""
     count = len(tracks)
     if count != len(profiles):
         raise ValueError("tracks 和 profiles 数量不一致。")
@@ -206,26 +349,33 @@ def rank_playlist(
                 )
 
     energies = [_profile_energy(profile) for profile in profiles]
-    # State: objective, path, used, weakest edge so far.
-    states: list[tuple[float, tuple[int, ...], frozenset[int], float]] = [
-        (0.0, (start_index,), frozenset({start_index}), 1.0)
+    neighbors = {
+        source: sorted(
+            (target for target in range(count) if target != source),
+            key=lambda target: (scores[source, target].total, -target),
+            reverse=True,
+        )
+        for source in range(count)
+    }
+
+    # State: exact objective, path, bit-mask, weakest edge so far.
+    states: list[tuple[float, tuple[int, ...], int, float]] = [
+        (0.0, (start_index,), 1 << start_index, 1.0)
     ]
     width = max(12, int(beam_width))
     for _ in range(count - 1):
-        candidates: list[tuple[float, tuple[int, ...], frozenset[int], float]] = []
-        for value, path, used, weakest in states:
+        candidates: list[tuple[float, tuple[int, ...], int, float]] = []
+        for value, path, used_mask, weakest in states:
             last = path[-1]
-            for nxt in range(count):
-                if nxt in used:
+            for nxt in neighbors[last]:
+                bit = 1 << nxt
+                if used_mask & bit:
                     continue
                 pair = scores[last, nxt]
                 new_weakest = min(weakest, pair.total)
-                # Log objective makes one weak edge visible. The extra bottleneck
-                # term directly optimizes the worst transition in the sequence.
                 new_value = value + math.log(max(pair.total, 1e-4))
                 new_value += 0.28 * math.log(max(new_weakest, 1e-4))
 
-                # Avoid machine-like energy zigzags (hard up, hard down, hard up).
                 if len(path) >= 2:
                     prev = path[-2]
                     previous_delta = energies[last] - energies[prev]
@@ -238,13 +388,25 @@ def rank_playlist(
                     new_value -= 0.08 * min(1.0, acceleration / 0.55)
 
                 candidates.append(
-                    (new_value, path + (nxt,), used | {nxt}, new_weakest)
+                    (new_value, path + (nxt,), used_mask | bit, new_weakest)
                 )
-        candidates.sort(key=lambda item: (item[0], item[3], item[1]), reverse=True)
-        states = candidates[:width]
-    best = max(states, key=lambda item: (item[0], item[3]))
-    return list(best[1]), scores
 
+        candidates = _prune_dominated_states(candidates)
+        candidates.sort(
+            key=lambda item: (
+                item[0]
+                + _future_potential(item[1][-1], item[2], count, scores),
+                item[3],
+                item[0],
+                item[1],
+            ),
+            reverse=True,
+        )
+        states = candidates[:width]
+
+    best_state = max(states, key=lambda item: (item[0], item[3], item[1]))
+    polished = _improve_path(best_state[1], scores, energies)
+    return polished, scores
 
 def style_clusters(profiles: Sequence[MuQProfile]) -> list[int]:
     """Small deterministic k-means for UI style groups, not genre labels."""

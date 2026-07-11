@@ -755,32 +755,63 @@ def _cue_centered_window(
     earliest_start: int,
     pre_roll_beats: float,
     release_beats: float,
+    force_tail_fade: bool = False,
 ) -> tuple[int, int, int, int, int]:
-    """Return a common drum-bridge window around the two neural cue points.
+    """Return a safe transition window around the selected neural cues.
 
-    The selected CUE-DETR points remain the exact ownership-change instant.
-    Normally four beats are exposed before the cue for a quantized percussion
-    loop and two beats afterwards for the outgoing release. Near a track
-    boundary or playback deadline either side is shortened without moving the
-    neural cue or inventing another switch point.
+    The normal path keeps both CUE-DETR points as the ownership-change instant
+    and exposes pre-roll plus a short release.  If the outgoing cue is at the
+    physical end of the file, or playback has already passed the last neural
+    cue, there is no post-cue audio to release.  In that boundary case the
+    window becomes a deterministic tail crossfade: the final part of A fades
+    into B starting at its selected entry cue and reaches full B exactly at A's
+    end.  This avoids a stopped player without inventing another mid-song cut.
     """
     sr = int(current.sample_rate)
     beat_samples = max(1, int(round(60.0 / max(current.playback_bpm, 1.0) * sr)))
     desired_pre = max(0, int(round(float(pre_roll_beats) * beat_samples)))
     desired_post = max(1, int(round(float(release_beats) * beat_samples)))
 
+    current_post = max(0, current.total_samples - int(current_cue))
+    next_post = max(0, next_track.total_samples - int(next_cue))
     available_pre = min(
         max(0, int(current_cue) - int(max(0, earliest_start))),
         max(0, int(next_cue)),
         desired_pre,
     )
-    available_post = min(
-        max(0, current.total_samples - int(current_cue)),
-        max(0, next_track.total_samples - int(next_cue)),
-        desired_post,
-    )
-    if available_post < 1:
-        raise RuntimeError("CUE-DETR cue 点之后没有足够音频完成平滑交接。")
+    available_post = min(current_post, next_post, desired_post)
+
+    # A release shorter than a quarter beat behaves like a hard edge in the
+    # complex renderer.  Treat it as an endpoint case and use the actual tail.
+    tail_threshold = max(64, int(round(0.25 * beat_samples)))
+    needs_tail_fade = bool(force_tail_fade or available_post < tail_threshold)
+    if needs_tail_fade:
+        # Prefer a compact two-beat fade.  It is long enough to sound musical,
+        # but short enough to remain reliable when the loader finishes late.
+        desired_tail = max(64, min(desired_pre, 2 * beat_samples))
+        floor = int(np.clip(earliest_start, 0, max(0, current.total_samples - 1)))
+        current_available = max(1, current.total_samples - floor)
+
+        # Normally B enters from its neural cue.  A malformed endpoint IN cue
+        # has no playable continuation, so endpoint safety falls back to the
+        # first real downbeat (or sample zero) instead of stopping playback.
+        next_start = int(np.clip(next_cue, 0, max(0, next_track.total_samples - 1)))
+        if next_track.total_samples - next_start < min(desired_tail, beat_samples):
+            downbeats = np.asarray(next_track.downbeat_samples, dtype=np.int64)
+            valid = downbeats[(downbeats >= 0) & (downbeats < next_track.total_samples)]
+            next_start = int(valid[0]) if valid.size else 0
+
+        next_available = max(1, next_track.total_samples - next_start)
+        length = max(1, min(desired_tail, current_available, next_available))
+        current_start = max(0, current.total_samples - length)
+        # If preparation finished after the ideal start, shorten from the left
+        # rather than installing a plan whose start lies in already-played audio.
+        if current_start < floor:
+            current_start = floor
+            length = max(1, min(current.total_samples - current_start, next_available))
+        handoff_offset = int(length)
+        next_resume = int(min(next_track.total_samples, next_start + length))
+        return current_start, next_start, length, handoff_offset, next_resume
 
     current_start = int(current_cue) - int(available_pre)
     next_start = int(next_cue) - int(available_pre)
@@ -812,19 +843,29 @@ def find_best_transition(
     else:
         allowed_bars = config.allowed_bars
 
+    neural_exit = np.asarray(current.structure.cue_indices, dtype=np.int64)
+    neural_exit = neural_exit[(neural_exit >= 0) & (neural_exit < a.count)]
+    force_tail_fade = False
     if force_current_start is None:
         exit_indices = _candidate_indices(
             current,
             earliest_sample=earliest_start,
         )
+        # Heavy analysis can finish after the final neural OUT cue.  Keep the
+        # last CUE-DETR result as semantic context, but move rendering to the
+        # remaining physical tail instead of letting the current song end.
+        if exit_indices.size == 0 and neural_exit.size:
+            exit_indices = np.asarray([int(neural_exit[-1])], dtype=np.int64)
+            force_tail_fade = True
     else:
-        neural = np.asarray(current.structure.cue_indices, dtype=np.int64)
-        neural = neural[(neural >= 0) & (neural < a.count)]
-        future = neural[a.start_samples[neural] >= force_current_start]
+        future = neural_exit[a.start_samples[neural_exit] >= force_current_start]
         if future.size:
             exit_indices = np.asarray([int(future[0])], dtype=np.int64)
+        elif neural_exit.size:
+            exit_indices = np.asarray([int(neural_exit[-1])], dtype=np.int64)
+            force_tail_fade = True
         else:
-            raise RuntimeError("CUE-DETR 在请求位置之后没有可用 cue 点。")
+            raise RuntimeError("CUE-DETR 没有可用于尾端安全淡化的 cue 点。")
 
     entry_indices = _candidate_indices(
         next_track,
@@ -927,6 +968,7 @@ def find_best_transition(
         earliest_start=earliest_start,
         pre_roll_beats=config.pre_roll_beats,
         release_beats=config.release_beats,
+        force_tail_fade=force_tail_fade,
     )
     handoff_phase = float(handoff_offset / max(length, 1))
     transition_beats = float(
@@ -943,6 +985,9 @@ def find_best_transition(
     metrics["cue_handoff_phase"] = handoff_phase
     metrics["cue_handoff_sample_a"] = float(current_cue)
     metrics["cue_handoff_sample_b"] = float(adjusted_next_cue)
+    metrics["tail_fade_fallback"] = float(handoff_offset >= length)
+    metrics["late_cue_fallback"] = float(force_tail_fade)
+    metrics["next_entry_reanchored"] = float(next_start != adjusted_next_cue - handoff_offset)
 
     fade_out, fade_in, bass_out, bass_in, high_out, high_in = _make_curves(
         length,

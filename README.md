@@ -1,6 +1,6 @@
-# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.16
+# Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.17
 
-这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.16 在 1.2.15 的自然短接基础上加入 **量化鼓循环桥**：CUE-DETR 仍然决定真正换曲点，但在切点前先重复下一首 CUE 附近的鼓组，让听众提前进入下一首节奏；旋律、人声和低频仍然只在 CUE 附近交接，因此不会变成多拍双歌堆叠。
+这是一个面向本地音乐文件的自动 DJ 实验程序。1.2.17 在 1.2.16 的量化鼓循环桥基础上增加 **尾端安全淡化** 与 **图搜索排序优化**：当最后一个 CUE 已经错过或落在文件末端时，不再停止播放，而是把当前歌曲实际剩余尾部等功率淡出到下一首；播放列表排序则加入前瞻、状态去重和局部路径改良。
 
 ## 模型分工
 
@@ -10,9 +10,27 @@
 - **MuQ**：播放顺序、风格连续性和 cue 对兼容度。
 - **本地 DSP**：BPM 同步、逐拍相位锁定、三段分频、鼓循环、低频所有权和最终转场渲染。
 
-## 1.2.16 的核心变化
+## 1.2.17 的核心变化
 
-### 1. CUE-DETR 仍是主交接点
+### 1. 末端 CUE 不再导致断歌
+
+- 当前播放位置已经越过最后一个 CUE-DETR OUT 时，保留该 CUE 作为语义上下文，但把实际渲染窗口移动到歌曲物理尾部。
+- CUE 后不足 1/4 拍时，不再进入需要 post-cue release 的鼓循环/HPSS 复杂渲染器。
+- 改用最长约 2 拍的 equal-power `Tail Crossfade`：A 在真实文件末尾降到 0，B 在同一点回到 unity。
+- 如果下一首的 IN cue 本身错误地落在末端，则只在端点安全路径中回退到第一个有效 downbeat/样本 0，保证播放器继续。
+- 即使 GUI 选择 `Always DJ`，端点安全仍优先，避免为坚持复杂效果而断歌。
+
+### 2. 播放列表图搜索继续优化
+
+- 邻接边按方向兼容度预排序，搜索状态改用 bit-mask，降低集合复制开销。
+- 加入一层未来连通性前瞻，避免当前边很高但下一步无路可走的“死端”节点。
+- 对相同 `已用集合 + 前一首 + 当前首` 做 Pareto 状态去重，同时保留累计分更高与最弱边更强的方案。
+- Beam 完成后执行确定性 swap/relocate 局部改良，修复内部单条弱边；首曲固定不变。
+- 评分仍保持方向性 MuQ、BPM、能量、结构与最弱边惩罚，不引入随机结果。
+
+### 3. 1.2.16 鼓循环桥继续保留
+
+#### 3.1 CUE-DETR 仍是主交接点
 
 所有有效 CUE-DETR cue 都可以参加配对，不存在以下旧版硬约束：
 
@@ -23,7 +41,7 @@ B IN ：前 35% / 前 32 小节
 
 歌曲位置只写入诊断指标，权重为 0。候选根据 downbeat、乐句、CUE-DETR 置信度、鼓组相位、低频/人声碰撞、能量、调性、结构角色和 MuQ 兼容度排序。
 
-### 2. 默认使用“4 拍鼓循环桥 + 2 拍释放”
+#### 3.2 默认使用“4 拍鼓循环桥 + 2 拍释放”
 
 ```text
 CUE 前第 4～2 拍
@@ -52,7 +70,7 @@ CUE 后第 2 拍
 
 新增的 2 拍不是把两首完整歌曲叠得更久，而是只让下一首的 percussion loop 提前出现。主旋律/和声实际交叉仍约 2–2.5 拍，bass 交换约 0.7–0.9 拍。
 
-### 3. 鼓循环实现
+#### 3.3 鼓循环实现
 
 - 循环素材来自下一首 **CUE 当拍之后的 2 拍 percussion stem**。
 - 预入区有 4 拍，因此该 2 拍 loop 重复两次。
@@ -61,7 +79,7 @@ CUE 后第 2 拍
 - 不循环 bass，也不循环 harmonic/vocal，避免双低频和双人声。
 - 如果 cue 太靠近边界或没有足够音频，只缩短可用窗口，不创造新 cue。
 
-### 4. 自动手法保持精简
+#### 3.4 自动手法保持精简
 
 保留：
 
@@ -87,7 +105,7 @@ CUE 后第 2 拍
 bass_A + bass_B = 1
 ```
 
-### 5. MIX END 连续性
+#### 3.5 MIX END 连续性
 
 保留 1.2.14/1.2.15 修复：
 
@@ -104,7 +122,7 @@ bass_A + bass_B = 1
 
 ```powershell
 conda activate beatthis-auto-dj
-cd beatthis_muq_cuedetr_auto_dj_gui_v1216
+cd dj-test-main
 python verify_cuedetr.py
 python app.py
 ```
@@ -161,7 +179,7 @@ python check_mixend_continuity.py
 当前结果：
 
 ```text
-87 passed
+90 passed
 PASS: beat-quantized drum-loop bridge is continuous
 PASS: quantized drum-loop transition invariants satisfied
 PASS: MIX END continuity invariants satisfied

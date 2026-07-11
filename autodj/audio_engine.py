@@ -1636,11 +1636,12 @@ class AutoDJEngine:
         )
         length = max(1, int(length))
         bars = base_plan.bars
-        policy = (
-            "CUE-DETR short smooth handoff"
-            if mode == "Gapless Trim"
-            else "CUE-DETR short beat crossfade"
-        )
+        if mode == "Gapless Trim":
+            policy = "CUE-DETR short smooth handoff"
+        elif mode == "Tail Crossfade":
+            policy = "Endpoint-safe tail fade"
+        else:
+            policy = "CUE-DETR short beat crossfade"
 
         gain = float(base_plan.metrics.get("local_gain", 1.0))
         fade_out, fade_in, bass_out, bass_in, high_out, high_in = self._cue_centered_curves(
@@ -1698,6 +1699,13 @@ class AutoDJEngine:
         plan: TransitionPlan,
     ) -> TransitionPlan:
         policy = self.config.automix_policy.strip().lower()
+        # A cue at/behind the physical endpoint has no post-cue material for the
+        # drum-loop/HPSS renderer.  Always use the deterministic equal-power
+        # tail fade here, even when the UI requests "Always DJ".
+        if plan.metrics.get("tail_fade_fallback", 0.0) >= 0.5:
+            return self._simple_transition_plan(
+                current, next_track, earliest_start, plan, "Tail Crossfade"
+            )
         if policy == "always dj":
             plan.policy_mode = "Forced complex DJ"
             return plan
