@@ -695,6 +695,73 @@ def _rank_by_cue_scores(
     return np.asarray(sorted(ranked), dtype=np.int64)
 
 
+def _entry_standalone_quality(track: PreparedTrack, index: int) -> float:
+    """Estimate whether an IN cue can safely carry the mix on its own.
+
+    Manual DJ cue guidelines favour entry points with meaningful post-cue
+    material that is not too quiet.  This score uses only existing local
+    descriptors and never invents a new cue.
+    """
+    features = track.bar_features
+    if index < 0 or index >= features.count:
+        return 0.0
+    stop = min(features.count, index + 2)
+    local_rms = float(np.mean(np.maximum(features.rms[index:stop], 0.0)))
+    reference = float(np.median(np.maximum(features.rms, 0.0))) + 1e-8
+    energy = float(np.clip(1.0 - math.exp(-local_rms / reference), 0.0, 1.0))
+    onset = float(np.clip(np.mean(features.onset[index:stop]), 0.0, 1.0))
+    vocal = float(np.clip(np.mean(features.vocal_proxy[index:stop]), 0.0, 1.0))
+
+    start = int(features.start_samples[index])
+    beat_samples = max(
+        1,
+        int(round(60.0 / max(track.playback_bpm, 1.0) * track.sample_rate)),
+    )
+    room = float(
+        np.clip(
+            (track.total_samples - start) / max(8.0 * beat_samples, 1.0),
+            0.0,
+            1.0,
+        )
+    )
+    cue = (
+        float(track.structure.mix_in_score[index])
+        if track.structure.mix_in_score.size > index
+        else 0.5
+    )
+    # A little vocal content is acceptable, but a dense vocal opening is less
+    # forgiving during an emergency tail handoff.
+    vocal_room = 1.0 - 0.35 * vocal
+    quality = (
+        0.34 * np.clip(cue, 0.0, 1.0)
+        + 0.27 * energy
+        + 0.22 * room
+        + 0.11 * onset
+        + 0.06 * vocal_room
+    )
+    return float(np.clip(quality, 0.0, 1.0))
+
+
+def _rank_tail_entry_candidates(
+    indices: np.ndarray,
+    track: PreparedTrack,
+    maximum: int,
+) -> np.ndarray:
+    if indices.size == 0:
+        return indices
+    ranked = sorted(
+        (int(index) for index in indices),
+        key=lambda index: (
+            _entry_standalone_quality(track, index),
+            float(track.structure.mix_in_score[index])
+            if track.structure.mix_in_score.size > index else 0.0,
+            -index,
+        ),
+        reverse=True,
+    )[:maximum]
+    return np.asarray(sorted(ranked), dtype=np.int64)
+
+
 def _make_curves(
     length: int,
     local_gain: float,
@@ -896,7 +963,22 @@ def find_best_transition(
         return preferred if preferred.size else indices
 
     exit_indices = feasible(exit_indices, current, earliest_start)
-    entry_indices = feasible(entry_indices, next_track, 0)
+    if force_tail_fade:
+        # The endpoint-safe path starts B at its IN cue and does not require
+        # pre-cue drum-loop material.  Keeping the normal pre-roll feasibility
+        # gate here would incorrectly discard strong cue-ins at sample zero.
+        entry_starts = next_track.bar_features.start_samples[entry_indices]
+        tail_post = max(64, beat_samples)
+        preferred_tail_entries = entry_indices[
+            entry_starts + tail_post < next_track.total_samples
+        ]
+        entry_indices = (
+            preferred_tail_entries
+            if preferred_tail_entries.size
+            else entry_indices
+        )
+    else:
+        entry_indices = feasible(entry_indices, next_track, 0)
     exit_scores = np.asarray(current.structure.mix_out_score, dtype=np.float32)
     entry_scores = np.asarray(next_track.structure.mix_in_score, dtype=np.float32)
     if force_current_start is None:
@@ -905,11 +987,16 @@ def find_best_transition(
             exit_scores,
             config.max_exit_candidates,
         )
-    entry_indices = _rank_by_cue_scores(
-        entry_indices,
-        entry_scores,
-        config.max_entry_candidates,
-    )
+    if force_tail_fade:
+        entry_indices = _rank_tail_entry_candidates(
+            entry_indices, next_track, config.max_entry_candidates
+        )
+    else:
+        entry_indices = _rank_by_cue_scores(
+            entry_indices,
+            entry_scores,
+            config.max_entry_candidates,
+        )
     if exit_indices.size == 0 or entry_indices.size == 0:
         raise RuntimeError("CUE-DETR 没有提供足够的 IN/OUT cue 点。")
 
@@ -931,6 +1018,12 @@ def find_best_transition(
                     int(next_index),
                     bars,
                 )
+                if force_tail_fade:
+                    entry_quality = _entry_standalone_quality(
+                        next_track, int(next_index)
+                    )
+                    score = 0.86 * score + 0.14 * entry_quality
+                    metrics["tail_entry_quality"] = entry_quality
                 if best is None or score > best[0]:
                     best = (score, int(current_index), int(next_index), bars, metrics)
 
@@ -946,6 +1039,10 @@ def find_best_transition(
             next_index,
             bars,
         )
+        if force_tail_fade:
+            entry_quality = _entry_standalone_quality(next_track, next_index)
+            score = 0.86 * score + 0.14 * entry_quality
+            metrics["tail_entry_quality"] = entry_quality
         best = (score, current_index, next_index, bars, metrics)
 
     score, current_index, next_index, context_bars, metrics = best

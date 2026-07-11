@@ -31,3 +31,13 @@ CUE-DETR remains the sole source of transition cue locations. Beat This! only qu
 - MuQ: https://huggingface.co/OpenMuQ/MuQ-large-msd-iter
 - All-In-One: https://github.com/mir-aidj/all-in-one
 - Rubber Band: https://breakfastquay.com/rubberband/
+
+## 1.2.18 research-guided sequencing and transition updates
+
+- CUE-DETR paper — cue points align closely with expert annotations and underlying musical structure: https://arxiv.org/abs/2407.06823
+- M-DJCUE expert annotation guidelines — cue-ins should be able to stand alone and should not be too quiet; cue-outs may define a fade duration: https://github.com/MZehren/M-DJCUE
+- Automatic DJ Transitions with Differentiable Audio Effects — real-world DJ transition modelling with explicit EQ and fader controls: https://arxiv.org/abs/2110.06525
+- The algorithmic nature of song-sequencing — curated sequences often alternate increases and decreases in energy/valence: https://arxiv.org/abs/2408.04383
+- The Importance of Song Context and Song Order in Automated Music Playlist Generation — playlist continuation benefits from song context: https://arxiv.org/abs/1807.04690
+- Diverse Beam Search — preserving diverse beam hypotheses can improve exploration/exploitation and top-1 solutions: https://arxiv.org/abs/1610.02424
+- Bellman–Held–Karp subset dynamic programming is the classical exact approach for small Hamiltonian/TSP-like sequencing problems: https://en.wikipedia.org/wiki/Held%E2%80%93Karp_algorithm

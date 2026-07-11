@@ -264,6 +264,71 @@ def _unique_grid(
     )
 
 
+def _normalized_audio_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    """Return a stable zero-lag correlation estimate for two stereo regions."""
+    left = np.asarray(a, dtype=np.float64)
+    right = np.asarray(b, dtype=np.float64)
+    length = min(len(left), len(right))
+    if length < 64:
+        return 0.0
+    left = left[:length]
+    right = right[:length]
+    if left.ndim == 2:
+        left = np.mean(left, axis=1)
+    if right.ndim == 2:
+        right = np.mean(right, axis=1)
+    left = left - float(np.mean(left))
+    right = right - float(np.mean(right))
+    denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+    if denominator <= 1e-10:
+        return 0.0
+    return float(np.clip(np.dot(left, right) / denominator, -1.0, 1.0))
+
+
+def _correlation_compensated_pair(
+    fade_out: np.ndarray,
+    fade_in: np.ndarray,
+    correlation: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Remove positive-correlation power build-up without moving endpoints.
+
+    For gain curves ``a`` and ``b``, the expected power contains the cross term
+    ``2*rho*a*b``.  Scaling both curves by the square root of the intended power
+    divided by correlated power preserves the original fade law while avoiding
+    the familiar centre bump on aligned kicks or repeated material.  Negative
+    correlation is not boosted because cancellation estimates are fragile.
+    """
+    outgoing = np.asarray(fade_out, dtype=np.float64)
+    incoming = np.asarray(fade_in, dtype=np.float64)
+    rho = float(np.clip(correlation, 0.0, 0.97))
+    if rho <= 1e-4 or outgoing.shape != incoming.shape:
+        return (
+            np.ascontiguousarray(outgoing, dtype=np.float32),
+            np.ascontiguousarray(incoming, dtype=np.float32),
+            0.0,
+        )
+
+    intended = np.square(outgoing) + np.square(incoming)
+    correlated = intended + 2.0 * rho * outgoing * incoming
+    scale = np.sqrt(
+        np.divide(
+            intended,
+            np.maximum(correlated, 1e-12),
+            out=np.ones_like(intended),
+            where=intended > 1e-12,
+        )
+    )
+    # Full positive correlation requires at most 3 dB attenuation at equal gain.
+    scale = np.clip(scale, 0.70, 1.0)
+    minimum = float(np.min(scale)) if scale.size else 1.0
+    reduction_db = float(-20.0 * math.log10(max(minimum, 1e-9)))
+    return (
+        np.ascontiguousarray(outgoing * scale, dtype=np.float32),
+        np.ascontiguousarray(incoming * scale, dtype=np.float32),
+        reduction_db,
+    )
+
+
 class AutoDJEngine:
     """Beat This! 重拍驱动、连续 BPM 回归与专业过渡的实时 DJ 引擎。"""
 
@@ -1611,6 +1676,64 @@ class AutoDJEngine:
             for value in (fade_out, fade_in, bass_out, bass_in, fade_out, fade_in)
         )
 
+    @staticmethod
+    def _correlation_adapted_curves(
+        current: PreparedTrack,
+        next_track: PreparedTrack,
+        current_start: int,
+        next_start: int,
+        length: int,
+        curves: tuple[np.ndarray, ...],
+    ) -> tuple[tuple[np.ndarray, ...], dict[str, float]]:
+        """Adapt fallback gains to measured overlap correlation per EQ band."""
+        fade_out, fade_in, bass_out, bass_in, high_out, high_in = curves
+        size = min(
+            int(length),
+            current.total_samples - int(current_start),
+            next_track.total_samples - int(next_start),
+        )
+        if size < 64:
+            return curves, {
+                "fade_correlation_low": 0.0,
+                "fade_correlation_mid": 0.0,
+                "fade_correlation_high": 0.0,
+                "correlation_compensation_db": 0.0,
+            }
+
+        a0 = int(current_start)
+        b0 = int(next_start)
+        a1 = a0 + size
+        b1 = b0 + size
+        correlations = {
+            "low": _normalized_audio_correlation(
+                current.low_audio[a0:a1], next_track.low_audio[b0:b1]
+            ),
+            "mid": _normalized_audio_correlation(
+                current.mid_audio[a0:a1], next_track.mid_audio[b0:b1]
+            ),
+            "high": _normalized_audio_correlation(
+                current.high_audio[a0:a1], next_track.high_audio[b0:b1]
+            ),
+        }
+        bass_out, bass_in, low_db = _correlation_compensated_pair(
+            bass_out, bass_in, correlations["low"]
+        )
+        fade_out, fade_in, mid_db = _correlation_compensated_pair(
+            fade_out, fade_in, correlations["mid"]
+        )
+        high_out, high_in, high_db = _correlation_compensated_pair(
+            high_out, high_in, correlations["high"]
+        )
+        adapted = (
+            fade_out, fade_in, bass_out, bass_in, high_out, high_in
+        )
+        return adapted, {
+            "fade_correlation_low": float(correlations["low"]),
+            "fade_correlation_mid": float(correlations["mid"]),
+            "fade_correlation_high": float(correlations["high"]),
+            "correlation_compensation_db": float(max(low_db, mid_db, high_db)),
+        }
+
     def _simple_transition_plan(
         self,
         current: PreparedTrack,
@@ -1644,13 +1767,18 @@ class AutoDJEngine:
             policy = "CUE-DETR short beat crossfade"
 
         gain = float(base_plan.metrics.get("local_gain", 1.0))
-        fade_out, fade_in, bass_out, bass_in, high_out, high_in = self._cue_centered_curves(
+        curves = self._cue_centered_curves(
             length,
             gain,
             base_plan.switch_position,
             transition_beats=float(base_plan.metrics.get("transition_beats", 4.0)),
         )
+        curves, correlation_metrics = self._correlation_adapted_curves(
+            current, next_track, current_start, next_start, length, curves
+        )
+        fade_out, fade_in, bass_out, bass_in, high_out, high_in = curves
         metrics = dict(base_plan.metrics)
+        metrics.update(correlation_metrics)
         metrics["policy_complexity"] = 0.15 if mode == "Gapless Trim" else 0.42
         return TransitionPlan(
             current_start=int(current_start),

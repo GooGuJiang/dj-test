@@ -1,4 +1,4 @@
-"""Offline smoke test for the v1.2.17 cue-centered drum-loop bridge."""
+"""Offline smoke test for the v1.2.18 cue-centered drum-loop bridge."""
 
 from __future__ import annotations
 

@@ -1,3 +1,34 @@
+# Engineering notes — 1.2.18
+
+## Network research translated into implementation
+
+The 1.2.18 pass used public papers, official repositories and expert-annotation guidelines rather than changing weights by trial and error. CUE-DETR remains the only source of cue locations. M-DJCUE's annotation rules motivate a separate endpoint entry-quality term: an IN cue should have enough meaningful material after it to carry the mix and should not be excessively quiet. The differentiable-DSP DJ transition literature motivates keeping the transition controls explicit as EQ-band gains plus fader curves.
+
+Playlist ordering is treated as a directed Hamiltonian-path problem whose edge values already encode style, tempo, structure and transition quality. Small queues now use exact subset dynamic programming. Larger queues keep beam search but add two-step continuation estimates and a small endpoint-diversity reserve, following the general result that near-duplicate beams waste search budget.
+
+## Correlation-aware fallback fade
+
+Equal-power curves assume the two sources are effectively uncorrelated. Aligned kicks, repeated loops or similar source material can have positive correlation, adding a cross term to expected overlap power:
+
+```text
+P = a² + b² + 2ρab
+```
+
+For each low/mid/high band, 1.2.18 estimates zero-lag normalized correlation over the planned overlap. Positive correlation scales both curves by `sqrt((a²+b²)/P)`. This leaves both endpoints unchanged and reduces the centre by at most approximately 3 dB. Negative correlation is measured for diagnostics but never boosted because cancellation estimates are not stable enough to justify added gain.
+
+## Energy context correction
+
+The old path objective subtracted a penalty whenever consecutive energy deltas changed sign. That meant a rise followed by a release was treated as worse than an uninterrupted rise, contrary to the sequencing regularities reported in curated albums. The new second-order term mildly rewards controlled direction reversal, penalizes two large moves in the same direction, and retains an acceleration penalty to prevent exaggerated saw-tooth ordering.
+
+## Verification
+
+- 94 pytest cases pass.
+- Exact DP remains below 0.13 seconds for a synthetic 10-track queue in the test environment.
+- A 20-track beam-search queue completes in about 0.40 seconds in the same smoke benchmark.
+- Natural transition, MIX END and drum-loop continuity checks pass.
+
+---
+
 # Engineering notes — 1.2.16
 
 ## Research conclusion

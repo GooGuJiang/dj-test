@@ -43,6 +43,70 @@ def format_time(seconds: float | None) -> str:
     return f"{value // 60:02d}:{value % 60:02d}"
 
 
+def _rank_tracks_snapshot(
+    tracks: list[TrackAnalysis],
+    profile_map: dict[str, MuQProfile],
+    structure_map: dict[str, AllInOneProfile],
+    *,
+    selected_index: int = 0,
+    playing: bool = False,
+    current_path: str = "",
+    next_path: str = "",
+    transitioning: bool = False,
+) -> tuple[list[TrackAnalysis], dict[str, PairScore], float, float]:
+    """Rank a stable queue snapshot while preserving the active playback prefix.
+
+    Missing MuQ profiles are intentionally replaced with empty profiles so the
+    same graph search can fall back to BPM and structure instead of leaving the
+    imported queue in file-selection order.
+    """
+    if len(tracks) < 2:
+        return list(tracks), {}, 1.0, 1.0
+
+    fixed_prefix: list[TrackAnalysis] = []
+    segment = list(tracks)
+    segment_start = max(0, min(int(selected_index), len(segment) - 1))
+    if playing and current_path:
+        path_to_index = {track.path: i for i, track in enumerate(tracks)}
+        anchor_index = path_to_index.get(current_path, 0)
+        # Once a transition has started, B is already audible and must remain
+        # fixed too.  Reorder only from that track onward.
+        if transitioning and next_path in path_to_index:
+            anchor_index = path_to_index[next_path]
+        fixed_prefix = tracks[:anchor_index]
+        segment = tracks[anchor_index:]
+        segment_start = 0
+
+    profiles = [profile_map.get(track.path, MuQProfile()) for track in segment]
+    structures = [
+        structure_map.get(track.path, AllInOneProfile()) for track in segment
+    ]
+    order, _scores = rank_playlist(
+        segment,
+        profiles,
+        start_index=segment_start,
+        structures=structures,
+    )
+    ordered_tracks = fixed_prefix + [segment[index] for index in order]
+
+    pair_map: dict[str, PairScore] = {}
+    edge_scores: list[float] = []
+    for outgoing, incoming in zip(ordered_tracks, ordered_tracks[1:]):
+        pair = transition_compatibility(
+            outgoing,
+            incoming,
+            profile_map.get(outgoing.path, MuQProfile()),
+            profile_map.get(incoming.path, MuQProfile()),
+            structure_map.get(outgoing.path),
+            structure_map.get(incoming.path),
+        )
+        pair_map[outgoing.path] = pair
+        edge_scores.append(pair.total)
+    average = sum(edge_scores) / max(len(edge_scores), 1)
+    worst = min(edge_scores, default=1.0)
+    return ordered_tracks, pair_map, average, worst
+
+
 class VerticalScrolledFrame(ttk.Frame):
     """带独立垂直滚动条的 ttk 容器。
 
@@ -126,7 +190,7 @@ class VerticalScrolledFrame(ttk.Frame):
 class AutoDJApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.17")
+        self.title("Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.19")
         self.settings_store = SettingsStore()
         self.saved_settings = self.settings_store.load()
         self._settings_after_id: str | None = None
@@ -171,6 +235,7 @@ class AutoDJApp(tk.Tk):
         self.cuedetr_analysis_active = False
         self.cuedetr_probe_result: dict[str, object] = {}
         self._preload_after_id: str | None = None
+        self._pending_auto_sort = False
 
         self._build_style()
         self._build_ui()
@@ -183,7 +248,7 @@ class AutoDJApp(tk.Tk):
         self.after(150, self._detect_rubberband)
         self.after(240, self._detect_allin1)
         self.after(320, self._detect_cuedetr)
-        LOGGER.info("Auto DJ 1.2.17 GUI 启动，主环境 Python=%s", os.sys.executable)
+        LOGGER.info("Auto DJ 1.2.19 GUI 启动，主环境 Python=%s", os.sys.executable)
         self.after(100, self._poll)
 
     _SETTING_VARIABLES = {
@@ -375,7 +440,7 @@ class AutoDJApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill=tk.X)
         header.grid_columnconfigure(1, weight=1)
-        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.17", style="Title.TLabel").grid(
+        ttk.Label(header, text="Beat This! + CUE-DETR + MuQ + All-In-One Auto DJ 1.2.19", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.header_subtitle = ttk.Label(
@@ -1001,7 +1066,7 @@ class AutoDJApp(tk.Tk):
         self.auto_muq_sort_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             settings_frame,
-            text="MuQ 分析完成后自动重排未播放队列",
+            text="全部分析完成后自动重排未播放队列",
             variable=self.auto_muq_sort_var,
         ).pack(anchor=tk.W, pady=(3, 0))
         self.preload_pair_var = tk.BooleanVar(value=True)
@@ -1445,12 +1510,20 @@ class AutoDJApp(tk.Tk):
             self._continue_after_cuedetr()
 
     def _continue_after_cuedetr(self) -> None:
-        if self.auto_muq_sort_var.get() and self.muq_enabled_var.get():
-            self._log("歌曲结构分析完成，正在进行 MuQ 风格分析与排序…")
-            self._rank_with_muq(automatic=True)
-        else:
-            self._log("Beat This!、All-In-One 与 CUE-DETR 分析完成。")
-            self._schedule_preload()
+        should_sort = bool(self._pending_auto_sort or self.auto_muq_sort_var.get())
+        if should_sort and len(self.tracks) >= 2:
+            if self.muq_enabled_var.get():
+                self._log("歌曲分析完成，正在进行 MuQ 风格分析与队列重排…")
+                self._rank_with_muq(automatic=True)
+            else:
+                self._log("MuQ 未启用，使用 BPM 与结构特征自动重排队列…")
+                self._rank_without_muq(reason="MuQ 未启用")
+            return
+
+        self._pending_auto_sort = False
+        self._log("Beat This!、All-In-One 与 CUE-DETR 分析完成。")
+        self._finish_analysis_progress("全部分析完成")
+        self._schedule_preload()
 
     def _set_effect_strength(self, value: str) -> None:
         number = float(value)
@@ -1579,6 +1652,7 @@ class AutoDJApp(tk.Tk):
             messagebox.showinfo("正在分析", "请等待当前模型分析完成。")
             return
         self.analysis_active = True
+        self._pending_auto_sort = bool(self.auto_muq_sort_var.get())
         total = len(paths)
         self.ui_events.put(("analysis_progress", ("Beat This!", -1, total, "准备模型")))
         LOGGER.info("Beat This! 批量分析开始，共 %d 首", total)
@@ -1713,16 +1787,85 @@ class AutoDJApp(tk.Tk):
             if track.path == selected_path:
                 self.tree.selection_set(str(index))
 
-    def _rank_with_muq(self, automatic: bool = False) -> None:
+    def _rank_without_muq(self, reason: str) -> None:
+        """Run the graph ranker with cached MuQ data or BPM/structure fallback."""
         if self.muq_ranking_active:
+            self._pending_auto_sort = True
             return
         if self.analysis_active or self.allin1_analysis_active or self.cuedetr_analysis_active:
-            if not automatic:
+            self._pending_auto_sort = True
+            self._log("自动排序已排队，将在当前分析阶段结束后执行。")
+            return
+        if len(self.tracks) < 2:
+            self._pending_auto_sort = False
+            self._finish_analysis_progress("全部分析完成")
+            self._schedule_preload()
+            return
+
+        self.muq_ranking_active = True
+        tracks_snapshot = list(self.tracks)
+        snapshot_paths = tuple(track.path for track in tracks_snapshot)
+        profile_snapshot = dict(self.muq_profiles)
+        structure_snapshot = dict(self.allin1_profiles)
+        group_snapshot = dict(self.muq_groups)
+        status = self.engine.get_status()
+        selected_index = self._selected_index()
+        self.ui_events.put(
+            ("analysis_progress", ("队列排序", 0, 1, f"{reason} · BPM/结构降级排序"))
+        )
+
+        def worker() -> None:
+            try:
+                ordered_tracks, pair_map, average, worst = _rank_tracks_snapshot(
+                    tracks_snapshot,
+                    profile_snapshot,
+                    structure_snapshot,
+                    selected_index=selected_index,
+                    playing=bool(status.get("playing")),
+                    current_path=str(status.get("current_path") or ""),
+                    next_path=str(status.get("next_path") or ""),
+                    transitioning=bool(status.get("transitioning")),
+                )
+                self.ui_events.put(
+                    (
+                        "muq_ranked",
+                        (
+                            snapshot_paths,
+                            ordered_tracks,
+                            profile_snapshot,
+                            group_snapshot,
+                            pair_map,
+                            average,
+                            worst,
+                            "BPM/结构降级",
+                        ),
+                    )
+                )
+            except Exception as exc:
+                self.ui_events.put(("muq_error", (str(exc), True, "BPM/结构降级")))
+
+        threading.Thread(
+            target=worker, daemon=True, name="Fallback-Queue-Ranking"
+        ).start()
+
+    def _rank_with_muq(self, automatic: bool = False) -> None:
+        if self.muq_ranking_active:
+            if automatic:
+                self._pending_auto_sort = True
+            return
+        if self.analysis_active or self.allin1_analysis_active or self.cuedetr_analysis_active:
+            if automatic:
+                self._pending_auto_sort = True
+                self._log("自动排序已排队，将在当前分析阶段结束后执行。")
+            else:
                 messagebox.showinfo("正在分析", "请等待 Beat This! / All-In-One / CUE-DETR 分析完成。")
             return
         if len(self.tracks) < 2:
+            self._pending_auto_sort = False
             if not automatic:
                 messagebox.showinfo("歌曲不足", "至少添加两首歌曲后才能进行 MuQ 排序。")
+            else:
+                self._finish_analysis_progress("全部分析完成")
             self._schedule_preload()
             return
 
@@ -1731,10 +1874,6 @@ class AutoDJApp(tk.Tk):
         snapshot_paths = tuple(track.path for track in tracks_snapshot)
         structure_snapshot = dict(self.allin1_profiles)
         status = self.engine.get_status()
-        playing = bool(status.get("playing"))
-        current_path = str(status.get("current_path") or "")
-        next_path = str(status.get("next_path") or "")
-        transitioning = bool(status.get("transitioning"))
         selected_index = self._selected_index()
         self._log("MuQ 正在分析风格并优化播放顺序…")
         self.ui_events.put(
@@ -1769,50 +1908,16 @@ class AutoDJApp(tk.Tk):
                     track.path: int(group)
                     for track, group in zip(tracks_snapshot, group_values)
                 }
-
-                fixed_prefix: list[TrackAnalysis] = []
-                segment = list(tracks_snapshot)
-                segment_start = selected_index
-                if playing and current_path:
-                    path_to_index = {track.path: i for i, track in enumerate(tracks_snapshot)}
-                    current_index = path_to_index.get(current_path, 0)
-                    anchor_index = current_index
-                    # 过渡已经开始时，当前 B 不能再替换；从 B 之后排序。
-                    if transitioning and next_path in path_to_index:
-                        anchor_index = path_to_index[next_path]
-                    fixed_prefix = tracks_snapshot[:anchor_index]
-                    segment = tracks_snapshot[anchor_index:]
-                    segment_start = 0
-
-                segment_profiles = [profile_map[track.path] for track in segment]
-                segment_structures = [
-                    structure_snapshot.get(track.path, AllInOneProfile())
-                    for track in segment
-                ]
-                order, _scores = rank_playlist(
-                    segment,
-                    segment_profiles,
-                    start_index=segment_start,
-                    structures=segment_structures,
+                ordered_tracks, pair_map, average, worst = _rank_tracks_snapshot(
+                    tracks_snapshot,
+                    profile_map,
+                    structure_snapshot,
+                    selected_index=selected_index,
+                    playing=bool(status.get("playing")),
+                    current_path=str(status.get("current_path") or ""),
+                    next_path=str(status.get("next_path") or ""),
+                    transitioning=bool(status.get("transitioning")),
                 )
-                ordered_segment = [segment[index] for index in order]
-                ordered_tracks = fixed_prefix + ordered_segment
-
-                pair_map: dict[str, PairScore] = {}
-                edge_scores: list[float] = []
-                for outgoing, incoming in zip(ordered_tracks, ordered_tracks[1:]):
-                    pair = transition_compatibility(
-                        outgoing,
-                        incoming,
-                        profile_map[outgoing.path],
-                        profile_map[incoming.path],
-                        structure_snapshot.get(outgoing.path),
-                        structure_snapshot.get(incoming.path),
-                    )
-                    pair_map[outgoing.path] = pair
-                    edge_scores.append(pair.total)
-                average = sum(edge_scores) / max(len(edge_scores), 1)
-                worst = min(edge_scores, default=1.0)
                 self.ui_events.put(
                     (
                         "muq_ranked",
@@ -1824,11 +1929,12 @@ class AutoDJApp(tk.Tk):
                             pair_map,
                             average,
                             worst,
+                            "MuQ",
                         ),
                     )
                 )
             except Exception as exc:
-                self.ui_events.put(("muq_error", str(exc)))
+                self.ui_events.put(("muq_error", (str(exc), automatic, "MuQ")))
 
         threading.Thread(target=worker, daemon=True, name="MuQ-Ranking").start()
 
@@ -2083,12 +2189,17 @@ class AutoDJApp(tk.Tk):
                     pair_map,
                     average,
                     worst,
+                    rank_mode,
                 ) = payload  # type: ignore[misc]
                 self.muq_ranking_active = False
                 current_paths = tuple(track.path for track in self.tracks)
                 if set(snapshot_paths) != set(current_paths):
-                    self._log("队列在 MuQ 分析期间发生变化，正在重新排序…")
-                    self._rank_with_muq(automatic=True)
+                    self._pending_auto_sort = True
+                    self._log("队列在排序期间发生变化，正在基于最新列表重新排序…")
+                    if self.muq_enabled_var.get():
+                        self._rank_with_muq(automatic=True)
+                    else:
+                        self._rank_without_muq(reason="队列发生变化")
                     continue
                 selected_path = None
                 selection = self.tree.selection()
@@ -2096,10 +2207,12 @@ class AutoDJApp(tk.Tk):
                     old_index = int(selection[0])
                     if 0 <= old_index < len(self.tracks):
                         selected_path = self.tracks[old_index].path
+                before_paths = tuple(track.path for track in self.tracks)
                 self.muq_profiles = dict(profile_map)
                 self.muq_groups = dict(group_map)
                 self.muq_pair_scores = dict(pair_map)
                 self.tracks = list(ordered_tracks)
+                self._pending_auto_sort = False
                 self.engine.set_preloaded_muq_profiles(self.muq_profiles)
                 self.engine.set_preloaded_allin1_profiles(self.allin1_profiles)
                 self.engine.set_preloaded_cuedetr_profiles(self.cuedetr_profiles)
@@ -2113,20 +2226,33 @@ class AutoDJApp(tk.Tk):
                     for index, track in enumerate(self.tracks):
                         if track.path == selected_path:
                             self.tree.selection_set(str(index))
+                            self.tree.see(str(index))
                             break
                 elif self.tracks:
                     self.tree.selection_set("0")
+                changed = before_paths != tuple(track.path for track in self.tracks)
+                change_text = "队列顺序已更新" if changed else "当前顺序已是最优，无需移动"
                 self._log(
-                    "MuQ 平滑排序完成："
+                    f"{rank_mode} 排序完成：{change_text} · "
                     f"平均 {average * 100:.0f}分 · 最弱相邻边 {worst * 100:.0f}分"
                 )
-                self._finish_analysis_progress("分析、排序与队列更新完成")
+                self._finish_analysis_progress(f"排序完成 · {change_text}")
                 self._schedule_preload(delay_ms=150)
             elif kind == "muq_error":
+                message, automatic, rank_mode = payload  # type: ignore[misc]
                 self.muq_ranking_active = False
-                self.analysis_progress_text.configure(text=f"分析进度 · MuQ 失败 · {payload}")
-                self._log(f"MuQ 排序失败：{payload}")
-                messagebox.showerror("MuQ 排序失败", str(payload))
+                self._log(f"{rank_mode} 排序失败：{message}")
+                if automatic and rank_mode == "MuQ":
+                    self._log("MuQ 不可用，自动切换到 BPM 与结构降级排序。")
+                    self._rank_without_muq(reason=f"MuQ 失败：{message}")
+                    continue
+                self._pending_auto_sort = False
+                self.analysis_progress_text.configure(
+                    text=f"分析进度 · {rank_mode} 排序失败 · {message}"
+                )
+                if not automatic:
+                    messagebox.showerror(f"{rank_mode} 排序失败", str(message))
+                self._finish_analysis_progress("分析完成，但队列排序失败")
                 self._schedule_preload()
             elif kind == "play_started":
                 self.starting_playback = False

@@ -177,6 +177,32 @@ def transition_compatibility(
     )
 
 
+def _energy_arc_term(previous_delta: float, next_delta: float) -> float:
+    """Second-order energy context for a three-track window.
+
+    Curated sequencing studies report frequent alternation between rising and
+    falling energy.  The old implementation accidentally penalized exactly that
+    pattern.  This term mildly rewards a controlled reversal, penalizes two
+    consecutive large moves in the same direction, and still limits abrupt
+    acceleration so the result does not become a saw-tooth sequence.
+    """
+    previous = float(previous_delta)
+    following = float(next_delta)
+    acceleration = abs(following - previous)
+    value = -0.055 * min(1.0, acceleration / 0.60)
+
+    quiet = 0.035
+    if abs(previous) < quiet or abs(following) < quiet:
+        return float(value)
+    if previous * following < 0.0:
+        controlled = min(abs(previous), abs(following))
+        value += 0.075 * min(1.0, controlled / 0.28)
+    else:
+        sustained = min(abs(previous), abs(following))
+        value -= 0.065 * min(1.0, sustained / 0.28)
+    return float(value)
+
+
 def _path_objective(
     path: Sequence[int],
     scores: dict[tuple[int, int], PairScore],
@@ -198,12 +224,7 @@ def _path_objective(
             before = int(path[index - 2])
             previous_delta = energies[prev] - energies[before]
             next_delta = energies[current] - energies[prev]
-            if previous_delta * next_delta < 0.0:
-                value -= 0.18 * min(
-                    1.0, abs(previous_delta - next_delta) / 0.45
-                )
-            acceleration = abs(next_delta - previous_delta)
-            value -= 0.08 * min(1.0, acceleration / 0.55)
+            value += _energy_arc_term(previous_delta, next_delta)
     return float(value), float(weakest)
 
 
@@ -213,24 +234,43 @@ def _future_potential(
     count: int,
     scores: dict[tuple[int, int], PairScore],
 ) -> float:
-    """Optimistic one-step continuation used only to rank beam states."""
+    """Two-step continuation estimate for ranking incomplete beam states.
+
+    The estimate is deliberately optimistic and never enters the final path
+    objective.  Looking one edge farther prevents the beam from over-valuing a
+    node with one attractive incoming edge but no usable continuation.
+    """
     remaining = [
-        scores[node, nxt].total
-        for nxt in range(count)
+        nxt for nxt in range(count)
         if not used_mask & (1 << nxt) and nxt != node
     ]
     if not remaining:
         return 0.0
-    remaining.sort(reverse=True)
-    best = math.log(max(remaining[0], 1e-4))
-    second = math.log(max(remaining[1], 1e-4)) if len(remaining) > 1 else best
-    # The best edge avoids dead ends; the second-best term avoids nodes with one
-    # lucky exit but generally poor connectivity.
-    return 0.18 * best + 0.06 * second
+
+    route_values: list[float] = []
+    direct_values: list[float] = []
+    for nxt in remaining:
+        direct = math.log(max(scores[node, nxt].total, 1e-4))
+        direct_values.append(direct)
+        onward = [
+            math.log(max(scores[nxt, after].total, 1e-4))
+            for after in remaining
+            if after != nxt
+        ]
+        best_onward = max(onward) if onward else direct
+        route_values.append(direct + 0.52 * best_onward)
+
+    route_values.sort(reverse=True)
+    direct_values.sort(reverse=True)
+    best_route = route_values[0]
+    second_route = route_values[1] if len(route_values) > 1 else best_route
+    best_direct = direct_values[0]
+    return 0.105 * best_route + 0.035 * second_route + 0.025 * best_direct
 
 
 def _prune_dominated_states(
     states: Sequence[tuple[float, tuple[int, ...], int, float]],
+    max_frontier: int | None = 2,
 ) -> list[tuple[float, tuple[int, ...], int, float]]:
     """Deduplicate equivalent search states while preserving bottleneck Pareto points."""
     kept: dict[
@@ -250,8 +290,6 @@ def _prune_dominated_states(
             if not (value >= old[0] and weakest >= old[3])
         ]
         frontier.append(state)
-        # In practice two nondominated variants are enough: one maximizing the
-        # accumulated score, one protecting the weakest edge.
         frontier.sort(
             key=lambda item: (
                 item[0] + 0.12 * math.log(max(item[3], 1e-4)),
@@ -260,8 +298,108 @@ def _prune_dominated_states(
             ),
             reverse=True,
         )
-        del frontier[2:]
+        if max_frontier is not None:
+            del frontier[max(1, int(max_frontier)) :]
     return [state for frontier in kept.values() for state in frontier]
+
+
+def _state_rank(
+    state: tuple[float, tuple[int, ...], int, float],
+    count: int,
+    scores: dict[tuple[int, int], PairScore],
+) -> tuple[float, float, float, tuple[int, ...]]:
+    value, path, used_mask, weakest = state
+    return (
+        value + _future_potential(path[-1], used_mask, count, scores),
+        weakest,
+        value,
+        path,
+    )
+
+
+def _select_diverse_beam(
+    candidates: Sequence[tuple[float, tuple[int, ...], int, float]],
+    width: int,
+    count: int,
+    scores: dict[tuple[int, int], PairScore],
+) -> list[tuple[float, tuple[int, ...], int, float]]:
+    """Keep a small endpoint-diverse reserve before filling by global rank.
+
+    Standard beam search often spends most of its budget on near-duplicate
+    prefixes.  Reserving only a fraction of slots for distinct final nodes keeps
+    alternative graph regions alive without changing the deterministic result.
+    """
+    ordered = sorted(
+        candidates,
+        key=lambda item: _state_rank(item, count, scores),
+        reverse=True,
+    )
+    target = max(1, int(width))
+    reserve = min(len(ordered), count, max(1, target // 5))
+    selected: list[tuple[float, tuple[int, ...], int, float]] = []
+    selected_paths: set[tuple[int, ...]] = set()
+    seen_last: set[int] = set()
+
+    for state in ordered:
+        last = state[1][-1]
+        if last in seen_last:
+            continue
+        selected.append(state)
+        selected_paths.add(state[1])
+        seen_last.add(last)
+        if len(selected) >= reserve:
+            break
+
+    for state in ordered:
+        if len(selected) >= target:
+            break
+        if state[1] in selected_paths:
+            continue
+        selected.append(state)
+        selected_paths.add(state[1])
+    return selected
+
+
+def _exact_rank_small(
+    count: int,
+    start_index: int,
+    scores: dict[tuple[int, int], PairScore],
+    energies: Sequence[float],
+) -> list[int]:
+    """Exact subset-DP search for small playlists.
+
+    States are keyed by used set and the final two tracks because the objective
+    contains a three-track energy-context term.  All Pareto-nondominated
+    accumulated-score/weakest-edge variants are retained, making this exact for
+    the implemented objective while the playlist remains small.
+    """
+    states: list[tuple[float, tuple[int, ...], int, float]] = [
+        (0.0, (start_index,), 1 << start_index, 1.0)
+    ]
+    for _ in range(count - 1):
+        candidates: list[tuple[float, tuple[int, ...], int, float]] = []
+        for value, path, used_mask, weakest in states:
+            last = path[-1]
+            for nxt in range(count):
+                bit = 1 << nxt
+                if used_mask & bit:
+                    continue
+                pair = scores[last, nxt]
+                new_weakest = min(weakest, pair.total)
+                new_value = value + math.log(max(pair.total, 1e-4))
+                new_value += 0.28 * math.log(max(new_weakest, 1e-4))
+                if len(path) >= 2:
+                    prev = path[-2]
+                    new_value += _energy_arc_term(
+                        energies[last] - energies[prev],
+                        energies[nxt] - energies[last],
+                    )
+                candidates.append(
+                    (new_value, path + (nxt,), used_mask | bit, new_weakest)
+                )
+        states = _prune_dominated_states(candidates, max_frontier=None)
+    best = max(states, key=lambda item: (item[0], item[3], item[1]))
+    return list(best[1])
 
 
 def _improve_path(
@@ -358,6 +496,11 @@ def rank_playlist(
         for source in range(count)
     }
 
+    # Subset dynamic programming is exact and inexpensive for small queues.
+    # Larger queues retain bounded beam search and local path polish.
+    if count <= 10:
+        return _exact_rank_small(count, start_index, scores, energies), scores
+
     # State: exact objective, path, bit-mask, weakest edge so far.
     states: list[tuple[float, tuple[int, ...], int, float]] = [
         (0.0, (start_index,), 1 << start_index, 1.0)
@@ -378,31 +521,17 @@ def rank_playlist(
 
                 if len(path) >= 2:
                     prev = path[-2]
-                    previous_delta = energies[last] - energies[prev]
-                    next_delta = energies[nxt] - energies[last]
-                    if previous_delta * next_delta < 0.0:
-                        new_value -= 0.18 * min(
-                            1.0, abs(previous_delta - next_delta) / 0.45
-                        )
-                    acceleration = abs(next_delta - previous_delta)
-                    new_value -= 0.08 * min(1.0, acceleration / 0.55)
+                    new_value += _energy_arc_term(
+                        energies[last] - energies[prev],
+                        energies[nxt] - energies[last],
+                    )
 
                 candidates.append(
                     (new_value, path + (nxt,), used_mask | bit, new_weakest)
                 )
 
         candidates = _prune_dominated_states(candidates)
-        candidates.sort(
-            key=lambda item: (
-                item[0]
-                + _future_potential(item[1][-1], item[2], count, scores),
-                item[3],
-                item[0],
-                item[1],
-            ),
-            reverse=True,
-        )
-        states = candidates[:width]
+        states = _select_diverse_beam(candidates, width, count, scores)
 
     best_state = max(states, key=lambda item: (item[0], item[3], item[1]))
     polished = _improve_path(best_state[1], scores, energies)
