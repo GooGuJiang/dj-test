@@ -681,15 +681,15 @@ def _render_archetype(
     vocal_risk: float,
     drop_landing_phase: float = 1.0,
     handoff_phase: float = 0.5,
-    transition_beats: float = 2.0,
+    transition_beats: float = 4.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """Render a cue-centered DJ handoff without a hard cut.
+    """Render a cue-centered DJ handoff with a perceptible short crossfade.
 
-    The CUE-DETR marker is the ownership-change point, not the beginning of a
-    long blend.  Deck B is teased for roughly one beat before the cue, takes
-    rhythmic/low-frequency ownership at the cue, and deck A is released within
-    roughly one beat afterwards.  Curves remain smooth so the switch is clear
-    but never sounds like an accidental stop.
+    The CUE-DETR marker remains the ownership-change point, not the beginning
+    of a long blend. Deck B is introduced across the two-beat pre-roll, becomes
+    dominant on the cue, and Deck A keeps a smooth one-beat musical release.
+    The full window is normally four beats, which is long enough to hear the
+    transition but still far shorter than a conventional multi-bar blend.
     """
     del drop_landing_phase, bars
     if archetype not in SUPPORTED_ARCHETYPES:
@@ -702,42 +702,50 @@ def _render_archetype(
     handoff = float(np.clip(handoff_phase, 0.20, 0.80))
     beat_width = 1.0 / max(float(transition_beats), 1.0)
 
-    # Bass changes ownership almost exactly on the cue. Bass Swap is the
-    # tightest version; Short Blend leaves a slightly softer quarter-beat move.
-    bass_half = (0.10 if archetype == "Bass Swap" else 0.16) * beat_width
-    if archetype == "Echo Out":
-        bass_half = 0.12 * beat_width
-    bass_progress = _ramp(phase, handoff - bass_half, handoff + bass_half)
+    # Bass ownership still changes close to the cue, but no longer in a
+    # fraction-of-a-beat snap. The curve is biased slightly early so B owns the
+    # downbeat while the complete exchange remains smooth and complementary.
+    if archetype == "Bass Swap":
+        bass_before_beats, bass_after_beats = 0.40, 0.25
+    elif archetype == "Echo Out":
+        bass_before_beats, bass_after_beats = 0.50, 0.30
+    else:
+        bass_before_beats, bass_after_beats = 0.55, 0.35
+    bass_progress = _ramp(
+        phase,
+        handoff - bass_before_beats * beat_width,
+        handoff + bass_after_beats * beat_width,
+    )
     bass_a = np.clip(1.0 - bass_progress, 0.0, 1.0).astype(np.float32)
     bass_b = np.clip(bass_progress, 0.0, 1.0).astype(np.float32)
 
-    # A quiet one-beat drum teaser precedes the cue.  The actual drum cross is
-    # biased slightly early so B is already dominant at the cue, while A still
-    # has a short, smooth release tail afterwards.
-    teaser_end = max(0.0, handoff - 0.34 * beat_width)
-    teaser = 0.22 * np.sqrt(np.clip(_ramp(phase, 0.0, teaser_end), 0.0, 1.0))
+    # B first appears as a restrained rhythmic teaser, then the two drum beds
+    # cross over roughly two beats. B is clearly dominant on the cue, while A's
+    # kick/percussion tail remains audible for about three quarters of a beat.
+    teaser_end = max(0.0, handoff - 1.25 * beat_width)
+    teaser = 0.20 * np.sqrt(np.clip(_ramp(phase, 0.0, teaser_end), 0.0, 1.0))
     drum_progress = _ramp(
         phase,
-        handoff - 0.48 * beat_width,
-        handoff + 0.24 * beat_width,
+        handoff - 1.25 * beat_width,
+        handoff + 0.75 * beat_width,
     )
     drum_a, drum_b_cross = _equal_power(drum_progress)
     drum_b = np.maximum(teaser, drum_b_cross).astype(np.float32)
     drum_a = drum_a.astype(np.float32)
 
-    # Main musical content crosses around the cue and is fully released within
-    # less than one beat.  Vocal risk narrows the overlap rather than creating a
-    # silence gap or letting two lead vocals run together.
-    harm_half_before = (0.34 - 0.10 * vocal_risk) * beat_width
-    harm_half_after = (0.54 - 0.16 * vocal_risk) * beat_width
+    # Main musical content gets the broadest crossfade. It starts before the
+    # cue and releases A just over one beat afterwards. Vocal risk shortens this
+    # overlap, but never replaces it with silence or a hard cut.
+    harm_before_beats = 1.45 - 0.35 * vocal_risk
+    harm_after_beats = 1.15 - 0.35 * vocal_risk
     harm_progress = _ramp(
         phase,
-        handoff - harm_half_before,
-        handoff + harm_half_after,
+        handoff - harm_before_beats * beat_width,
+        handoff + harm_after_beats * beat_width,
     )
     harm_a, harm_b = _equal_power(harm_progress)
     if vocal_risk > 0.0:
-        center = np.exp(-0.5 * ((phase - handoff) / max(0.16 * beat_width, 1e-4)) ** 2)
+        center = np.exp(-0.5 * ((phase - handoff) / max(0.42 * beat_width, 1e-4)) ** 2)
         vocal_duck = 1.0 - (0.10 * vocal_risk) * center
         harm_a = (harm_a * vocal_duck).astype(np.float32)
         harm_b = (harm_b * vocal_duck).astype(np.float32)
@@ -762,10 +770,10 @@ def _render_archetype(
         # Send only the outgoing harmonic/vocal body, beginning just before the
         # cue. The short feedback tail bridges the handoff without extending
         # two full songs beyond the cue.
-        echo_start = max(0.0, handoff - 0.30 * beat_width)
-        echo_end = min(1.0, handoff + 0.18 * beat_width)
+        echo_start = max(0.0, handoff - 0.75 * beat_width)
+        echo_end = min(1.0, handoff + 0.25 * beat_width)
         echo_send = _ramp(phase, echo_start, echo_end) * (1.0 - _ramp(
-            phase, handoff + 0.55 * beat_width, handoff + 0.95 * beat_width
+            phase, handoff + 0.85 * beat_width, handoff + 1.45 * beat_width
         ))
         echo = _delay_echo(
             a_harm[:length],
@@ -777,7 +785,7 @@ def _render_archetype(
 
     # A small, local headroom dip only around the handoff avoids a level bump;
     # it does not create an audible hole before or after the cue.
-    handoff_sigma = max(0.24 * beat_width, 1e-4)
+    handoff_sigma = max(0.55 * beat_width, 1e-4)
     center_shape = np.exp(-0.5 * ((phase - handoff) / handoff_sigma) ** 2)
     center_space = 1.0 - (0.06 + 0.05 * strength) * center_shape
     mixed = (a_contribution + b_contribution) * center_space[:, None] + echo
@@ -949,7 +957,7 @@ def render_human_transition(
     current_label: str,
     next_label: str,
     handoff_phase: float = 0.5,
-    transition_beats: float = 2.0,
+    transition_beats: float = 4.0,
     config: HumanTransitionConfig | None = None,
 ) -> HumanTransitionResult:
     config = config or HumanTransitionConfig()

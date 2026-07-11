@@ -69,7 +69,7 @@ class _RenderedPair:
 class EngineConfig:
     sample_rate: int = 44_100
     channels: int = 2
-    # 仅作为 cue 配对的上下文长度；实际可听重叠固定为 cue 前后各约 1 拍。
+    # 仅作为 cue 配对的上下文长度；实际可听重叠固定为 cue 前后各约 2 拍。
     crossfade_bars: int = 0
     max_stretch_percent: float = 12.0
     cue_on_first_downbeat: bool = True
@@ -1569,19 +1569,32 @@ class AutoDJEngine:
         length: int,
         gain: float,
         switch_position: float,
+        transition_beats: float = 4.0,
     ) -> tuple[np.ndarray, ...]:
-        """Short smooth fallback centered on the CUE-DETR handoff."""
+        """Balanced fallback crossfade centered on the CUE-DETR handoff."""
         phase = np.linspace(0.0, 1.0, max(1, length), dtype=np.float32)
-        switch = float(np.clip(switch_position, 0.15, 0.85))
+        switch = float(np.clip(switch_position, 0.0, 1.0))
+        beat_width = 1.0 / max(float(transition_beats), 1.0)
 
         def ramp(start: float, end: float) -> np.ndarray:
+            start = float(np.clip(start, 0.0, 1.0))
+            end = float(np.clip(end, 0.0, 1.0))
             if end <= start + 1e-6:
                 return (phase >= end).astype(np.float32)
             x = np.clip((phase - start) / (end - start), 0.0, 1.0)
             return (x * x * (3.0 - 2.0 * x)).astype(np.float32)
 
-        main = ramp(switch - 0.18, switch + 0.22)
-        bass = ramp(switch - 0.06, switch + 0.06)
+        # Mirror the advanced renderer: a roughly 2.5-beat musical crossfade and
+        # a shorter, cue-biased low-frequency handover. Clipping at 0/1 keeps
+        # shortened boundary windows continuous and at unity by MIX END.
+        main = ramp(
+            switch - 1.40 * beat_width,
+            switch + 1.10 * beat_width,
+        )
+        bass = ramp(
+            switch - 0.55 * beat_width,
+            switch + 0.35 * beat_width,
+        )
         # 匹配阶段可能为下一首计算局部响度补偿。补偿只用于混音前段；
         # 到 MIX END 必须平滑回到 unity，否则提升下一首为 current 时会
         # 瞬时跳变，听起来像短暂掉音或“断一下”。
@@ -1613,7 +1626,7 @@ class AutoDJEngine:
         # mix to a newly invented location.
         current_start = int(base_plan.current_start)
         next_start = int(base_plan.next_start)
-        # Every fallback keeps the same two-beat cue-centered window.  It may
+        # Every fallback keeps the same balanced cue-centered window. It may
         # simplify DSP, but it may not move the neural cue or finish before it.
         length = min(
             base_plan.length,
@@ -1633,6 +1646,7 @@ class AutoDJEngine:
             length,
             gain,
             base_plan.switch_position,
+            transition_beats=float(base_plan.metrics.get("transition_beats", 4.0)),
         )
         metrics = dict(base_plan.metrics)
         metrics["policy_complexity"] = 0.15 if mode == "Gapless Trim" else 0.42
@@ -1903,7 +1917,7 @@ class AutoDJEngine:
             current_label=current_label,
             next_label=next_label,
             handoff_phase=plan.switch_position,
-            transition_beats=float(plan.metrics.get("transition_beats", 2.0)),
+            transition_beats=float(plan.metrics.get("transition_beats", 4.0)),
             config=HumanTransitionConfig(
                 mode=self.config.human_style_mode,
                 max_candidates=self.config.human_max_candidates,

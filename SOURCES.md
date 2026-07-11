@@ -8,6 +8,7 @@
 - Serato — Beatgrids in Serato DJ Pro: https://support.serato.com/hc/en-us/articles/202856014-Beatgrids-in-Serato-DJ-Pro
 - Serato — Mixing / Keylock keeps musical key while tempo changes: https://support.serato.com/hc/en-us/articles/360000067636-Mixing
 - Ableton Live 12 manual — adjacent audio clips can be crossfaded: https://www.ableton.com/en/manual/arrangement-view/
+- Ableton Live 12 manual — mixer crossfader creates smooth transitions between clips: https://www.ableton.com/en/manual/live-concepts/
 - Ableton Live 12 manual — mixer crossfader and smooth transitions: https://www.ableton.com/en/manual/mixing/
 - Ableton Live 12 manual — tempo-synchronised delay: https://www.ableton.com/en/manual/live-audio-effect-reference/
 - Mixxx manual — Beatmatching and Mixing: https://manual.mixxx.org/2.5/en/chapters/djing_with_mixxx.html#beatmatching-and-mixing

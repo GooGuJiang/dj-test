@@ -1,4 +1,4 @@
-# Engineering notes — 1.2.14
+# Engineering notes — 1.2.15
 
 ## Research conclusion
 
@@ -27,11 +27,11 @@ CUE-DETR remains the only cue generator. Unlike 1.2.11, no song-position window 
 
 ## Cue-centered renderer
 
-CUE-DETR cue points are treated as temporal transition boundaries. The audible transition is no longer a multi-bar phrase beginning at the cue. A two-beat window is built around the selected pair: one beat of pre-roll and one beat of release. The exact cue is stored separately from the window start and is used as the ownership switch.
+CUE-DETR cue points are treated as temporal ownership boundaries. The audible transition is not a multi-bar phrase beginning at the cue, but the earlier two-beat window proved too abrupt in listening. Version 1.2.15 uses a balanced four-beat window: two beats before the cue and two beats after it. The exact cue is still stored separately from the window start and remains the ownership switch.
 
-Before the cue, incoming percussion is limited to a quiet teaser. At the cue, incoming drums are already stronger than outgoing drums and the complementary low-band curves cross. Outgoing harmonic and percussive content then reaches zero within less than one beat. This creates a decisive switch without a discontinuity.
+Incoming percussion begins as a quiet teaser, then drums cross for about two beats. Harmonic/main content uses a wider 2–2.5 beat equal-power crossfade. At the cue, B is already dominant, but A remains audible for roughly 0.75 beat in drums and about 1.1 beats in harmonic content. This preserves a clear handoff while making the transition perceptible rather than instantaneous.
 
-The low-band curves remain complementary rather than equal-power, so `bass_A + bass_B = 1`. Full-band/harmonic curves remain continuous equal-power curves. Echo is restricted to the outgoing harmonic layer and decays inside the short release window.
+The low-band curves remain complementary, so `bass_A + bass_B = 1`, but their exchange is widened to roughly 0.65–0.9 beat. Echo stays restricted to the outgoing harmonic layer. All curves are continuous and the fallback renderer mirrors the same timing.
 
 If either cue is too close to a boundary, the pre/post window is shortened while preserving the neural cue. The matcher never invents a replacement location.
 
@@ -41,8 +41,8 @@ Transition history, variation bonuses and impact-mode preferences were removed. 
 
 ## Verification
 
-- 80 pytest cases pass.
-- The standalone natural-transition smoke test checks finite audio, peak ceiling, bass ownership, quiet pre-cue drums, cue-time ownership, sub-beat release and continuous curves.
+- 83 pytest cases pass.
+- The standalone natural-transition smoke test checks finite audio, peak ceiling, bass ownership, quiet pre-cue drums, audible overlap, cue-time ownership, post-cue tail and continuous curves.
 - Existing preload, seek, phase-lock, tempo recovery, time-stretch and CUE-DETR-only tests remain active.
 
 

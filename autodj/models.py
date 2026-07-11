@@ -397,7 +397,7 @@ class TransitionPlan:
     next_resume_sample: int = -1
     micro_offset_samples: int = 0
     # Exact CUE-DETR handoff metadata. ``current_start``/``next_start`` are the
-    # short pre-roll starts; these cue samples remain the actual ownership switch.
+    # balanced pre-roll starts; these cue samples remain the actual ownership switch.
     current_cue_sample: int = -1
     next_cue_sample: int = -1
     handoff_offset_samples: int = 0

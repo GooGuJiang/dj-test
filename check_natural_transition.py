@@ -1,4 +1,4 @@
-"""Offline smoke test for the cue-centered v1.2.14 transition renderer."""
+"""Offline smoke test for the cue-centered v1.2.15 balanced transition renderer."""
 
 from __future__ import annotations
 
@@ -44,14 +44,15 @@ def main() -> int:
             effect_strength=0.65,
             vocal_risk=0.2,
             handoff_phase=0.5,
-            transition_beats=2.0,
+            transition_beats=4.0,
         )
         peak = float(np.max(np.abs(mixed)))
         bass_error = float(np.max(np.abs(controls["bass_a"] + controls["bass_b"] - 1.0)))
         pre = int(0.20 * (len(mixed) - 1))
+        overlap = int(0.40 * (len(mixed) - 1))
         cue = int(0.50 * (len(mixed) - 1))
-        after = int(0.55 * (len(mixed) - 1))
-        released = int(0.70 * (len(mixed) - 1))
+        after = int(0.60 * (len(mixed) - 1))
+        released = int(0.78 * (len(mixed) - 1))
         max_step = max(
             float(np.max(np.abs(np.diff(controls[name]))))
             for name in ("bass_a", "bass_b", "drum_a", "drum_b", "harm_a", "harm_b")
@@ -60,8 +61,9 @@ def main() -> int:
             f"{archetype:11s} peak={peak:.4f} bass_error={bass_error:.2e} "
             f"pre_B={controls['drum_b'][pre]:.3f} "
             f"cue_drums={controls['drum_a'][cue]:.3f}->{controls['drum_b'][cue]:.3f} "
+            f"overlap={controls['harm_a'][overlap]:.3f}/{controls['harm_b'][overlap]:.3f} "
             f"post_bass={controls['bass_a'][after]:.3f}->{controls['bass_b'][after]:.3f} "
-            f"A@70%={controls['drum_a'][released]:.3f} max_step={max_step:.4f}"
+            f"A@78%={controls['drum_a'][released]:.3f} max_step={max_step:.4f}"
         )
         if not np.isfinite(mixed).all():
             failures.append(f"{archetype}: non-finite audio")
@@ -73,10 +75,14 @@ def main() -> int:
             failures.append(f"{archetype}: pre-cue drum teaser is not conservative")
         if controls["drum_b"][cue] <= controls["drum_a"][cue]:
             failures.append(f"{archetype}: incoming drums do not own the cue")
-        if controls["bass_b"][after] < 0.90 or controls["bass_a"][after] > 0.10:
+        if controls["harm_a"][overlap] < 0.70 or controls["harm_b"][overlap] < 0.35:
+            failures.append(f"{archetype}: musical crossfade is still too abrupt")
+        if controls["bass_b"][after] < 0.98 or controls["bass_a"][after] > 0.02:
             failures.append(f"{archetype}: bass handoff is too slow after cue")
-        if controls["drum_a"][released] > 0.02:
-            failures.append(f"{archetype}: outgoing drums release too late")
+        if controls["harm_a"][after] < 0.12:
+            failures.append(f"{archetype}: outgoing musical tail disappears too early")
+        if controls["drum_a"][released] > 0.02 or controls["harm_a"][released] > 0.02:
+            failures.append(f"{archetype}: outgoing deck release is too late")
         if np.mean(np.abs(deck_b[after])) <= np.mean(np.abs(deck_a[after])):
             failures.append(f"{archetype}: deck B is not dominant after cue")
         if max_step >= 0.01:

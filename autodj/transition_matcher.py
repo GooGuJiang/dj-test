@@ -16,12 +16,13 @@ from .muq_analyzer import cosine_similarity
 
 @dataclass(frozen=True)
 class MatcherConfig:
-    # These bars are analysis context only. The audible overlap is deliberately
-    # limited around the selected CUE-DETR switch point (one beat before and one
-    # beat after) so a strong cue never becomes the start of a long blend.
+    # These bars are analysis context only. The audible overlap remains centered
+    # on the selected CUE-DETR switch point, but uses a balanced one-bar window
+    # (two beats before and two beats after in 4/4) so the handoff is audible
+    # without returning to an 8/16/32-bar long blend.
     allowed_bars: tuple[int, ...] = (4, 8, 16)
-    pre_roll_beats: float = 1.0
-    release_beats: float = 1.0
+    pre_roll_beats: float = 2.0
+    release_beats: float = 2.0
     max_exit_candidates: int = 32
     max_entry_candidates: int = 24
     # CUE-DETR remains the only cue source. Positional tail/head windows are
@@ -753,12 +754,13 @@ def _cue_centered_window(
     pre_roll_beats: float,
     release_beats: float,
 ) -> tuple[int, int, int, int, int]:
-    """Return a common short window centered on the two neural cue points.
+    """Return a common balanced window centered on the two neural cue points.
 
-    The selected CUE-DETR points are aligned as the handoff instant.  At most
-    one beat is exposed before the cue and one beat after it.  Near a track
-    boundary or playback deadline the two sides are shortened symmetrically so
-    the handoff remains aligned and never starts in the past.
+    The selected CUE-DETR points remain the exact ownership-change instant.
+    Normally two beats are exposed before the cue and two beats afterwards,
+    giving the listener a real crossfade while keeping the overlap to one 4/4
+    bar. Near a track boundary or playback deadline either side is shortened
+    without moving the neural cue or inventing another switch point.
     """
     sr = int(current.sample_rate)
     beat_samples = max(1, int(round(60.0 / max(current.playback_bpm, 1.0) * sr)))

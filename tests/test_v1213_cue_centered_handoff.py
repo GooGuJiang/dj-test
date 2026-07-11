@@ -27,16 +27,16 @@ def test_cuedetr_point_is_handoff_not_transition_start() -> None:
     plan = find_best_transition(a, b, requested_bars=8)
 
     beat = int(round(60.0 / a.playback_bpm * a.sample_rate))
-    assert plan.current_cue_sample - plan.current_start == beat
-    assert plan.next_cue_sample - plan.next_start == beat
-    assert plan.length == 2 * beat
-    assert plan.next_resume_sample - plan.next_cue_sample == beat
+    assert plan.current_cue_sample - plan.current_start == 2 * beat
+    assert plan.next_cue_sample - plan.next_start == 2 * beat
+    assert plan.length == 4 * beat
+    assert plan.next_resume_sample - plan.next_cue_sample == 2 * beat
     assert plan.switch_position == pytest.approx(0.5)
     assert plan.switch_sample_a == plan.current_cue_sample
     assert plan.switch_sample_b == plan.next_cue_sample
 
 
-def test_cue_handoff_is_fast_but_not_a_hard_cut() -> None:
+def test_cue_handoff_is_balanced_and_not_a_hard_cut() -> None:
     roles = _roles()
     _, deck_a, deck_b, controls = _render_archetype(
         "Short Blend",
@@ -54,20 +54,29 @@ def test_cue_handoff_is_fast_but_not_a_hard_cut() -> None:
         effect_strength=0.65,
         vocal_risk=0.2,
         handoff_phase=0.5,
-        transition_beats=2.0,
+        transition_beats=4.0,
     )
     length = len(deck_a)
     cue = int(0.5 * (length - 1))
-    before = int(0.20 * (length - 1))
-    just_after = int(0.55 * (length - 1))
-    released = int(0.70 * (length - 1))
+    teaser = int(0.20 * (length - 1))
+    overlap = int(0.40 * (length - 1))
+    just_after = int(0.60 * (length - 1))
+    released = int(0.78 * (length - 1))
 
-    assert 0.10 < controls["drum_b"][before] < 0.25
-    assert controls["drum_b"][cue] > controls["drum_a"][cue]
-    assert controls["bass_b"][just_after] > 0.90
-    assert controls["bass_a"][just_after] < 0.10
+    assert 0.15 < controls["drum_b"][teaser] < 0.25
+    # The new one-bar window has a clearly audible pre-cue crossfade.
+    assert controls["drum_a"][overlap] > 0.70
+    assert controls["drum_b"][overlap] > 0.45
+    assert controls["harm_a"][overlap] > 0.75
+    assert controls["harm_b"][overlap] > 0.40
+    # CUE-DETR is still the ownership switch, but A is not abruptly muted.
+    assert controls["drum_b"][cue] > controls["drum_a"][cue] > 0.30
+    assert controls["harm_b"][cue] > controls["harm_a"][cue] > 0.40
+    assert controls["bass_b"][just_after] > 0.98
+    assert controls["bass_a"][just_after] < 0.02
+    assert controls["harm_a"][just_after] > 0.15
     assert controls["drum_a"][released] < 0.01
-    assert controls["harm_a"][released] < 0.05
+    assert controls["harm_a"][released] < 0.01
     assert np.mean(np.abs(deck_b[just_after])) > np.mean(np.abs(deck_a[just_after]))
 
     # Curves cross over finite samples rather than jumping from 1 to 0.
@@ -90,4 +99,4 @@ def test_fallback_window_shortens_only_when_track_boundary_requires_it() -> None
     assert plan.next_bar_index == 0
     assert plan.next_start == plan.next_cue_sample == 0
     assert 0.0 <= plan.switch_position < 0.5
-    assert plan.length <= int(round(60.0 / a.playback_bpm * a.sample_rate))
+    assert plan.length <= 2 * int(round(60.0 / a.playback_bpm * a.sample_rate))
